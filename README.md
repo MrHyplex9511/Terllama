@@ -20,7 +20,7 @@ Discord: https://discord.com/invite/TBB6KNkP7M
 make
 
 # 2. Pull a model from HuggingFace
-./terllama pull HuggingFaceTB/SmolLM2-135M --format i2s
+./terllama pull HuggingFaceTB/SmolLM2-135M --format als
 
 # 3. Start the API server
 ./terllama serve --port 8375
@@ -58,7 +58,7 @@ Detects available ISA extensions (AVX2+FMA, NEON) and compiles matching kernels.
 ./terllama show SmolLM2-135M
 
 # Download a model from HuggingFace
-./terllama pull HuggingFaceTB/SmolLM2-135M --format i2s
+./terllama pull HuggingFaceTB/SmolLM2-135M --format als
 
 # Remove a model
 ./terllama rm SmolLM2-135M
@@ -134,7 +134,7 @@ Models are stored in `~/.terllama/models/<repo-name>/` and tracked in `~/.terlla
 
 ```bash
 # Download from HuggingFace
-./terllama pull HuggingFaceTB/SmolLM2-135M --format i2s
+./terllama pull HuggingFaceTB/SmolLM2-135M --format als
 
 # List installed
 ./terllama list
