@@ -7,6 +7,8 @@ Runs SmolLM2-135M (and similar ternary-quantized models) using I2_S packed weigh
 
 Features an OpenAI-compatible API server, web chat UI, and model management CLI — similar to Ollama.
 
+Discord: https://discord.com/invite/TBB6KNkP7M
+
 ## Quick Start
 
 ```bash
@@ -146,8 +148,6 @@ Models are stored in `~/.terllama/models/<repo-name>/` and tracked in `~/.terlla
 docker build -t terllama .
 docker run -p 11434:11434 -v ~/.terllama:/root/.terllama terllama
 ```
-
-Discord: https://discord.com/invite/TBB6KNkP7M
 
 ## Results (SmolLM2-135M)
 
