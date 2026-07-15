@@ -1,0 +1,32 @@
+# Build artifacts
+build/
+terllama
+terllama-bench
+benchmark
+*.o
+*.obj
+*.exe
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+venv/
+
+# Weights / model files (large)
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.gguf
+*.onnx
+*.npy
