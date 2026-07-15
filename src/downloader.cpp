@@ -327,15 +327,15 @@ static void print_usage(const char* prog) {
 }
 
 int downloader_main(int argc, char** argv) {
-    if (argc < 3) { print_usage(argv[0]); return 1; }
+    if (argc < 2) { print_usage(argv[0]); return 1; }
 
-    std::string cmd = argv[2];
+    std::string cmd = argv[1];
     if (cmd != "download") { print_usage(argv[0]); return 1; }
 
     std::string hf_repo;
     std::string format = "i2s";
 
-    for (int i = 3; i < argc; i++) {
+    for (int i = 2; i < argc; i++) {
         std::string arg = argv[i];
         if (arg == "--format" || arg == "--fmt") {
             if (i + 1 >= argc) {
