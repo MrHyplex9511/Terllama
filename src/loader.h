@@ -164,6 +164,15 @@ inline std::vector<LayerData> load_decomposed_layers(const std::string& path) {
         f.read(reinterpret_cast<char*>(&ld.out_features), 4);
         f.read(reinterpret_cast<char*>(&ld.in_features), 4);
         f.read(reinterpret_cast<char*>(&ld.num_terms), 4);
+        if (ld.num_terms == 0) {
+            // Raw FP32 layer (e.g. lm_head): data_len(uint32) + float32 data
+            ld.has_raw_weights = true;
+            uint32_t data_len;
+            f.read(reinterpret_cast<char*>(&data_len), 4);
+            ld.raw_weights.resize(data_len / sizeof(float));
+            f.read(reinterpret_cast<char*>(ld.raw_weights.data()), data_len);
+            continue;
+        }
         ld.terms.resize(ld.num_terms);
         for (int t = 0; t < ld.num_terms; t++) {
             auto& term = ld.terms[t];
