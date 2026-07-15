@@ -1,5 +1,9 @@
 # Terllama
 
+<p align="center">
+  <img src="TerLlama.png" alt="Terllama Logo" width="200">
+</p>
+
 **Alpha**: under active development. Kernels work. Output is plausible. Expect rough edges.
 
 Ternary LLM inference engine. CPU-first, multi-ISA (scalar, AVX2, NEON).  
