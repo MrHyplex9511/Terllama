@@ -33,6 +33,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <limits.h>
+#include <unistd.h>
+#include <libgen.h>
 #include <mutex>
 #include <thread>
 #include <atomic>
@@ -312,7 +315,13 @@ static bool init_server(const std::string& model_dir) {
     if (g_model.loaded) return true;
 
     g_model.model_dir  = model_dir;
-    g_model.helper_dir = model_dir + "/scripts";
+    // Resolve scripts/ relative to this binary (co-located in repo)
+    g_model.helper_dir = []{
+        char buf[PATH_MAX];
+        ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf)-1);
+        if (len != -1) { buf[len]='\0'; return std::string(dirname(buf))+"/scripts"; }
+        return std::string("scripts");
+    }();
     g_model.arch       = detect_cpu_arch();
 
     // Allow environment override for testing

@@ -129,28 +129,30 @@ def als_decompose(W, num_terms=8, max_iter=10):
 
     return terms
 
-def pack_als_ternary(alpha, ternary_vec, n_elements):
+def pack_als_ternary(alpha, tv_tensor):
     """
-    Pack ternary vector into 2-bit ALS format.
+    Vectorized ALS packing. PyTorch ops, no Python loops.
 
-    decode_ternary format: 00=0, 10=+1, 11=-1 (per 2-bit field).
-    MSB to LSB within byte: elem0(2b), elem1(2b), elem2(2b), elem3(2b).
+    Maps: +1→bits 10(2), -1→bits 11(3), 0→bits 00(0).
+    Packs 4 values/byte MSB-first.
     """
-    n_bytes = (n_elements * 2 + 7) // 8
-    buf = bytearray(n_bytes)
-    for pos in range(n_elements):
-        tv = int(ternary_vec[pos])
-        if tv == 1:
-            bits = 2  # 10
-        elif tv == -1:
-            bits = 3  # 11
-        else:
-            bits = 0  # 00
-        byte_idx = (pos * 2) // 8
-        bit_offset = (pos * 2) % 8
-        buf[byte_idx] |= (bits & 0x03) << (6 - bit_offset)
-    alpha_bytes = struct.pack('<f', alpha)
-    return bytes(alpha_bytes) + bytes(buf)
+    # Map ternary -> 2-bit codes
+    tv = tv_tensor.to(torch.int8)
+    codes = torch.zeros(tv.numel(), dtype=torch.uint8, device=tv.device)
+    codes.masked_fill_(tv == 1, 2)
+    codes.masked_fill_(tv == -1, 3)
+
+    # Pad to multiple of 4
+    n = codes.shape[0]
+    pad = (4 - n % 4) % 4
+    if pad:
+        codes = torch.nn.functional.pad(codes, (0, pad))
+
+    # Pack 4 vals per byte: [a,b,c,d] -> (a<<6)|(b<<4)|(c<<2)|d
+    c4 = codes.reshape(-1, 4)
+    packed = (c4[:, 0] << 6) | (c4[:, 1] << 4) | (c4[:, 2] << 2) | c4[:, 3]
+
+    return struct.pack('<f', alpha) + packed.cpu().numpy().tobytes()
 
 def export_als(out_dir, model_name, num_terms=8):
     """ALS export: multi-term rank-1 ternary decomposition."""
@@ -195,22 +197,20 @@ def export_als(out_dir, model_name, num_terms=8):
 
         t1 = time.time()
         terms = als_decompose(W, num_terms=num_terms)
-        t2 = time.time()
 
-        # Pack each term: alpha + 2-bit ternary data
-        n_elements = out_f * in_f
+        # Pack each term: alpha + 2-bit ternary data (vectorized)
         packed_terms = []
         for alpha, tv in terms:
-            packed_terms.append(pack_als_ternary(alpha, tv, n_elements))
+            packed_terms.append(pack_als_ternary(alpha, tv))
 
-        # Reconstruct for error computation
+        # Reconstruct for error (vectorized)
         W_hat = torch.zeros(out_f, in_f)
         for alpha, tv in terms:
             if alpha != 0:
-                T_mat = tv.reshape(out_f, in_f).float()
-                W_hat += alpha * T_mat
+                W_hat += alpha * tv.reshape(out_f, in_f).float()
 
         err = torch.norm(W - W_hat).item() / torch.norm(W).item() * 100
+        t2 = time.time()
         als_size = sum(len(p) for p in packed_terms)
         total_fp32 += fp32_bytes
         total_als += als_size
@@ -366,6 +366,66 @@ def export_i2s(out_dir, model_name):
     return 0
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# model_extra.bin writer (config + embedding + RMS norms)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def write_extra(out_dir, model_hf):
+    """
+    Write model_extra.bin containing:
+      - 9 × int32/float32 config fields
+      - embedding table [vocab_size, hidden_size] float32
+      - final_norm [hidden_size] float32
+      - per-layer: [input_layernorm, post_attention_layernorm] each [hidden_size] float32
+    """
+    cfg = model_hf.config
+    extra_path = Path(out_dir) / 'model_extra.bin'
+
+    # 9 config fields matching loader.h read order
+    fields = [
+        ('vocab_size', cfg.vocab_size, 'i'),
+        ('hidden_size', cfg.hidden_size, 'i'),
+        ('intermediate_size', cfg.intermediate_size, 'i'),
+        ('num_hidden_layers', cfg.num_hidden_layers, 'i'),
+        ('num_attention_heads', cfg.num_attention_heads, 'i'),
+        ('num_key_value_heads', cfg.num_key_value_heads, 'i'),
+        ('rms_norm_eps', cfg.rms_norm_eps, 'f'),
+        ('rope_theta', getattr(cfg, 'rope_theta', 10000.0), 'f'),
+        ('max_position_embeddings', cfg.max_position_embeddings, 'i'),
+    ]
+
+    with open(extra_path, 'wb') as f:
+        for name, val, fmt in fields:
+            if fmt == 'i':
+                f.write(struct.pack('<i', int(val)))
+            else:
+                f.write(struct.pack('<f', float(val)))
+
+        # Embedding weights
+        emb = model_hf.get_input_embeddings().weight.data.float()
+        f.write(emb.numpy().tobytes())
+
+        # Final norm
+        if hasattr(model_hf.model, 'norm'):
+            fn = model_hf.model.norm.weight.data.float()
+        elif hasattr(model_hf.model, 'final_norm'):
+            fn = model_hf.model.final_norm.weight.data.float()
+        else:
+            print('  Warning: could not find final norm, writing zeros')
+            fn = torch.zeros(cfg.hidden_size)
+        f.write(fn.numpy().tobytes())
+
+        # Per-layer norms
+        for i in range(cfg.num_hidden_layers):
+            layer = model_hf.model.layers[i]
+            in_ln = layer.input_layernorm.weight.data.float()
+            pa_ln = layer.post_attention_layernorm.weight.data.float()
+            f.write(in_ln.numpy().tobytes())
+            f.write(pa_ln.numpy().tobytes())
+
+    return extra_path
+
+
 def main():
     parser = argparse.ArgumentParser(description='Export HF model to Terllama binary format')
     parser.add_argument('--model', default='HuggingFaceTB/SmolLM2-135M',
@@ -376,15 +436,27 @@ def main():
                         help='Export format (default: i2s)')
     parser.add_argument('--terms', type=int, default=8,
                         help='Number of ALS terms (default: 8, only for --format als)')
+    parser.add_argument('--rotate', type=int, default=0,
+                        help='RoPE theta (-1: max positional, 0: no change, N: specific value)')
     args = parser.parse_args()
 
     model_slug = args.model.replace('/', '-')
     out_dir = args.outdir or str(Path.home() / '.terllama' / 'models' / model_slug)
 
     if args.format == 'als':
-        return export_als(out_dir, args.model, num_terms=args.terms)
+        ret = export_als(out_dir, args.model, num_terms=args.terms)
     else:
-        return export_i2s(out_dir, args.model)
+        ret = export_i2s(out_dir, args.model)
+    if ret != 0:
+        return ret
+
+    # Write model_extra.bin — reload model if needed (it's cached, fast)
+    print('\n[Writing model_extra.bin...]')
+    from transformers import AutoModelForCausalLM as _M
+    m = _M.from_pretrained(args.model, dtype=torch.float32).eval()
+    extra_path = write_extra(out_dir, m)
+    print(f'  Wrote {extra_path} ({os.path.getsize(extra_path)/1e6:.1f} MB)')
+    return 0
 
 if __name__ == '__main__':
     sys.exit(main())

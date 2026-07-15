@@ -321,9 +321,7 @@ static int cmd_chat(const std::string& model_id, const std::string& prompt_text,
         ? std::string(std::getenv("TERLLAMA_MODEL_DIR"))
         : models_dir() + "/" + model_id;
 
-    std::string helper_dir = std::getenv("TERLLAMA_MODEL_DIR")
-        ? (model_dir + "/scripts")
-        : "scripts";
+    std::string helper_dir = "scripts";
 
     srand(42);
     CPUArch arch = detect_cpu_arch();
@@ -529,8 +527,7 @@ int main(int argc, char** argv) {
             std::string model_dir = std::getenv("TERLLAMA_MODEL_DIR")
                 ? std::string(std::getenv("TERLLAMA_MODEL_DIR"))
                 : models_dir() + "/" + model_id;
-            std::string helper_dir = std::getenv("TERLLAMA_MODEL_DIR")
-                ? (model_dir + "/scripts") : "scripts";
+            std::string helper_dir = "scripts";
 
             srand(42);
             auto cfg = load_config(model_dir + "/model_extra.bin");
@@ -589,7 +586,7 @@ int main(int argc, char** argv) {
         std::string model_dir = std::getenv("TERLLAMA_MODEL_DIR")
             ? std::string(std::getenv("TERLLAMA_MODEL_DIR"))
             : ".";
-        std::string helper_dir = model_dir + "/scripts";
+        std::string helper_dir = "scripts";
 
         srand(42);
         CPUArch arch = detect_cpu_arch();
