@@ -907,7 +907,7 @@ int server_main(int argc, char** argv) {
         : ".";
 
     // Port
-    int port = 11434;
+    int port = 8375;
     if (argc > 1) {
         port = std::stoi(argv[1]);
     } else if (const char* env_port = std::getenv("TERLLAMA_PORT")) {

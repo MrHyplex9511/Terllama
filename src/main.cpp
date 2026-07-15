@@ -12,7 +12,7 @@
  *
  * Environment:
  *   TERLLAMA_MODEL_DIR   model file directory
- *   TERLLAMA_PORT        server port (default 11434)
+ *   TERLLAMA_PORT        server port (default 8375)
  */
 #include "model.h"
 #include "loader.h"
@@ -448,13 +448,13 @@ static void print_usage(const char* prog) {
     std::cerr << std::endl;
     std::cerr << "Environment:" << std::endl;
     std::cerr << "  TERLLAMA_MODEL_DIR   model file directory" << std::endl;
-    std::cerr << "  TERLLAMA_PORT        server port (default 11434)" << std::endl;
+    std::cerr << "  TERLLAMA_PORT        server port (default 8375)" << std::endl;
     std::cerr << "  TERLLAMA_ARCH        override CPU arch" << std::endl;
     std::cerr << std::endl;
     std::cerr << "Usage examples:" << std::endl;
     std::cerr << "  " << prog << " pull HuggingFaceTB/SmolLM2-135M --format i2s" << std::endl;
     std::cerr << "  " << prog << " list" << std::endl;
-    std::cerr << "  " << prog << " serve --port 11434" << std::endl;
+    std::cerr << "  " << prog << " serve --port 8375" << std::endl;
     std::cerr << "  " << prog << " \"Hello, world!\" 100 0.8" << std::endl;
 }
 

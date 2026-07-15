@@ -19,12 +19,12 @@ make
 ./terllama pull HuggingFaceTB/SmolLM2-135M --format i2s
 
 # 3. Start the API server
-./terllama serve --port 11434
+./terllama serve --port 8375
 
-# 4. Open http://localhost:11434 in your browser
+# 4. Open http://localhost:8375 in your browser
 #    Or use curl:
-curl http://localhost:11434/v1/models
-curl -X POST http://localhost:11434/v1/chat/completions \
+curl http://localhost:8375/v1/models
+curl -X POST http://localhost:8375/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"messages":[{"role":"user","content":"Hello!"}],"stream":false}'
 ```
@@ -60,7 +60,7 @@ Detects available ISA extensions (AVX2+FMA, NEON) and compiles matching kernels.
 ./terllama rm SmolLM2-135M
 
 # Start API server (OpenAI-compatible)
-./terllama serve --port 11434
+./terllama serve --port 8375
 
 # Interactive CLI chat
 ./terllama chat --model SmolLM2-135M --prompt "Hello!"
@@ -71,7 +71,7 @@ Detects available ISA extensions (AVX2+FMA, NEON) and compiles matching kernels.
 
 ## API Server
 
-The server exposes an OpenAI-compatible API at `http://localhost:11434`:
+The server exposes an OpenAI-compatible API at `http://localhost:8375`:
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
@@ -84,7 +84,7 @@ The server exposes an OpenAI-compatible API at `http://localhost:11434`:
 ### Chat Completions
 
 ```bash
-curl -X POST http://localhost:11434/v1/chat/completions \
+curl -X POST http://localhost:8375/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "default",
@@ -105,12 +105,12 @@ For streaming, set `"stream": true`. The server sends SSE events (`data: {...}\n
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `TERLLAMA_MODEL_DIR` | `.` | Model file directory |
-| `TERLLAMA_PORT` | `11434` | Server port |
+| `TERLLAMA_PORT` | `8375` | Server port |
 | `TERLLAMA_ARCH` | auto | Force CPU arch (scalar, avx2, neon, etc.) |
 
 ## Web UI
 
-A single-file HTML chat interface at `http://localhost:11434/` (served by the API server). Features:
+A single-file HTML chat interface at `http://localhost:8375/` (served by the API server). Features:
 
 - Chat interface with streaming responses
 - Model selection dropdown
@@ -146,7 +146,7 @@ Models are stored in `~/.terllama/models/<repo-name>/` and tracked in `~/.terlla
 
 ```bash
 docker build -t terllama .
-docker run -p 11434:11434 -v ~/.terllama:/root/.terllama terllama
+docker run -p 8375:8375 -v ~/.terllama:/root/.terllama terllama
 ```
 
 ## Results (SmolLM2-135M)

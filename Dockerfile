@@ -5,9 +5,9 @@
 #   docker build -t terllama .
 #
 # Run:
-#   docker run -p 11434:11434 -v ~/.terllama:/root/.terllama terllama
+#   docker run -p 8375:8375 -v ~/.terllama:/root/.terllama terllama
 #
-# The server listens on port 11434 with an OpenAI-compatible API.
+# The server listens on port 8375 with an OpenAI-compatible API.
 # Mount ~/.terllama to persist downloaded models across container restarts.
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -36,10 +36,10 @@ RUN apk add --no-cache libgomp libcurl python3 py3-pip
 COPY --from=builder /terllama /usr/local/bin/terllama
 COPY web /usr/local/share/terllama/web
 
-EXPOSE 11434
+EXPOSE 8375
 VOLUME /root/.terllama
 
 ENV TERLLAMA_MODEL_DIR=/root/.terllama/models
 ENV TERLLAMA_WEB_DIR=/usr/local/share/terllama/web
 
-CMD ["terllama", "serve", "--port", "11434"]
+CMD ["terllama", "serve", "--port", "8375"]
