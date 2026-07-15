@@ -28,6 +28,8 @@ python3 scripts/export_ternary_model_bitnet.py --hf <model>
 ./terllama-bench model_decomposed_i2s.bin
 ```
 
+Discord: https://discord.com/invite/TBB6KNkP7M
+
 ## Results (SmolLM2-135M)
 
 ### Model Size
