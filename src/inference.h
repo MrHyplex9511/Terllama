@@ -330,7 +330,63 @@ inline int sample_multinomial(const float* logits, int n, float temp,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// GENERATION LOOP
+// GENERATION LOOP (with per-token streaming callback)
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Streaming callback: return true to continue, false to abort
+using StreamCallback = bool (*)(int token, float* logits, void* userdata);
+
+inline bool generate_stream(
+    const std::vector<int>& prompt_tokens,
+    int max_tokens, float temperature,
+    const ModelConfig& cfg,
+    const std::vector<float>& embedding,
+    const std::vector<LayerData>& layers,
+    const std::vector<float>& final_norm,
+    const std::vector<NormWeights>& layer_norms,
+    const RoPECache& rope,
+    StreamCallback callback, void* userdata) {
+
+    KVCache kv_cache(cfg.max_position_embeddings, cfg.num_hidden_layers,
+                     cfg.num_key_value_heads, cfg.head_dim, cfg.hidden_size);
+
+    // Prefill
+    for (int pos = 0; pos < (int)prompt_tokens.size(); pos++) {
+        model_forward(prompt_tokens[pos], pos, cfg, embedding,
+                      layers, final_norm, layer_norms, rope, kv_cache);
+    }
+
+    // Autoregressive
+    std::vector<int> output_tokens;
+    int next_token = prompt_tokens.back();
+    for (int i = 0; i < max_tokens; i++) {
+        int pos = (int)prompt_tokens.size() + i;
+        float* logits = model_forward(next_token, pos, cfg, embedding,
+                                       layers, final_norm, layer_norms, rope, kv_cache);
+
+        std::vector<int> recent;
+        for (int j = std::max(0, (int)output_tokens.size() - 8); j < (int)output_tokens.size(); j++)
+            recent.push_back(output_tokens[j]);
+
+        if (temperature < 0.01f)
+            next_token = sample_argmax(logits, cfg.vocab_size);
+        else
+            next_token = sample_multinomial(logits, cfg.vocab_size, temperature,
+                                            recent, 1.15f);
+
+        output_tokens.push_back(next_token);
+
+        // Callback with the new token
+        if (callback && !callback(next_token, logits, userdata))
+            return false; // aborted
+
+        if (next_token == 0) break;
+    }
+    return true;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GENERATION LOOP (batch return, original)
 // ═══════════════════════════════════════════════════════════════════════════
 inline std::pair<std::vector<int>, double> generate(
     const std::vector<int>& prompt_tokens,

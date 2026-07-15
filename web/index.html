@@ -1,0 +1,1079 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Terllama Chat</title>
+<style>
+/* ── Reset & Base ── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg: #f4f4f8;
+  --surface: #ffffff;
+  --surface-hover: #f0f0f4;
+  --text: #1a1a2e;
+  --text-secondary: #6b7280;
+  --border: #e0e0e8;
+  --user-msg: #2563eb;
+  --user-text: #ffffff;
+  --assistant-msg: #f0f0f4;
+  --assistant-text: #1a1a2e;
+  --accent: #2563eb;
+  --accent-hover: #1d4ed8;
+  --danger: #ef4444;
+  --shadow: 0 1px 3px rgba(0,0,0,0.08), 0 1px 2px rgba(0,0,0,0.06);
+  --shadow-lg: 0 4px 24px rgba(0,0,0,0.10);
+  --radius: 12px;
+  --radius-sm: 8px;
+  --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --mono: "SF Mono", "Fira Code", "Fira Mono", "Roboto Mono", monospace;
+  --transition: 0.2s ease;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0f1117;
+    --surface: #1a1d28;
+    --surface-hover: #242736;
+    --text: #e8eaed;
+    --text-secondary: #9aa0a6;
+    --border: #2d3140;
+    --user-msg: #3b82f6;
+    --user-text: #ffffff;
+    --assistant-msg: #242736;
+    --assistant-text: #e8eaed;
+    --accent: #3b82f6;
+    --accent-hover: #60a5fa;
+    --shadow: 0 1px 3px rgba(0,0,0,0.3), 0 1px 2px rgba(0,0,0,0.2);
+    --shadow-lg: 0 4px 24px rgba(0,0,0,0.4);
+  }
+}
+
+:root.light-mode {
+  --bg: #f4f4f8;
+  --surface: #ffffff;
+  --surface-hover: #f0f0f4;
+  --text: #1a1a2e;
+  --text-secondary: #6b7280;
+  --border: #e0e0e8;
+  --user-msg: #2563eb;
+  --user-text: #ffffff;
+  --assistant-msg: #f0f0f4;
+  --assistant-text: #1a1a2e;
+  --accent: #2563eb;
+  --accent-hover: #1d4ed8;
+}
+
+:root.dark-mode {
+  --bg: #0f1117;
+  --surface: #1a1d28;
+  --surface-hover: #242736;
+  --text: #e8eaed;
+  --text-secondary: #9aa0a6;
+  --border: #2d3140;
+  --user-msg: #3b82f6;
+  --user-text: #ffffff;
+  --assistant-msg: #242736;
+  --assistant-text: #e8eaed;
+  --accent: #3b82f6;
+  --accent-hover: #60a5fa;
+}
+
+html, body { height: 100%; overflow: hidden; }
+body {
+  font-family: var(--font);
+  background: var(--bg);
+  color: var(--text);
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  transition: background var(--transition), color var(--transition);
+}
+
+/* ── Layout ── */
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  width: 100vw;
+  max-width: 900px;
+  margin: 0 auto;
+  position: relative;
+}
+
+/* ── Header ── */
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+  flex-shrink: 0;
+  transition: background var(--transition), border-color var(--transition);
+}
+.header-left {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.header-logo {
+  font-size: 24px;
+  line-height: 1;
+}
+.header-title {
+  font-size: 18px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+}
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.btn-icon {
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  width: 36px;
+  height: 36px;
+  border-radius: var(--radius-sm);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-secondary);
+  font-size: 18px;
+  transition: background var(--transition), color var(--transition);
+}
+.btn-icon:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+/* ── Controls Bar ── */
+.controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 20px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+  flex-shrink: 0;
+  transition: background var(--transition), border-color var(--transition);
+}
+.control-group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+.control-group select,
+.control-group input[type="range"] {
+  cursor: pointer;
+}
+.control-group select {
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 4px 28px 4px 10px;
+  font-size: 13px;
+  font-family: var(--font);
+  appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%236b7280' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'%3E%3C/polyline%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 8px center;
+  transition: border-color var(--transition);
+}
+.control-group select:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.temp-slider {
+  flex: 1;
+  min-width: 80px;
+  max-width: 120px;
+  height: 4px;
+  -webkit-appearance: none;
+  appearance: none;
+  background: var(--border);
+  border-radius: 2px;
+  outline: none;
+}
+.temp-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--accent);
+  cursor: pointer;
+  border: 2px solid var(--surface);
+  box-shadow: var(--shadow);
+}
+.temp-slider::-moz-range-thumb {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--accent);
+  cursor: pointer;
+  border: 2px solid var(--surface);
+  box-shadow: var(--shadow);
+}
+.temp-value {
+  min-width: 28px;
+  text-align: center;
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--text);
+}
+.control-spacer {
+  flex: 1;
+}
+
+/* ── System Prompt ── */
+.system-prompt-wrap {
+  padding: 0 20px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+  flex-shrink: 0;
+  transition: background var(--transition), border-color var(--transition);
+  overflow: hidden;
+}
+.system-prompt-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 0;
+  cursor: pointer;
+  user-select: none;
+}
+.system-prompt-header label {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+.system-prompt-toggle {
+  font-size: 14px;
+  color: var(--text-secondary);
+  transition: transform var(--transition);
+}
+.system-prompt-toggle.open {
+  transform: rotate(180deg);
+}
+.system-prompt-body {
+  max-height: 0;
+  overflow: hidden;
+  transition: max-height 0.3s ease;
+}
+.system-prompt-body.open {
+  max-height: 200px;
+}
+.system-prompt-body textarea {
+  width: 100%;
+  min-height: 60px;
+  max-height: 160px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font);
+  font-size: 13px;
+  line-height: 1.5;
+  resize: vertical;
+  outline: none;
+  transition: border-color var(--transition), background var(--transition);
+  margin-bottom: 12px;
+}
+.system-prompt-body textarea:focus {
+  border-color: var(--accent);
+}
+
+/* ── Messages Area ── */
+.messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  scroll-behavior: smooth;
+}
+.messages:empty {
+  justify-content: center;
+  align-items: center;
+}
+.empty-state {
+  text-align: center;
+  color: var(--text-secondary);
+  max-width: 360px;
+}
+.empty-state-icon {
+  font-size: 48px;
+  margin-bottom: 12px;
+  opacity: 0.5;
+}
+.empty-state h3 {
+  font-size: 18px;
+  font-weight: 600;
+  margin-bottom: 6px;
+  color: var(--text);
+}
+.empty-state p {
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+/* ── Message Bubbles ── */
+.message {
+  display: flex;
+  max-width: 85%;
+  animation: msgIn 0.25s ease;
+}
+@keyframes msgIn {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.message.user {
+  align-self: flex-end;
+}
+.message.assistant {
+  align-self: flex-start;
+}
+.message.system {
+  align-self: center;
+  max-width: 100%;
+}
+.message-bubble {
+  padding: 12px 16px;
+  border-radius: 18px;
+  line-height: 1.55;
+  font-size: 14px;
+  word-wrap: break-word;
+  overflow-wrap: break-word;
+  white-space: pre-wrap;
+  position: relative;
+}
+.message.user .message-bubble {
+  background: var(--user-msg);
+  color: var(--user-text);
+  border-bottom-right-radius: 4px;
+}
+.message.assistant .message-bubble {
+  background: var(--assistant-msg);
+  color: var(--assistant-text);
+  border-bottom-left-radius: 4px;
+}
+.message.assistant .message-bubble p {
+  margin: 0.5em 0;
+}
+.message.assistant .message-bubble p:first-child { margin-top: 0; }
+.message.assistant .message-bubble p:last-child { margin-bottom: 0; }
+.message.assistant .message-bubble code {
+  background: rgba(0,0,0,0.08);
+  padding: 1px 4px;
+  border-radius: 4px;
+  font-family: var(--mono);
+  font-size: 13px;
+}
+.message.assistant .message-bubble pre {
+  background: rgba(0,0,0,0.06);
+  padding: 12px;
+  border-radius: 8px;
+  overflow-x: auto;
+  margin: 8px 0;
+}
+.message.assistant .message-bubble pre code {
+  background: none;
+  padding: 0;
+  font-size: 13px;
+}
+.message.user .message-bubble code {
+  background: rgba(255,255,255,0.15);
+  padding: 1px 4px;
+  border-radius: 4px;
+  font-family: var(--mono);
+  font-size: 13px;
+}
+
+/* Message actions */
+.message-actions {
+  display: flex;
+  gap: 4px;
+  margin-top: 4px;
+  padding: 0 4px;
+  opacity: 0;
+  transition: opacity var(--transition);
+}
+.message.assistant:hover .message-actions {
+  opacity: 1;
+}
+.btn-action {
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  padding: 4px 8px;
+  border-radius: 4px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  transition: background var(--transition), color var(--transition);
+}
+.btn-action:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+/* Typing indicator */
+.typing-indicator {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 0;
+}
+.typing-dot {
+  width: 8px;
+  height: 8px;
+  background: var(--text-secondary);
+  border-radius: 50%;
+  animation: dotPulse 1.4s ease-in-out infinite;
+}
+.typing-dot:nth-child(2) { animation-delay: 0.2s; }
+.typing-dot:nth-child(3) { animation-delay: 0.4s; }
+@keyframes dotPulse {
+  0%, 60%, 100% { opacity: 0.3; transform: scale(0.8); }
+  30% { opacity: 1; transform: scale(1); }
+}
+
+/* Streaming cursor */
+.stream-cursor {
+  display: inline-block;
+  width: 8px;
+  height: 16px;
+  background: var(--accent);
+  margin-left: 2px;
+  animation: blink 0.8s step-end infinite;
+  vertical-align: text-bottom;
+  border-radius: 1px;
+}
+@keyframes blink {
+  50% { opacity: 0; }
+}
+
+/* Error message */
+.message.error {
+  align-self: center;
+  max-width: 100%;
+}
+.message.error .message-bubble {
+  background: #fef2f2;
+  color: #991b1b;
+  border: 1px solid #fecaca;
+  font-size: 13px;
+  border-radius: var(--radius-sm);
+}
+@media (prefers-color-scheme: dark) {
+  .message.error .message-bubble {
+    background: #2d1517;
+    color: #fca5a5;
+    border-color: #4a1d21;
+  }
+}
+:root.light-mode .message.error .message-bubble {
+  background: #fef2f2;
+  color: #991b1b;
+  border-color: #fecaca;
+}
+:root.dark-mode .message.error .message-bubble {
+  background: #2d1517;
+  color: #fca5a5;
+  border-color: #4a1d21;
+}
+
+/* ── Input Area ── */
+.input-area {
+  display: flex;
+  align-items: flex-end;
+  gap: 10px;
+  padding: 12px 20px 16px;
+  border-top: 1px solid var(--border);
+  background: var(--surface);
+  flex-shrink: 0;
+  transition: background var(--transition), border-color var(--transition);
+}
+.input-wrap {
+  flex: 1;
+  position: relative;
+  display: flex;
+  align-items: flex-end;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  transition: border-color var(--transition), background var(--transition);
+}
+.input-wrap:focus-within {
+  border-color: var(--accent);
+}
+.input-wrap textarea {
+  flex: 1;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  font-family: var(--font);
+  font-size: 14px;
+  line-height: 1.5;
+  padding: 10px 14px;
+  resize: none;
+  outline: none;
+  max-height: 200px;
+  min-height: 44px;
+}
+.input-wrap textarea::placeholder {
+  color: var(--text-secondary);
+}
+.btn-send {
+  width: 36px;
+  height: 36px;
+  border: none;
+  border-radius: 50%;
+  background: var(--accent);
+  color: white;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 16px;
+  margin: 4px;
+  flex-shrink: 0;
+  transition: background var(--transition), transform 0.1s ease;
+}
+.btn-send:hover { background: var(--accent-hover); }
+.btn-send:active { transform: scale(0.92); }
+.btn-send:disabled {
+  background: var(--border);
+  color: var(--text-secondary);
+  cursor: not-allowed;
+  transform: none;
+}
+
+/* ── Footer ── */
+.footer {
+  text-align: center;
+  padding: 6px 20px;
+  font-size: 11px;
+  color: var(--text-secondary);
+  background: var(--surface);
+  border-top: 1px solid var(--border);
+  flex-shrink: 0;
+  transition: color var(--transition), background var(--transition), border-color var(--transition);
+}
+
+/* ── Responsive ── */
+@media (max-width: 600px) {
+  .header { padding: 10px 14px; }
+  .controls { padding: 8px 14px; gap: 8px; }
+  .system-prompt-wrap { padding: 0 14px; }
+  .messages { padding: 14px; gap: 12px; }
+  .message { max-width: 92%; }
+  .input-area { padding: 10px 14px 14px; }
+  .message-bubble { padding: 10px 14px; font-size: 14px; }
+  .control-group select { font-size: 12px; padding: 3px 24px 3px 8px; }
+  .header-title { font-size: 16px; }
+  .temp-slider { max-width: 80px; min-width: 60px; }
+}
+@media (max-width: 400px) {
+  .controls { flex-wrap: wrap; }
+  .control-group.temp-group { width: 100%; }
+  .temp-slider { max-width: none; flex: 1; }
+}
+</style>
+</head>
+<body>
+
+<div class="app" id="app">
+  <!-- Header -->
+  <header class="header">
+    <div class="header-left">
+      <span class="header-logo">🦙</span>
+      <span class="header-title">Terllama</span>
+    </div>
+    <div class="header-actions">
+      <button class="btn-icon" id="themeToggle" title="Toggle theme" aria-label="Toggle theme">🌓</button>
+    </div>
+  </header>
+
+  <!-- Controls -->
+  <div class="controls">
+    <div class="control-group">
+      <label for="modelSelect">Model:</label>
+      <select id="modelSelect">
+        <option value="">Loading...</option>
+      </select>
+    </div>
+    <div class="control-group temp-group">
+      <label for="tempSlider">Temp:</label>
+      <input type="range" id="tempSlider" class="temp-slider" min="0" max="2" step="0.1" value="0.7">
+      <span class="temp-value" id="tempValue">0.7</span>
+    </div>
+    <div class="control-spacer"></div>
+    <button class="btn-icon" id="clearChat" title="Clear chat" aria-label="Clear chat">🗑️</button>
+  </div>
+
+  <!-- System Prompt -->
+  <div class="system-prompt-wrap">
+    <div class="system-prompt-header" id="sysPromptToggle">
+      <label>System Prompt</label>
+      <span class="system-prompt-toggle" id="sysPromptArrow">▾</span>
+    </div>
+    <div class="system-prompt-body" id="sysPromptBody">
+      <textarea id="systemPrompt" placeholder="Optional: set system behavior...">You are a helpful assistant.</textarea>
+    </div>
+  </div>
+
+  <!-- Messages -->
+  <div class="messages" id="messages">
+    <div class="empty-state">
+      <div class="empty-state-icon">💬</div>
+      <h3>Start a conversation</h3>
+      <p>Select a model, type a message, and press Enter to begin.</p>
+    </div>
+  </div>
+
+  <!-- Input -->
+  <div class="input-area">
+    <div class="input-wrap">
+      <textarea id="inputBox" placeholder="Type your message..." rows="1"></textarea>
+      <button class="btn-send" id="sendBtn" aria-label="Send message">➤</button>
+    </div>
+  </div>
+
+  <!-- Footer -->
+  <div class="footer">Terllama v0.1-alpha</div>
+</div>
+
+<script>
+(function() {
+  'use strict';
+
+  /* ── State ── */
+  const state = {
+    messages: [],
+    streaming: false,
+    abortController: null,
+    currentModel: '',
+    temperature: 0.7,
+    systemPrompt: 'You are a helpful assistant.',
+    models: [],
+    darkMode: false,
+  };
+
+  /* ── DOM refs ── */
+  const $ = (s) => document.querySelector(s);
+  const $$ = (s) => document.querySelectorAll(s);
+
+  const el = {
+    messages: $('#messages'),
+    inputBox: $('#inputBox'),
+    sendBtn: $('#sendBtn'),
+    modelSelect: $('#modelSelect'),
+    tempSlider: $('#tempSlider'),
+    tempValue: $('#tempValue'),
+    systemPrompt: $('#systemPrompt'),
+    sysPromptToggle: $('#sysPromptToggle'),
+    sysPromptBody: $('#sysPromptBody'),
+    sysPromptArrow: $('#sysPromptArrow'),
+    clearChat: $('#clearChat'),
+    themeToggle: $('#themeToggle'),
+    app: $('#app'),
+  };
+
+  /* ── Theme ── */
+  function getPreferredTheme() {
+    return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+  }
+
+  function setTheme(mode) {
+    const root = document.documentElement;
+    root.classList.remove('light-mode', 'dark-mode');
+    if (mode === 'dark') {
+      root.classList.add('dark-mode');
+      state.darkMode = true;
+    } else {
+      root.classList.add('light-mode');
+      state.darkMode = false;
+    }
+    try { localStorage.setItem('terllama-theme', mode); } catch (_) {}
+  }
+
+  function toggleTheme() {
+    setTheme(state.darkMode ? 'light' : 'dark');
+  }
+
+  function initTheme() {
+    let saved;
+    try { saved = localStorage.getItem('terllama-theme'); } catch (_) {}
+    setTheme(saved || getPreferredTheme());
+  }
+
+  // Listen for system theme changes (only if user hasn't set a preference)
+  window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', (e) => {
+    try {
+      if (!localStorage.getItem('terllama-theme')) {
+        setTheme(e.matches ? 'dark' : 'light');
+      }
+    } catch (_) {}
+  });
+
+  /* ── Models ── */
+  async function fetchModels() {
+    el.modelSelect.innerHTML = '<option value="">Loading...</option>';
+    el.modelSelect.disabled = true;
+    try {
+      const res = await fetch('/v1/models');
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      let models = [];
+      if (Array.isArray(data)) {
+        models = data;
+      } else if (data.data && Array.isArray(data.data)) {
+        models = data.data;
+      } else if (data.models && Array.isArray(data.models)) {
+        models = data.models;
+      }
+      if (models.length === 0) throw new Error('No models returned');
+      state.models = models;
+      el.modelSelect.innerHTML = '';
+      models.forEach((m) => {
+        const id = m.id || m.name || m.model || String(m);
+        const opt = document.createElement('option');
+        opt.value = id;
+        opt.textContent = id;
+        el.modelSelect.appendChild(opt);
+      });
+      el.modelSelect.disabled = false;
+      if (models.length > 0) {
+        el.modelSelect.value = models[0].id || models[0].name || models[0].model || String(models[0]);
+        state.currentModel = el.modelSelect.value;
+      }
+    } catch (err) {
+      el.modelSelect.innerHTML = '<option value="">No models found</option>';
+      el.modelSelect.disabled = false;
+      addError('Failed to load models: ' + err.message);
+    }
+  }
+
+  /* ── Messages ── */
+  function addMessage(role, content, isStreaming) {
+    // Remove empty state
+    const empty = el.messages.querySelector('.empty-state');
+    if (empty) empty.remove();
+
+    // Update or create bubble
+    let msgEl;
+    if (isStreaming) {
+      msgEl = el.messages.querySelector('.message.assistant:last-child');
+      if (!msgEl || msgEl.dataset.streaming !== 'true') {
+        msgEl = document.createElement('div');
+        msgEl.className = 'message assistant';
+        msgEl.dataset.streaming = 'true';
+        const bubble = document.createElement('div');
+        bubble.className = 'message-bubble';
+        msgEl.appendChild(bubble);
+        el.messages.appendChild(msgEl);
+      }
+      const bubble = msgEl.querySelector('.message-bubble');
+      bubble.textContent = content;
+
+      // Remove cursor from any other messages
+      el.messages.querySelectorAll('.stream-cursor').forEach(c => c.remove());
+      return msgEl;
+    }
+
+    // Final (non-streaming)
+    // If there's a streaming message, finalize it
+    const streamEl = el.messages.querySelector('.message.assistant[data-streaming="true"]');
+    if (streamEl) {
+      streamEl.dataset.streaming = 'false';
+      streamEl.querySelector('.stream-cursor')?.remove();
+      return streamEl;
+    }
+
+    // Normal add
+    const div = document.createElement('div');
+    div.className = 'message ' + role;
+    const bubble = document.createElement('div');
+    bubble.className = 'message-bubble';
+    bubble.textContent = content;
+    div.appendChild(bubble);
+
+    if (role === 'assistant') {
+      const actions = document.createElement('div');
+      actions.className = 'message-actions';
+      const copyBtn = document.createElement('button');
+      copyBtn.className = 'btn-action';
+      copyBtn.textContent = '📋 Copy';
+      copyBtn.addEventListener('click', () => copyText(content, copyBtn));
+      actions.appendChild(copyBtn);
+      div.appendChild(actions);
+    }
+
+    el.messages.appendChild(div);
+    scrollToBottom();
+    return div;
+  }
+
+  function addError(msg) {
+    const empty = el.messages.querySelector('.empty-state');
+    if (empty) empty.remove();
+    const div = document.createElement('div');
+    div.className = 'message error';
+    const bubble = document.createElement('div');
+    bubble.className = 'message-bubble';
+    bubble.textContent = '⚠️ ' + msg;
+    div.appendChild(bubble);
+    el.messages.appendChild(div);
+    scrollToBottom();
+  }
+
+  function scrollToBottom() {
+    requestAnimationFrame(() => {
+      el.messages.scrollTop = el.messages.scrollHeight;
+    });
+  }
+
+  function copyText(text, btn) {
+    if (!navigator.clipboard) {
+      // Fallback
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand('copy');
+      document.body.removeChild(ta);
+    } else {
+      navigator.clipboard.writeText(text).catch(() => {});
+    }
+    const orig = btn.textContent;
+    btn.textContent = '✅ Copied!';
+    setTimeout(() => { btn.textContent = orig; }, 2000);
+  }
+
+  function clearChat() {
+    if (state.streaming) {
+      cancelStream();
+    }
+    state.messages = [];
+    el.messages.innerHTML = `
+      <div class="empty-state">
+        <div class="empty-state-icon">💬</div>
+        <h3>Start a conversation</h3>
+        <p>Select a model, type a message, and press Enter to begin.</p>
+      </div>`;
+  }
+
+  /* ── Streaming ── */
+  async function sendMessage() {
+    const text = el.inputBox.value.trim();
+    if (!text || state.streaming) return;
+
+    if (!state.currentModel) {
+      addError('No model selected. Please select a model first.');
+      return;
+    }
+
+    // Check if model exists
+    const modelExists = state.models.some(m => {
+      const id = m.id || m.name || m.model || String(m);
+      return id === state.currentModel;
+    });
+    if (!modelExists && state.models.length > 0) {
+      // Try to re-fetch models
+      addError('Model "' + state.currentModel + '" is not available. Try selecting a different model.');
+      return;
+    }
+
+    el.inputBox.value = '';
+    autoResize(el.inputBox);
+    setSending(true);
+
+    // Add user message
+    const sysMsg = el.systemPrompt.value.trim() || state.systemPrompt;
+    const userMsg = { role: 'user', content: text };
+    state.messages.push(userMsg);
+    addMessage('user', text);
+
+    // Build messages array
+    const msgs = [];
+    if (sysMsg) {
+      msgs.push({ role: 'system', content: sysMsg });
+    }
+    state.messages.forEach(m => msgs.push({ role: m.role, content: m.content }));
+
+    // Start streaming
+    state.streaming = true;
+    state.abortController = new AbortController();
+
+    let fullContent = '';
+    let msgEl = null;
+
+    try {
+      const response = await fetch('/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: state.currentModel,
+          messages: msgs,
+          temperature: state.temperature,
+          stream: true,
+        }),
+        signal: state.abortController.signal,
+      });
+
+      if (!response.ok) {
+        let errMsg = `HTTP ${response.status}`;
+        try {
+          const errData = await response.json();
+          if (errData.error) errMsg = errData.error.message || errData.error;
+        } catch (_) {}
+        throw new Error(errMsg);
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed || !trimmed.startsWith('data:')) continue;
+          const payload = trimmed.slice(5).trim();
+          if (payload === '[DONE]') {
+            break;
+          }
+          try {
+            const chunk = JSON.parse(payload);
+            const delta = chunk.choices?.[0]?.delta?.content || chunk.choices?.[0]?.text || '';
+            if (delta) {
+              fullContent += delta;
+              msgEl = addMessage('assistant', fullContent, true);
+              scrollToBottom();
+            }
+          } catch (_) {
+            // Skip unparseable chunks
+          }
+        }
+      }
+
+      // Finalize
+      if (fullContent) {
+        addMessage('assistant', fullContent, false);
+        state.messages.push({ role: 'assistant', content: fullContent });
+      }
+
+    } catch (err) {
+      if (err.name === 'AbortError') {
+        if (fullContent) {
+          addMessage('assistant', fullContent, false);
+          state.messages.push({ role: 'assistant', content: fullContent });
+        }
+      } else {
+        addError('Request failed: ' + err.message);
+      }
+    } finally {
+      state.streaming = false;
+      state.abortController = null;
+      setSending(false);
+      scrollToBottom();
+    }
+  }
+
+  function cancelStream() {
+    if (state.abortController) {
+      state.abortController.abort();
+      state.abortController = null;
+    }
+  }
+
+  function setSending(sending) {
+    el.sendBtn.disabled = sending;
+    el.inputBox.disabled = sending;
+    el.sendBtn.textContent = sending ? '⏳' : '➤';
+  }
+
+  /* ── Input helpers ── */
+  function autoResize(ta) {
+    ta.style.height = 'auto';
+    ta.style.height = Math.min(ta.scrollHeight, 200) + 'px';
+  }
+
+  /* ── Events ── */
+
+  // Model select
+  el.modelSelect.addEventListener('change', () => {
+    state.currentModel = el.modelSelect.value;
+  });
+
+  // Temperature
+  el.tempSlider.addEventListener('input', () => {
+    state.temperature = parseFloat(el.tempSlider.value);
+    el.tempValue.textContent = state.temperature.toFixed(1);
+  });
+
+  // System prompt toggle
+  let sysPromptOpen = false;
+  el.sysPromptToggle.addEventListener('click', () => {
+    sysPromptOpen = !sysPromptOpen;
+    el.sysPromptBody.classList.toggle('open', sysPromptOpen);
+    el.sysPromptArrow.classList.toggle('open', sysPromptOpen);
+  });
+
+  // Send
+  el.sendBtn.addEventListener('click', sendMessage);
+
+  // Input: Enter to send, Shift+Enter for newline
+  el.inputBox.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      sendMessage();
+    }
+  });
+
+  // Auto-resize input
+  el.inputBox.addEventListener('input', () => autoResize(el.inputBox));
+
+  // Clear chat
+  el.clearChat.addEventListener('click', clearChat);
+
+  // Theme toggle
+  el.themeToggle.addEventListener('click', toggleTheme);
+
+  // Keyboard shortcut: Ctrl+Shift+? or Esc to focus input
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && !state.streaming) {
+      el.inputBox.focus();
+    }
+  });
+
+  /* ── Init ── */
+  initTheme();
+  fetchModels();
+  el.inputBox.focus();
+})();
+</script>
+</body>
+</html>

@@ -1,33 +1,28 @@
 # ═══════════════════════════════════════════════════════════════════════════
 # Terllama Makefile
 # ═══════════════════════════════════════════════════════════════════════════
-# Each kernel compiled separately with its own -march flags.
-# Dispatcher uses weak symbols: missing kernel .o → skip.
 #
-# Usage:
-#   make all          # Build terllama + benchmark
-#   make terllama     # Inference binary
-#   make bench        # Benchmark
+# Targets:
+#   make all          Build terllama + terllama-bench
+#   make terllama     Main binary (CLI + server + downloader)
+#   make bench        Benchmark binary
 #   make clean
-#   make help
 # ═══════════════════════════════════════════════════════════════════════════
 
 CXX         := g++
 CXXFLAGS    := -std=c++17 -O3 -fopenmp -Wall -Wextra -Wno-unknown-pragmas -Wno-address
-LDFLAGS     := -lm -fopenmp
+LDFLAGS     := -lm -fopenmp -lpthread
 
 SRC_DIR     := src
 BUILD_DIR   := build
 TARGET      := terllama
 BENCH       := terllama-bench
+THIRD_PARTY := third_party
 
 # ISA detection
 try_isa = $(shell echo 'int x;' | $(CXX) -x c++ $(1) -c - -o /dev/null 2>/dev/null && echo yes || echo no)
 
-HAVE_SSE42  := $(call try_isa,-msse4.2)
-HAVE_AVX    := $(call try_isa,-mavx)
 HAVE_AVX2   := $(call try_isa,-mavx2 -mfma)
-HAVE_AVX512 := $(call try_isa,-mavx512f -mavx512dq)
 
 # Kernel objects
 KERNEL_OBJS := $(BUILD_DIR)/kernel_scalar.o $(BUILD_DIR)/kernel_avx2.o
@@ -36,7 +31,11 @@ ifneq (,$(filter aarch64 arm64, $(shell uname -m)))
   KERNEL_OBJS += $(BUILD_DIR)/kernel_neon.o
 endif
 
-COMMON_OBJS := $(BUILD_DIR)/dispatcher.o
+# All source objects for the main binary
+MAIN_OBJS := $(BUILD_DIR)/main.o \
+             $(BUILD_DIR)/server.o \
+             $(BUILD_DIR)/downloader.o \
+             $(BUILD_DIR)/dispatcher.o
 
 .PHONY: all build-terllama build-bench clean help
 
@@ -49,11 +48,11 @@ build-bench: $(BUILD_DIR) $(BENCH)
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
-# Scalar fallback (any CPU)
+# Scalar fallback
 $(BUILD_DIR)/kernel_scalar.o: $(SRC_DIR)/kernel_scalar.cpp | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-# AVX2+FMA — primary optimized kernel
+# AVX2+FMA
 ifeq ($(HAVE_AVX2),yes)
 $(BUILD_DIR)/kernel_avx2.o: $(SRC_DIR)/kernel_avx2.cpp | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -mavx2 -mfma -c $< -o $@
@@ -70,17 +69,28 @@ $(BUILD_DIR)/kernel_neon.o: $(SRC_DIR)/kernel_neon.cpp | $(BUILD_DIR)
 $(BUILD_DIR)/dispatcher.o: $(SRC_DIR)/dispatcher.cpp | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-# Main inference binary
+# Main CLI (dispatches subcommands)
 $(BUILD_DIR)/main.o: $(SRC_DIR)/main.cpp | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) -I$(THIRD_PARTY) -c $< -o $@
+
+# Server (API + web)
+$(BUILD_DIR)/server.o: $(SRC_DIR)/server.cpp | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) -I$(THIRD_PARTY) -c $< -o $@
+
+# Downloader (HuggingFace model pull)
+$(BUILD_DIR)/downloader.o: $(SRC_DIR)/downloader.cpp | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
+# Benchmark
 $(BUILD_DIR)/benchmark.o: $(SRC_DIR)/benchmark.cpp | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-$(TARGET): $(BUILD_DIR)/main.o $(COMMON_OBJS) $(KERNEL_OBJS)
+# Main binary (CLI + server + downloader + kernels)
+$(TARGET): $(MAIN_OBJS) $(KERNEL_OBJS)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
 
-$(BENCH): $(BUILD_DIR)/benchmark.o $(COMMON_OBJS) $(KERNEL_OBJS)
+# Benchmark binary
+$(BENCH): $(BUILD_DIR)/benchmark.o $(BUILD_DIR)/dispatcher.o $(KERNEL_OBJS)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
 
 clean:
@@ -88,11 +98,12 @@ clean:
 
 help:
 	@echo "Terllama Build"
-	@echo "C++ compiler:  $(CXX)"
-	@echo "C++ flags:     $(CXXFLAGS)"
+	@echo "Compiler:      $(CXX)"
+	@echo "Flags:         $(CXXFLAGS)"
 	@echo "AVX2+FMA:      $(HAVE_AVX2)"
+	@echo ""
 	@echo "Targets:"
 	@echo "  make all            Build everything"
-	@echo "  make terllama       Inference binary"
-	@echo "  make bench          Benchmark"
+	@echo "  make terllama       Main binary (CLI + server + downloader)"
+	@echo "  make bench          Benchmark binary"
 	@echo "  make clean"
