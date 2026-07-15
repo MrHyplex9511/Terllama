@@ -1,11 +1,11 @@
 # Terllama
 
-**Alpha** — under active development. Kernels work, output is plausible, but expect rough edges.
+**Alpha**: under active development. Kernels work. Output is plausible. Expect rough edges.
 
 Ternary LLM inference engine. CPU-first, multi-ISA (scalar, AVX2, NEON).  
 Runs SmolLM2-135M (and similar ternary-quantized models) using I2_S packed weights, INT8 activations, and tile-parallel tiling.
 
-Features an OpenAI-compatible API server, web chat UI, and model management CLI — similar to Ollama.
+Features an OpenAI-compatible API server, web chat UI, and model management CLI, similar to Ollama.
 
 Discord: https://discord.com/invite/TBB6KNkP7M
 
@@ -122,7 +122,7 @@ A single-file HTML chat interface at `http://localhost:11434/` (served by the AP
 - Dark/light mode (auto-detect + toggle)
 - Responsive (works on mobile)
 
-No build tools or npm needed — it's served directly by the C++ server.
+No build tools or npm needed. The C++ server serves it directly.
 
 ## Model Management
 
@@ -189,7 +189,7 @@ Accuracy improves with more terms: at 10 terms the FFN layers drop below 2% erro
 | FP32 baseline | 8.24 | 1.0× |
 | Terllama (12 terms all layers) | 8.26 | **1.003×** |
 
-Larger models tolerate decomposition better — 1.1B is virtually lossless at 12 terms.
+Larger models decompose with less loss. 1.1B is nearly lossless at 12 terms.
 
 ## Architecture
 
@@ -208,11 +208,11 @@ Larger models tolerate decomposition better — 1.1B is virtually lossless at 12
 
 ## Optimizations
 
-- **I2_S packing** — 4 ternary values per byte, 2-bit codes
-- **INT8 activations** — quantize FP32 to INT8 before matmul
-- **Mean scaling** — block-wise mean-based ternary quantization
-- **Selective layer quant** — 7 projection layers per transformer block
-- **Tile-parallel tiling** — 128-col tiles, weights unpacked once per tile
+- **I2_S packing**: 4 ternary values per byte, 2-bit codes
+- **INT8 activations**: quantize FP32 to INT8 before matmul
+- **Mean scaling**: block-wise mean-based ternary quantization
+- **Selective layer quant**: 7 projection layers per transformer block
+- **Tile-parallel tiling**: 128-col tiles, weights unpacked once per tile
 
 ## Files
 
