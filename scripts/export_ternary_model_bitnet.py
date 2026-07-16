@@ -71,7 +71,7 @@ def pack_i2s_with_scales(codes, scales, qk=128):
 # ALS: multi-term rank-1 ternary decomposition
 # ═══════════════════════════════════════════════════════════════════════════
 
-def als_decompose(W, num_terms=8, max_iter=10):
+def als_decompose(W, num_terms=12, max_iter=10):
     """
     Decompose W into sum of rank-1 ternary terms via ALS.
 
@@ -154,7 +154,7 @@ def pack_als_ternary(alpha, tv_tensor):
 
     return struct.pack('<f', alpha) + packed.cpu().numpy().tobytes()
 
-def export_als(out_dir, model_name, num_terms=8):
+def export_als(out_dir, model_name, num_terms=12):
     """ALS export: multi-term rank-1 ternary decomposition."""
     from transformers import AutoModelForCausalLM
     out_dir = Path(out_dir)
@@ -434,7 +434,7 @@ def main():
                         help='Output directory (default: ~/.terllama/models/<slug>)')
     parser.add_argument('--format', choices=['i2s', 'als'], default='i2s',
                         help='Export format (default: i2s)')
-    parser.add_argument('--terms', type=int, default=8,
+    parser.add_argument('--terms', type=int, default=12,
                         help='Number of ALS terms (default: 8, only for --format als)')
     parser.add_argument('--rotate', type=int, default=0,
                         help='RoPE theta (-1: max positional, 0: no change, N: specific value)')
