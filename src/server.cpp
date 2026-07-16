@@ -910,16 +910,40 @@ static void handle_options(const httplib::Request& req, httplib::Response& res) 
 int server_main(int argc, char** argv) {
     srand((unsigned int)time(nullptr));
 
-    // Model directory
-    std::string model_dir = std::getenv("TERLLAMA_MODEL_DIR")
-        ? std::string(std::getenv("TERLLAMA_MODEL_DIR"))
-        : ".";
+    // Model directory — --model <slug/path>, env var, or default to .
+    std::string model_dir = ".";
+    for (int i = 1; i < argc - 1; i++) {
+        std::string a = argv[i];
+        if (a == "--model" || a == "-m") { model_dir = argv[i + 1]; break; }
+    }
+    if (model_dir == "." || model_dir.find('/') == std::string::npos) {
+        const char* env_m = std::getenv("TERLLAMA_MODEL_DIR");
+        if (env_m) { model_dir = env_m; }
+        else if (model_dir != ".") {
+            // Resolve slug to ~/.terllama/models/<slug>
+            model_dir = std::string(getenv("HOME") ? getenv("HOME") : "/root")
+                      + "/.terllama/models/" + model_dir;
+        }
+    }
 
-    // Port
+    // Port — handle --port N, -p N, positional, or env
     int port = 8375;
-    if (argc > 1) {
-        port = std::stoi(argv[1]);
-    } else if (const char* env_port = std::getenv("TERLLAMA_PORT")) {
+    for (int i = 1; i < argc - 1; i++) {
+        std::string a = argv[i];
+        if (a == "--port" || a == "-p") {
+            port = std::stoi(argv[i + 1]);
+            break;
+        }
+    }
+    if (port == 8375) {
+        // Check positional: skip subcommand name if present
+        for (int i = 1; i < argc; i++) {
+            std::string a = argv[i];
+            if (a == "serve" || a == "server") continue;
+            if (a[0] != '-') { port = std::stoi(a); break; }
+        }
+    }
+    if (const char* env_port = std::getenv("TERLLAMA_PORT")) {
         port = std::stoi(env_port);
     }
 
