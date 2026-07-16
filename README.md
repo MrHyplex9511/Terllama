@@ -4,12 +4,12 @@
   <img src="TerLlama.png" alt="Terllama Logo" width="200">
 </p>
 
-**Alpha**: under active development. Kernels work. Output is plausible. Expect rough edges.
+**Alpha**: active development. Kernels produce correct output. Expect bugs and API changes.
 
 Ternary LLM inference engine. CPU-first, multi-ISA (scalar, AVX2, NEON).  
 Runs SmolLM2-135M (and similar ternary-quantized models) using I2_S packed weights, INT8 activations, and tile-parallel tiling.
 
-Features an OpenAI-compatible API server, web chat UI, and model management CLI, similar to Ollama.
+Includes OpenAI-compatible API server, web chat UI, and model management CLI.
 
 Discord: https://discord.com/invite/TBB6KNkP7M
 
@@ -41,9 +41,9 @@ make terllama # main binary only
 make bench    # benchmark only
 ```
 
-Detects available ISA extensions (AVX2+FMA, NEON) and compiles matching kernels. Missing ISAs are skipped. On x86_64 without AVX2 the scalar fallback is used.
+Build detects available ISA extensions (AVX2+FMA, NEON) and compiles matching kernels. Skips missing ISAs. Falls back to scalar on x86_64 without AVX2.
 
-**Dependencies:** C++17 compiler, OpenMP, make. No external libraries needed (cpp-httplib included in `third_party/`). Tokenizer uses Python 3 (transformers).
+**Dependencies:** C++17 compiler, OpenMP, make, Python 3 (transformers) for tokenizer. Cpp-httplib ships in `third_party/`.
 
 ## CLI Usage
 
@@ -75,7 +75,7 @@ Detects available ISA extensions (AVX2+FMA, NEON) and compiles matching kernels.
 
 ## API Server
 
-The server exposes an OpenAI-compatible API at `http://localhost:8375`:
+OpenAI-compatible API at `http://localhost:8375`:
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
@@ -102,7 +102,7 @@ curl -X POST http://localhost:8375/v1/chat/completions \
   }'
 ```
 
-For streaming, set `"stream": true`. The server sends SSE events (`data: {...}\n\n`) and terminates with `data: [DONE]\n\n`.
+Set `"stream": true`. Response uses SSE events (`data: {...}\n\n`) and ends with `data: [DONE]\n\n`.
 
 ### Environment Variables
 
@@ -114,7 +114,7 @@ For streaming, set `"stream": true`. The server sends SSE events (`data: {...}\n
 
 ## Web UI
 
-A single-file HTML chat interface at `http://localhost:8375/` (served by the API server). Features:
+Single-file HTML chat interface at `http://localhost:8375/` (API server serves it):
 
 - Chat interface with streaming responses
 - Model selection dropdown
@@ -126,11 +126,11 @@ A single-file HTML chat interface at `http://localhost:8375/` (served by the API
 - Dark/light mode (auto-detect + toggle)
 - Responsive (works on mobile)
 
-No build tools or npm needed. The C++ server serves it directly.
+No build tools or npm. C++ server serves it directly.
 
 ## Model Management
 
-Models are stored in `~/.terllama/models/<repo-name>/` and tracked in `~/.terllama/models.json`.
+Terllama stores models in `~/.terllama/models/<repo-name>/` and tracks them in `~/.terllama/models.json`.
 
 ```bash
 # Download from HuggingFace
@@ -193,7 +193,7 @@ Accuracy improves with more terms: at 10 terms the FFN layers drop below 2% erro
 | FP32 baseline | 8.24 | 1.0× |
 | Terllama (12 terms all layers) | 8.26 | **1.003×** |
 
-Larger models decompose with less loss. 1.1B is nearly lossless at 12 terms.
+Larger models decompose with less loss. TinyLlama-1.1B PPL ratio: 1.003x at 12 terms.
 
 ## Architecture
 
