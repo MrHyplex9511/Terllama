@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            build-essential cmake g++ \
+            libomp-dev libcurl4-openssl-dev \
+            python3 python3-pip
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build -j$(nproc)
+
+      - name: Run tests
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Upload terllama binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: terllama-${{ github.sha }}
+          path: build/terllama
+          if-no-files-found: error

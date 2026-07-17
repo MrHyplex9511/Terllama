@@ -10,8 +10,8 @@
 # ═══════════════════════════════════════════════════════════════════════════
 
 CXX         := g++
-CXXFLAGS    := -std=c++17 -O3 -fopenmp -Wall -Wextra -Wno-unknown-pragmas -Wno-address
-LDFLAGS     := -lm -fopenmp -lpthread
+CXXFLAGS    := -std=c++17 -O3 -fopenmp -flto -Wall -Wextra -Wno-unknown-pragmas -Wno-address
+LDFLAGS     := -lm -fopenmp -lpthread -flto
 
 SRC_DIR     := src
 BUILD_DIR   := build
@@ -33,9 +33,14 @@ endif
 
 # All source objects for the main binary
 MAIN_OBJS := $(BUILD_DIR)/main.o \
+             $(BUILD_DIR)/commands.o \
              $(BUILD_DIR)/server.o \
+             $(BUILD_DIR)/handlers.o \
              $(BUILD_DIR)/downloader.o \
-             $(BUILD_DIR)/dispatcher.o
+             $(BUILD_DIR)/dispatcher.o \
+             $(BUILD_DIR)/gguf_loader.o \
+             $(BUILD_DIR)/inference.o \
+             $(BUILD_DIR)/logger.o
 
 .PHONY: all build-terllama build-bench clean help
 
@@ -69,17 +74,37 @@ $(BUILD_DIR)/kernel_neon.o: $(SRC_DIR)/kernel_neon.cpp | $(BUILD_DIR)
 $(BUILD_DIR)/dispatcher.o: $(SRC_DIR)/dispatcher.cpp | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
+# CLI commands
+$(BUILD_DIR)/commands.o: $(SRC_DIR)/cli/commands.cpp | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) -I$(SRC_DIR) -I$(THIRD_PARTY) -c $< -o $@
+
 # Main CLI (dispatches subcommands)
 $(BUILD_DIR)/main.o: $(SRC_DIR)/main.cpp | $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS) -I$(THIRD_PARTY) -c $< -o $@
+	$(CXX) $(CXXFLAGS) -I$(SRC_DIR) -I$(THIRD_PARTY) -c $< -o $@
 
 # Server (API + web)
 $(BUILD_DIR)/server.o: $(SRC_DIR)/server.cpp | $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS) -I$(THIRD_PARTY) -c $< -o $@
+	$(CXX) $(CXXFLAGS) -I$(SRC_DIR) -I$(THIRD_PARTY) -c $< -o $@
+
+# Server handlers (route implementations — separated from server.cpp)
+$(BUILD_DIR)/handlers.o: $(SRC_DIR)/server/handlers.cpp | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) -I$(SRC_DIR) -I$(THIRD_PARTY) -c $< -o $@
 
 # Downloader (HuggingFace model pull)
 $(BUILD_DIR)/downloader.o: $(SRC_DIR)/downloader.cpp | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+# GGUF loader
+$(BUILD_DIR)/gguf_loader.o: $(SRC_DIR)/gguf_loader.cpp $(SRC_DIR)/gguf_loader.h | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+# Core inference
+$(BUILD_DIR)/inference.o: $(SRC_DIR)/core/inference.cpp | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) -I$(SRC_DIR) -c $< -o $@
+
+# Logger
+$(BUILD_DIR)/logger.o: $(SRC_DIR)/core/logger.cpp | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) -I$(SRC_DIR) -c $< -o $@
 
 # Benchmark
 $(BUILD_DIR)/benchmark.o: $(SRC_DIR)/benchmark.cpp | $(BUILD_DIR)

@@ -5,9 +5,15 @@
  *   model_decomposed.bin        ALS bitplane format (original)
  *   model_decomposed_i2s.bin    I2_S packed format (BitNet-style)
  *   model_extra.bin             embedding + RMSNorm weights
+ *
+ * Also supports GGUF format (via gguf_loader.h):
+ *   model.gguf                  GGUF Q2_0 ternary weights (e.g. Bonsai)
  */
 #pragma once
 #include "model.h"
+#include "gguf_loader.h"
+#include <sys/stat.h>
+#include <dirent.h>
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -308,4 +314,98 @@ inline std::vector<LayerData> load_decomposed_layers_i2s(const std::string& path
         ld.terms.push_back(std::move(term));
     }
     return layers;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// UNIFIED LOADER: auto-detect GGUF vs .bin format
+// ═══════════════════════════════════════════════════════════════════════════
+// If model_dir/given path ends with .gguf, load directly via GGUF parser.
+// Otherwise, load from model_extra.bin + model_decomposed_i2s.bin.
+
+inline bool has_gguf_ext(const std::string& path) {
+    return path.size() >= 5 && path.substr(path.size() - 5) == ".gguf";
+}
+
+inline std::string model_path_for(const std::string& model_dir) {
+    // Check if model_dir is a .gguf file directly
+    struct stat st;
+    if (stat(model_dir.c_str(), &st) == 0 && S_ISREG(st.st_mode) && has_gguf_ext(model_dir)) {
+        return model_dir;  // direct .gguf path
+    }
+    // Check if model_dir contains a .gguf file
+    std::string gguf_path = model_dir + "/" + "model.gguf";
+    if (stat(gguf_path.c_str(), &st) == 0) return gguf_path;
+    gguf_path = model_dir + "/model.q2_0.gguf";
+    if (stat(gguf_path.c_str(), &st) == 0) return gguf_path;
+    // Scan for any .gguf file in the directory
+    DIR* dir = opendir(model_dir.c_str());
+    if (dir) {
+        struct dirent* entry;
+        while ((entry = readdir(dir)) != nullptr) {
+            std::string name = entry->d_name;
+            if (name.size() > 5 && name.substr(name.size() - 5) == ".gguf") {
+                gguf_path = model_dir + "/" + name;
+                closedir(dir);
+                return gguf_path;
+            }
+        }
+        closedir(dir);
+    }
+    return "";  // no GGUF file found
+}
+
+struct LoadedModel {
+    ModelConfig cfg;
+    std::vector<float> embedding;
+    std::vector<float> final_norm;
+    std::vector<NormWeights> layer_norms;
+    std::vector<LayerData> layers;
+};
+
+inline LoadedModel load_model_from(const std::string& model_path_or_dir) {
+    LoadedModel m;
+
+    // Check for .gguf (direct path or inside directory)
+    std::string gguf_path;
+    struct stat st;
+    if (stat(model_path_or_dir.c_str(), &st) == 0 && S_ISREG(st.st_mode) && has_gguf_ext(model_path_or_dir)) {
+        gguf_path = model_path_or_dir;
+    } else {
+        gguf_path = model_path_for(model_path_or_dir);
+    }
+
+    if (!gguf_path.empty()) {
+        // ── GGUF path ────────────────────────────────────────────────────
+        std::cout << "Loading GGUF model: " << gguf_path << std::endl;
+        if (!load_gguf_model(gguf_path, m.cfg, m.embedding,
+                              m.layer_norms, m.final_norm, m.layers)) {
+            std::cerr << "GGUF load failed" << std::endl;
+            exit(1);
+        }
+    } else {
+        // ── Legacy .bin path ─────────────────────────────────────────────
+        std::string extra_path = model_path_or_dir + "/model_extra.bin";
+        std::string i2s_path   = model_path_or_dir + "/model_decomposed_i2s.bin";
+        std::string als_path   = model_path_or_dir + "/model_decomposed.bin";
+
+        struct stat st_extra;
+        if (stat(extra_path.c_str(), &st_extra) != 0) {
+            std::cerr << "No model files found in " << model_path_or_dir << std::endl;
+            exit(1);
+        }
+
+        m.cfg = load_config(extra_path);
+        m.embedding = load_embedding(extra_path, m.cfg);
+        m.final_norm = load_final_norm(extra_path, m.cfg);
+        m.layer_norms = load_layer_norms(extra_path, m.cfg);
+
+        std::ifstream test_i2s(i2s_path);
+        if (test_i2s.good()) {
+            m.layers = load_decomposed_layers_i2s(i2s_path);
+        } else {
+            m.layers = load_decomposed_layers(als_path);
+        }
+    }
+
+    return m;
 }

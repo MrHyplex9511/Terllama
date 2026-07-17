@@ -1,11 +1,14 @@
 # Build artifacts
 build/
+build-cmake/
+build_cmake/
 terllama
 terllama-bench
 benchmark
 *.o
 *.obj
 *.exe
+compile_commands.json
 
 # IDE / OS
 .vscode/
@@ -14,6 +17,7 @@ benchmark
 *.swo
 *~
 .DS_Store
+.clang-format
 
 # Python
 __pycache__/
@@ -30,3 +34,6 @@ venv/
 *.gguf
 *.onnx
 *.npy
+
+# Generated docs
+docs/

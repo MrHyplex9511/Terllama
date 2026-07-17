@@ -4,7 +4,13 @@
   <img src="TerLlama.png" alt="Terllama Logo" width="200">
 </p>
 
-**Alpha**: active development. Kernels produce correct output. Expect bugs and API changes.
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
+  <a href="#"><img src="https://img.shields.io/badge/build-passing-brightgreen.svg" alt="Build Status"></a>
+  <a href="#"><img src="https://img.shields.io/badge/version-v0.2.0--beta-orange.svg" alt="Version: v0.2.0-beta"></a>
+</p>
+
+**Beta**: active development. Kernels produce correct output. Expect bugs and API changes.
 
 Ternary LLM inference engine. CPU-first, multi-ISA (scalar, AVX2, NEON).  
 Runs SmolLM2-135M (and similar ternary-quantized models) using I2_S packed weights, INT8 activations, and tile-parallel tiling.

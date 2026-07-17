@@ -95,12 +95,26 @@ void ternary_linear_i2s(const LayerData& layer, const float* input, float* outpu
     }
 
     int n_blocks = (layer.in_features + layer.i2s_qk - 1) / layer.i2s_qk;
+    int codes_per_block = layer.i2s_qk / 4;  // 32 for qk=128
 
-    std::vector<const uint8_t*> block_data(layer.i2s_blocks.size());
-    std::vector<const float*> block_scales(layer.i2s_blocks.size());
-    for (size_t i = 0; i < layer.i2s_blocks.size(); i++) {
-        block_data[i] = layer.i2s_blocks[i].packed.data();
-        block_scales[i] = &layer.i2s_blocks[i].scale;
+    // Build contiguous per-row data for the kernel, which expects
+    // i2s_block_data[row] to point to row's codes (n_blocks*32 contiguous bytes)
+    // and i2s_block_scales[row] to point to row's scales (n_blocks floats).
+    std::vector<uint8_t> contiguous_data((size_t)layer.out_features * n_blocks * codes_per_block);
+    std::vector<float>   contiguous_scales((size_t)layer.out_features * n_blocks);
+    for (int row = 0; row < layer.out_features; row++) {
+        for (int b = 0; b < n_blocks; b++) {
+            size_t idx = (size_t)row * n_blocks + b;
+            std::memcpy(&contiguous_data[(size_t)row * n_blocks * codes_per_block + b * codes_per_block],
+                        layer.i2s_blocks[idx].packed.data(), (size_t)codes_per_block);
+            contiguous_scales[(size_t)row * n_blocks + b] = layer.i2s_blocks[idx].scale;
+        }
+    }
+    std::vector<const uint8_t*> block_data(layer.out_features);
+    std::vector<const float*> block_scales(layer.out_features);
+    for (int row = 0; row < layer.out_features; row++) {
+        block_data[row] = &contiguous_data[(size_t)row * n_blocks * codes_per_block];
+        block_scales[row] = &contiguous_scales[(size_t)row * n_blocks];
     }
 
     CPUArch arch = (override_arch != CPUArch::UNKNOWN) ? override_arch : detect_cpu_arch();

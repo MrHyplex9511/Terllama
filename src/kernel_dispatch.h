@@ -681,7 +681,7 @@ inline void ternary_mul_neon(const uint32_t* const* term_data,
 inline void ternary_linear(const LayerData& layer,
                             const float* input,
                             float* output,
-                            CPUArch override_arch = CPUArch::UNKNOWN) {
+                            CPUArch override_arch) {
     const int max_terms = 32;
     const uint32_t* term_data[32];
     int alpha_exps[32];
@@ -734,7 +734,7 @@ inline void ternary_linear(const LayerData& layer,
 inline float validate_all_kernels(const LayerData& layer,
                                    const float* input,
                                    float* output_reference,
-                                   const char* reference_name = "scalar") {
+                                   const char* reference_name) {
     struct KernelInfo { CPUArch arch; const char* name; };
     KernelInfo all[] = {
         {CPUArch::X86_64_SCALAR, "scalar"},

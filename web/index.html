@@ -562,6 +562,68 @@ body {
   transform: none;
 }
 
+/* ── Stop Button ── */
+.btn-stop {
+  display: none;
+  width: 36px;
+  height: 36px;
+  border: 2px solid var(--danger);
+  border-radius: 50%;
+  background: transparent;
+  color: var(--danger);
+  cursor: pointer;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  font-weight: 700;
+  margin: 4px;
+  flex-shrink: 0;
+  transition: background var(--transition), transform 0.1s ease;
+  position: relative;
+}
+.btn-stop.visible {
+  display: flex;
+}
+.btn-stop:hover {
+  background: rgba(239, 68, 68, 0.1);
+}
+.btn-stop:active {
+  transform: scale(0.92);
+}
+.btn-stop.pulsing {
+  animation: stopPulse 1.5s ease-in-out infinite;
+}
+@keyframes stopPulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.4); }
+  50% { box-shadow: 0 0 0 8px rgba(239, 68, 68, 0); }
+}
+
+/* ── Token Counter ── */
+.token-counter {
+  display: none;
+  align-items: center;
+  gap: 12px;
+  padding: 4px 16px 8px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  font-family: var(--mono);
+}
+.token-counter.visible {
+  display: flex;
+}
+.token-counter .stat {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+}
+.token-counter .stat-value {
+  font-weight: 600;
+  color: var(--text);
+}
+.token-counter .stat-label {
+  opacity: 0.7;
+}
+
 /* ── Footer ── */
 .footer {
   text-align: center;
@@ -645,16 +707,29 @@ body {
     </div>
   </div>
 
+  <!-- Token Counter (visible during streaming) -->
+  <div class="token-counter" id="tokenCounter">
+    <span class="stat">
+      <span class="stat-value" id="tokenCount">0</span>
+      <span class="stat-label">tokens</span>
+    </span>
+    <span class="stat">
+      <span class="stat-value" id="tpsValue">0.0</span>
+      <span class="stat-label">TPS</span>
+    </span>
+  </div>
+
   <!-- Input -->
   <div class="input-area">
     <div class="input-wrap">
       <textarea id="inputBox" placeholder="Type your message..." rows="1"></textarea>
       <button class="btn-send" id="sendBtn" aria-label="Send message">➤</button>
+      <button class="btn-stop" id="stopBtn" aria-label="Stop generation">■</button>
     </div>
   </div>
 
   <!-- Footer -->
-  <div class="footer">Terllama v0.1-alpha</div>
+  <div class="footer">Terllama v0.2.0-beta</div>
 </div>
 
 <script>
@@ -671,6 +746,8 @@ body {
     systemPrompt: 'You are a helpful assistant.',
     models: [],
     darkMode: false,
+    tokenCount: 0,
+    startTime: 0,
   };
 
   /* ── DOM refs ── */
@@ -681,6 +758,7 @@ body {
     messages: $('#messages'),
     inputBox: $('#inputBox'),
     sendBtn: $('#sendBtn'),
+    stopBtn: $('#stopBtn'),
     modelSelect: $('#modelSelect'),
     tempSlider: $('#tempSlider'),
     tempValue: $('#tempValue'),
@@ -691,6 +769,9 @@ body {
     clearChat: $('#clearChat'),
     themeToggle: $('#themeToggle'),
     app: $('#app'),
+    tokenCounter: $('#tokenCounter'),
+    tokenCount: $('#tokenCount'),
+    tpsValue: $('#tpsValue'),
   };
 
   /* ── Theme ── */
@@ -762,9 +843,14 @@ body {
         state.currentModel = el.modelSelect.value;
       }
     } catch (err) {
-      el.modelSelect.innerHTML = '<option value="">No models found</option>';
+      console.error('fetchModels error:', err);
+      el.modelSelect.innerHTML = '<option value="">Connection error</option>';
       el.modelSelect.disabled = false;
-      addError('Failed to load models: ' + err.message);
+      let uiMsg = err.message;
+      if (err.message.includes('Failed to fetch') || err.message.includes('NetworkError')) {
+        uiMsg = 'Cannot connect to server. Is Terllama running on port ' + window.location.port + '?';
+      }
+      addError('⚠️ ' + uiMsg);
     }
   }
 
@@ -972,6 +1058,13 @@ body {
               fullContent += delta;
               msgEl = addMessage('assistant', fullContent, true);
               scrollToBottom();
+              // Token counter: count non-empty deltas
+              state.tokenCount++;
+              el.tokenCount.textContent = state.tokenCount;
+              const elapsed = (performance.now() - state.startTime) / 1000;
+              if (elapsed > 0) {
+                el.tpsValue.textContent = (state.tokenCount / elapsed).toFixed(1);
+              }
             }
           } catch (_) {
             // Skip unparseable chunks
@@ -1012,7 +1105,21 @@ body {
   function setSending(sending) {
     el.sendBtn.disabled = sending;
     el.inputBox.disabled = sending;
-    el.sendBtn.textContent = sending ? '⏳' : '➤';
+    if (sending) {
+      el.sendBtn.textContent = '';
+      el.sendBtn.style.display = 'none';
+      el.stopBtn.classList.add('visible', 'pulsing');
+      state.tokenCount = 0;
+      state.startTime = performance.now();
+      el.tokenCount.textContent = '0';
+      el.tpsValue.textContent = '0.0';
+      el.tokenCounter.classList.add('visible');
+    } else {
+      el.sendBtn.textContent = '➤';
+      el.sendBtn.style.display = '';
+      el.stopBtn.classList.remove('visible', 'pulsing');
+      el.tokenCounter.classList.remove('visible');
+    }
   }
 
   /* ── Input helpers ── */
@@ -1044,6 +1151,13 @@ body {
 
   // Send
   el.sendBtn.addEventListener('click', sendMessage);
+
+  // Stop generation
+  el.stopBtn.addEventListener('click', () => {
+    cancelStream();
+    el.stopBtn.classList.remove('visible', 'pulsing');
+    el.tokenCounter.classList.remove('visible');
+  });
 
   // Input: Enter to send, Shift+Enter for newline
   el.inputBox.addEventListener('keydown', (e) => {
