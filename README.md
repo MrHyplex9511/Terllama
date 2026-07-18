@@ -13,7 +13,7 @@
 [![Install](https://img.shields.io/badge/install-one--liner-brightgreen)](install.sh)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/your-org/terllama/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/MrHyplex9511/Terllama/main/install.sh | bash
 ```
 
 ## 🎥 Demo
