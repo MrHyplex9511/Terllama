@@ -159,6 +159,14 @@ pub async fn stream_chat(
     Ok(())
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateInfo {
+    pub update_available: bool,
+    pub latest_version: String,
+    pub current_version: String,
+    pub download_url: String,
+}
+
 #[tauri::command]
 pub async fn get_settings() -> Result<Settings, String> {
     Ok(Settings::load())
@@ -167,4 +175,44 @@ pub async fn get_settings() -> Result<Settings, String> {
 #[tauri::command]
 pub async fn save_settings(settings: Settings) -> Result<(), String> {
     settings.save()
+}
+
+#[tauri::command]
+pub async fn check_update() -> Result<UpdateInfo, String> {
+    let current_version = "1.0.0";
+    let client = Client::builder()
+        .user_agent("Terllama-Desktop/1.0.0")
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+
+    let resp = client
+        .get("https://api.github.com/repos/MrHyplex9511/Terllama/releases/latest")
+        .send()
+        .await
+        .map_err(|e| format!("Failed to check for updates: {}", e))?;
+
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse update response: {}", e))?;
+
+    let latest_tag = body["tag_name"]
+        .as_str()
+        .unwrap_or("v1.0.0")
+        .trim_start_matches('v')
+        .to_string();
+
+    let download_url = body["html_url"]
+        .as_str()
+        .unwrap_or("https://github.com/MrHyplex9511/Terllama/releases")
+        .to_string();
+
+    let update_available = latest_tag != current_version;
+
+    Ok(UpdateInfo {
+        update_available,
+        latest_version: latest_tag,
+        current_version: current_version.to_string(),
+        download_url,
+    })
 }

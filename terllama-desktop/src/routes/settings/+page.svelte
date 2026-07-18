@@ -7,6 +7,24 @@
   const s = getSettingsState();
 
   let saveStatus = $state<string | null>(null);
+  let updateStatus = $state<{ text: string; available: boolean } | null>(null);
+
+  async function checkNow() {
+    updateStatus = { text: 'Checking...', available: false };
+    try {
+      const info: any = await invoke('check_update');
+      if (info.update_available) {
+        updateStatus = {
+          text: `v${info.latest_version} available! Download from GitHub`,
+          available: true,
+        };
+      } else {
+        updateStatus = { text: 'Up to date (v1.0.0)', available: false };
+      }
+    } catch {
+      updateStatus = { text: 'Could not check (offline?)', available: false };
+    }
+  }
 
   async function browseModelDir() {
     const dir = await open({
@@ -196,6 +214,20 @@
           class="link"
         >github.com/MrHyplex9511/Terllama</a>
       </div>
+      <div class="about-row">
+        <span></span>
+        <button class="check-update-btn" onclick={checkNow}>
+          Check for Updates
+        </button>
+      </div>
+      {#if updateStatus}
+        <div class="about-row">
+          <span></span>
+          <span class:update-available={updateStatus.available} class:up-to-date={!updateStatus.available}>
+            {updateStatus.text}
+          </span>
+        </div>
+      {/if}
     </div>
   </div>
 
@@ -400,6 +432,32 @@
     border-color: var(--accent);
     color: var(--accent-hover);
     background: rgba(124, 58, 237, 0.1);
+  }
+
+  .check-update-btn {
+    padding: 6px 14px;
+    border: 1px solid var(--accent);
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--accent-hover);
+    font-size: 12px;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+
+  .check-update-btn:hover {
+    background: rgba(124, 58, 237, 0.1);
+  }
+
+  .update-available {
+    color: var(--accent-hover);
+    font-weight: 500;
+    font-size: 13px;
+  }
+
+  .up-to-date {
+    color: var(--success);
+    font-size: 13px;
   }
 
   .about-info {

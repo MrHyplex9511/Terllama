@@ -52,6 +52,7 @@ fn main() {
             commands::stream_chat,
             commands::get_settings,
             commands::save_settings,
+            commands::check_update,
         ])
         .setup(|app| {
             // Tray icon and menu

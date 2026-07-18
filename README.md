@@ -16,6 +16,8 @@
 curl -fsSL https://raw.githubusercontent.com/MrHyplex9511/Terllama/main/install.sh | bash
 ```
 
+**Uninstall:** `curl -fsSL https://raw.githubusercontent.com/MrHyplex9511/Terllama/main/uninstall.sh | bash`
+
 ## 🎥 Demo
 
 [![asciicast](https://img.shields.io/badge/demo-asciinema-blue)](https://asciinema.org/a/PLACEHOLDER)

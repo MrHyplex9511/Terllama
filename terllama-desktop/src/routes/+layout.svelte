@@ -16,6 +16,7 @@
   let currentRoute = $state('library');
   let sidebarCollapsed = $state(false);
   let showOnboarding = $state(false);
+  let updateInfo = $state<{ latest: string; current: string; url: string } | null>(null);
 
   // Load settings on mount
   $effect(() => {
@@ -27,7 +28,26 @@
     if (!onboarded) {
       showOnboarding = true;
     }
+
+    // Check for updates on startup
+    checkForUpdates();
   });
+
+  async function checkForUpdates() {
+    try {
+      const { invoke } = await import('@tauri-apps/api/core');
+      const info: any = await invoke('check_update');
+      if (info.update_available) {
+        updateInfo = {
+          latest: info.latest_version,
+          current: info.current_version,
+          url: info.download_url,
+        };
+      }
+    } catch {
+      // Silently fail — offline or rate-limited
+    }
+  }
 
   function navigate(route: string) {
     currentRoute = route;
@@ -51,6 +71,25 @@
 
 {#if showOnboarding}
   <Onboarding onComplete={() => (showOnboarding = false)} />
+{/if}
+
+{#if updateInfo}
+  <div class="update-banner">
+    <span>
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align: middle; margin-right: 8px;">
+        <polyline points="23 4 23 10 17 10" />
+        <polyline points="1 20 1 14 7 14" />
+        <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" />
+      </svg>
+      Update <strong>v{updateInfo.latest}</strong> available (you have v{updateInfo.current})
+    </span>
+    <div class="update-actions">
+      <a href={updateInfo.url} target="_blank" rel="noopener noreferrer" class="update-btn">
+        Download
+      </a>
+      <button class="update-dismiss" onclick={() => (updateInfo = null)}>×</button>
+    </div>
+  </div>
 {/if}
 
 <div class="app-layout">
@@ -108,6 +147,54 @@
 </div>
 
 <style>
+  .update-banner {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 16px;
+    padding: 8px 20px;
+    background: linear-gradient(135deg, #7c3aed, #a855f7);
+    color: white;
+    font-size: 13px;
+    z-index: 100;
+    position: relative;
+  }
+
+  .update-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .update-btn {
+    padding: 4px 14px;
+    background: white;
+    color: #7c3aed;
+    font-weight: 600;
+    font-size: 12px;
+    border-radius: 6px;
+    text-decoration: none;
+    transition: opacity 0.15s;
+  }
+
+  .update-btn:hover {
+    opacity: 0.9;
+  }
+
+  .update-dismiss {
+    background: none;
+    border: none;
+    color: white;
+    font-size: 20px;
+    cursor: pointer;
+    padding: 0 4px;
+    opacity: 0.7;
+  }
+
+  .update-dismiss:hover {
+    opacity: 1;
+  }
+
   .app-layout {
     display: flex;
     height: 100vh;
