@@ -624,6 +624,35 @@ body {
   opacity: 0.7;
 }
 
+/* ── Context Bar ── */
+.context-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 16px 8px;
+  font-size: 12px;
+  font-family: var(--mono);
+  color: var(--text-secondary);
+}
+.context-bar.hidden { display: none; }
+.context-track {
+  flex: 1;
+  height: 8px;
+  background: var(--border);
+  border-radius: 4px;
+  overflow: hidden;
+  max-width: 200px;
+}
+.context-fill {
+  height: 100%;
+  border-radius: 4px;
+  transition: width 0.3s ease, background 0.3s ease;
+  background: #4CAF50;
+}
+.context-fill.warning { background: #FF9800; }
+.context-fill.danger { background: #f44336; }
+.context-text { min-width: 100px; text-align: right; }
+
 /* ── Footer ── */
 .footer {
   text-align: center;
@@ -719,6 +748,15 @@ body {
     </span>
   </div>
 
+  <!-- Context Bar -->
+  <div class="context-bar hidden" id="contextBar">
+    <span class="context-label">Context:</span>
+    <div class="context-track">
+      <div class="context-fill" id="contextFill" style="width:0%"></div>
+    </div>
+    <span class="context-text" id="contextText">0 / 4,096</span>
+  </div>
+
   <!-- Input -->
   <div class="input-area">
     <div class="input-wrap">
@@ -729,7 +767,7 @@ body {
   </div>
 
   <!-- Footer -->
-  <div class="footer">Terllama v0.2.0-beta</div>
+  <div class="footer">Terllama v1.0.0</div>
 </div>
 
 <script>
@@ -747,8 +785,11 @@ body {
     models: [],
     darkMode: false,
     tokenCount: 0,
+    contextTokens: 0,
     startTime: 0,
   };
+
+  const MAX_CONTEXT = 4096;
 
   /* ── DOM refs ── */
   const $ = (s) => document.querySelector(s);
@@ -772,6 +813,9 @@ body {
     tokenCounter: $('#tokenCounter'),
     tokenCount: $('#tokenCount'),
     tpsValue: $('#tpsValue'),
+    contextBar: $('#contextBar'),
+    contextFill: $('#contextFill'),
+    contextText: $('#contextText'),
   };
 
   /* ── Theme ── */
@@ -1061,6 +1105,7 @@ body {
               // Token counter: count non-empty deltas
               state.tokenCount++;
               el.tokenCount.textContent = state.tokenCount;
+              updateContextBar(state.tokenCount);
               const elapsed = (performance.now() - state.startTime) / 1000;
               if (elapsed > 0) {
                 el.tpsValue.textContent = (state.tokenCount / elapsed).toFixed(1);
@@ -1114,12 +1159,29 @@ body {
       el.tokenCount.textContent = '0';
       el.tpsValue.textContent = '0.0';
       el.tokenCounter.classList.add('visible');
+      el.contextBar.classList.add('hidden');
+      el.contextFill.style.width = '0%';
+      el.contextText.textContent = '0 / ' + MAX_CONTEXT.toLocaleString();
     } else {
       el.sendBtn.textContent = '➤';
       el.sendBtn.style.display = '';
       el.stopBtn.classList.remove('visible', 'pulsing');
       el.tokenCounter.classList.remove('visible');
     }
+  }
+
+  /* ── Context Bar ── */
+  function updateContextBar(tokens) {
+    state.contextTokens = tokens;
+    const pct = Math.min(100, (tokens / MAX_CONTEXT) * 100);
+    el.contextFill.style.width = pct + '%';
+    el.contextText.textContent = tokens.toLocaleString() + ' / ' + MAX_CONTEXT.toLocaleString();
+
+    el.contextFill.classList.remove('warning', 'danger');
+    if (pct > 95) el.contextFill.classList.add('danger');
+    else if (pct > 80) el.contextFill.classList.add('warning');
+
+    el.contextBar.classList.remove('hidden');
   }
 
   /* ── Input helpers ── */

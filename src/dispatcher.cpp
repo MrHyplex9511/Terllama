@@ -6,6 +6,7 @@
  */
 #include "kernel_decl.h"
 #include "model.h"
+#include "core/logger.h"
 #include <cstring>
 #include <cmath>
 #include <algorithm>
@@ -175,8 +176,7 @@ float validate_all_kernels(const LayerData& layer, const float* input,
             float d = std::abs(ref[i] - test[i]);
             if (d > err) err = d;
         }
-        printf("  %-8s vs scalar: max_err = %8.2e  %s\n",
-               k.name, err, err < 1e-4f ? "OK" : "MISMATCH!");
+        Logger::debug("  {} vs scalar: max_err = {}  {}", k.name, err, err < 1e-4f ? "OK" : "MISMATCH!");
         if (err > max_err) max_err = err;
 
         if (output_reference && strcmp(k.name, reference_name) == 0) {

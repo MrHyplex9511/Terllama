@@ -14,6 +14,7 @@
 #include "model.h"
 #include "loader.h"
 #include "inference.h"
+#include "core/tokenizer.h"
 
 // ═══════════════════════════════════════════════════════════════════════════
 // SHARED GLOBAL STATE (defined in server.cpp)
@@ -30,11 +31,15 @@ struct ServerModelState {
     std::string helper_dir;
     CPUArch arch{CPUArch::UNKNOWN};
     bool loaded{false};
+    Tokenizer tokenizer;  // native tokenizer from GGUF metadata
 };
 
 extern ServerModelState g_model;
 extern std::mutex       g_model_mutex;
 extern std::string      g_api_key;
+extern size_t           g_memory_limit;
+extern std::atomic<int> g_active_requests;
+extern std::atomic<long long> g_last_request_time;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // MESSAGE STRUCT (chat prompt building)
@@ -44,6 +49,8 @@ struct Message {
     std::string role;
     std::string content;
 };
+
+bool init_server(const std::string& model_dir);
 
 // ═══════════════════════════════════════════════════════════════════════════
 // RESPONSE HELPERS
@@ -59,13 +66,11 @@ void send_error(httplib::Response& res, const std::string& message,
                 const std::string& type = "server_error");
 
 // ═══════════════════════════════════════════════════════════════════════════
-// TOKENIZER HELPERS (Python subprocess bridge via posix_spawn)
+// TOKENIZER (Python subprocess for encode, native C++ for decode)
 // ═══════════════════════════════════════════════════════════════════════════
 
-std::vector<int> tokenize_with_python(const std::string& prompt,
+std::vector<int> tokenize_with_helper(const std::string& prompt,
                                       const std::string& helper_dir);
-std::string decode_with_python(const std::vector<int>& tokens,
-                               const std::string& helper_dir);
 
 // ═══════════════════════════════════════════════════════════════════════════
 // COMPLETION HELPERS

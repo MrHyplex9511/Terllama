@@ -38,6 +38,7 @@
 #include <thread>
 #include <atomic>
 #include <chrono>
+#include "core/logger.h"
 
 using json = nlohmann::json;
 
@@ -48,12 +49,15 @@ using json = nlohmann::json;
 ServerModelState g_model;
 std::mutex       g_model_mutex;
 std::string      g_api_key;
+size_t           g_memory_limit = 0;
+std::atomic<int> g_active_requests{0};
+std::atomic<long long> g_last_request_time{0};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // MODEL LOADING
 // ═══════════════════════════════════════════════════════════════════════════
 
-static bool init_server(const std::string& model_dir) {
+bool init_server(const std::string& model_dir) {
     std::lock_guard<std::mutex> lock(g_model_mutex);
     if (g_model.loaded) return true;
 
@@ -79,32 +83,30 @@ static bool init_server(const std::string& model_dir) {
         else if (ao == "neon")    g_model.arch = CPUArch::ARM64_NEON;
     }
 
-    std::cout << "Terllama — CPU: " << cpu_arch_name(g_model.arch)
-              << "  |  Model: " << model_dir << std::endl;
+    Logger::info("Terllama — CPU: {}  |  Model: {}", cpu_arch_name(g_model.arch), model_dir);
 
     try {
-        std::cout << "Loading model (auto-detect GGUF vs .bin)..." << std::endl;
+        Logger::info("Loading model (auto-detect GGUF vs .bin)...");
         auto loaded = load_model_from(model_dir);
         g_model.cfg = loaded.cfg;
         g_model.embedding = loaded.embedding;
         g_model.layer_norms = loaded.layer_norms;
         g_model.final_norm = loaded.final_norm;
         g_model.layers = loaded.layers;
-        std::cout << "  Loaded " << g_model.layers.size() << " layers."
-                  << std::endl;
+        Logger::info("  Loaded {} layers.", g_model.layers.size());
 
-        std::cout << "Building RoPE cache..." << std::endl;
+        Logger::info("Building RoPE cache...");
         g_model.rope = build_rope_cache(
             g_model.cfg.max_position_embeddings,
             g_model.cfg.head_dim,
             g_model.cfg.rope_theta);
 
         g_model.loaded = true;
-        std::cout << "Server initialized." << std::endl;
+        Logger::info("Server initialized.");
         return true;
 
     } catch (const std::exception& e) {
-        std::cerr << "Failed to load model: " << e.what() << std::endl;
+        Logger::error("Failed to load model: {}", e.what());
         return false;
     }
 }
@@ -166,13 +168,99 @@ int server_main(int argc, char** argv) {
         if (env_key) g_api_key = env_key;
     }
 
+    std::string keep_alive_str = "5m";
+    for (int i = 1; i < argc - 1; i++) {
+        std::string a = argv[i];
+        if (a == "--keep-alive") {
+            keep_alive_str = argv[i + 1];
+            break;
+        }
+    }
+
+    long long keep_alive_ms = 5 * 60 * 1000; // default 5m
+    if (!keep_alive_str.empty()) {
+        try {
+            if (keep_alive_str.back() == 'm') {
+                keep_alive_ms = std::stoll(keep_alive_str.substr(0, keep_alive_str.size() - 1)) * 60 * 1000;
+            } else if (keep_alive_str.back() == 's') {
+                keep_alive_ms = std::stoll(keep_alive_str.substr(0, keep_alive_str.size() - 1)) * 1000;
+            } else {
+                keep_alive_ms = std::stoll(keep_alive_str) * 1000;
+            }
+        } catch (...) {
+            Logger::warn("Invalid --keep-alive format: {}, default to 5m", keep_alive_str);
+            keep_alive_ms = 5 * 60 * 1000;
+        }
+    }
+
+    // Parse memory limit
+    for (int i = 1; i < argc - 1; i++) {
+        std::string a = argv[i];
+        if (a == "--memory-limit") {
+            std::string limit_str = argv[i + 1];
+            try {
+                char unit = limit_str.back();
+                if (unit == 'G' || unit == 'g') {
+                    g_memory_limit = std::stoull(limit_str.substr(0, limit_str.size() - 1)) * 1024 * 1024 * 1024;
+                } else if (unit == 'M' || unit == 'm') {
+                    g_memory_limit = std::stoull(limit_str.substr(0, limit_str.size() - 1)) * 1024 * 1024;
+                } else if (unit == 'K' || unit == 'k') {
+                    g_memory_limit = std::stoull(limit_str.substr(0, limit_str.size() - 1)) * 1024;
+                } else {
+                    g_memory_limit = std::stoull(limit_str);
+                }
+                Logger::info("Memory limit set to: {} bytes", g_memory_limit);
+            } catch (...) {
+                Logger::warn("Invalid --memory-limit format: {}, disabling limit", limit_str);
+                g_memory_limit = 0;
+            }
+            break;
+        }
+    }
+
     std::string web_dir = model_dir + "/web";
 
     // ─── Init model ─────────────────────────────────────────────────────
-    std::cout << "Initializing Terllama server..." << std::endl;
+    Logger::info("Initializing Terllama server...");
     if (!init_server(model_dir)) {
-        std::cerr << "FATAL: failed to load model from " << model_dir << std::endl;
+        Logger::error("FATAL: failed to load model from {}", model_dir);
         return 1;
+    }
+
+    // Start keep-alive watchdog thread
+    if (keep_alive_ms > 0) {
+        g_last_request_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        
+        std::thread watchdog([keep_alive_ms]() {
+            while (true) {
+                std::this_thread::sleep_for(std::chrono::seconds(5));
+                if (g_model.loaded) {
+                    long long now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count();
+                    long long last = g_last_request_time.load();
+                    if (now - last > keep_alive_ms && g_active_requests.load() == 0) {
+                        Logger::info("No request for {} ms. Unloading model to save memory...", keep_alive_ms);
+                        std::lock_guard<std::mutex> lock(g_model_mutex);
+                        g_model.embedding.clear();
+                        g_model.embedding.shrink_to_fit();
+                        g_model.layers.clear();
+                        g_model.layers.shrink_to_fit();
+                        g_model.final_norm.clear();
+                        g_model.final_norm.shrink_to_fit();
+                        g_model.layer_norms.clear();
+                        g_model.layer_norms.shrink_to_fit();
+                        g_model.rope.sin.clear();
+                        g_model.rope.sin.shrink_to_fit();
+                        g_model.rope.cos.clear();
+                        g_model.rope.cos.shrink_to_fit();
+                        g_model.loaded = false;
+                        Logger::info("Model unloaded.");
+                    }
+                }
+            }
+        });
+        watchdog.detach();
     }
 
     // ─── HTTP server ────────────────────────────────────────────────────
@@ -191,7 +279,7 @@ int server_main(int argc, char** argv) {
         std::ifstream test_web(web_dir + "/index.html");
         if (test_web.good()) {
             svr.set_base_dir(web_dir, "/");
-            std::cout << "Web UI at http://0.0.0.0:" << port << "/" << std::endl;
+            Logger::info("Web UI at http://0.0.0.0:{}/", port);
         } else {
             svr.Get("/", [](const httplib::Request& req, httplib::Response& res) {
                 (void)req;
@@ -207,7 +295,7 @@ int server_main(int argc, char** argv) {
                     })}
                 }.dump());
             });
-            std::cout << "No web/index.html — serving API listing at /" << std::endl;
+            Logger::info("No web/index.html — serving API listing at /");
         }
     }
 
@@ -239,34 +327,39 @@ int server_main(int argc, char** argv) {
     svr.set_write_timeout(300, 0);
 
     // ─── Banner ─────────────────────────────────────────────────────────
-    std::cout << "\n"
-              << "╔══════════════════════════════════════════════╗\n"
-              << "║        Terllama Inference Server            ║\n"
-              << "╠══════════════════════════════════════════════╣\n"
-              << "║  CPU:    " << cpu_arch_name(g_model.arch);
+    Logger::info("");
+    Logger::info("╔══════════════════════════════════════════════╗");
+    Logger::info("║        Terllama Inference Server            ║");
+    Logger::info("╠══════════════════════════════════════════════╣");
     {
+        std::string cpu_line = "║  CPU:    ";
+        cpu_line += cpu_arch_name(g_model.arch);
         int pad = 35 - (int)strlen(cpu_arch_name(g_model.arch));
-        for (int i = 0; i < pad; i++) std::cout << ' ';
-        std::cout << "║\n";
+        cpu_line.append(pad, ' ');
+        cpu_line += "║";
+        Logger::info(cpu_line.c_str());
     }
-    std::cout << "║  Layers: " << g_model.cfg.num_hidden_layers
-              << "  Hidden: " << g_model.cfg.hidden_size
-              << "  Heads: " << g_model.cfg.num_attention_heads
-              << "        ║\n"
-              << "║  Port:   " << port;
+    Logger::info("║  Layers: {}  Hidden: {}  Heads: {}        ║",
+                 g_model.cfg.num_hidden_layers, g_model.cfg.hidden_size,
+                 g_model.cfg.num_attention_heads);
     {
+        std::string port_line = "║  Port:   ";
+        port_line += std::to_string(port);
         int pad = (port < 10000 ? 1 : 0) + (port < 1000 ? 1 : 0);
-        for (int i = 0; i < 36 - pad; i++) std::cout << ' ';
-        std::cout << "║\n";
+        port_line.append(36 - pad, ' ');
+        port_line += "║";
+        Logger::info(port_line.c_str());
     }
-    std::cout << "║  API:    http://0.0.0.0:" << port << "/v1/models";
     {
+        std::string api_line = "║  API:    http://0.0.0.0:";
+        api_line += std::to_string(port);
+        api_line += "/v1/models";
         int pad = 18 - (port > 9999 ? 5 : port > 999 ? 4 : 3);
-        for (int i = 0; i < pad; i++) std::cout << ' ';
-        std::cout << "║\n";
+        api_line.append(pad, ' ');
+        api_line += "║";
+        Logger::info(api_line.c_str());
     }
-    std::cout << "╚══════════════════════════════════════════════╝\n"
-              << std::endl;
+    Logger::info("╚══════════════════════════════════════════════╝");
 
     svr.listen("0.0.0.0", port);
     return 0;

@@ -18,12 +18,14 @@
  *   TERLLAMA_PORT        server port (default 8375)
  */
 #include "cli/commands.h"
+#include "core/logger.h"
 
 #include <iostream>
 #include <string>
 #include <cstdlib>
 #include <pwd.h>
 #include <unistd.h>
+#include <csignal>
 
 // ═══════════════════════════════════════════════════════════════════════════
 // HELPERS
@@ -60,6 +62,16 @@ std::string fmt_size(double bytes) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 int main(int argc, char** argv) {
+    // Install signal handlers
+    signal(SIGINT,  handle_signal);
+    signal(SIGTERM, handle_signal);
+
+    // Version flag
+    if (argc == 2 && (std::string(argv[1]) == "--version" || std::string(argv[1]) == "-v")) {
+        std::cout << "Terllama v" << TERLLAMA_VERSION << std::endl;
+        return 0;
+    }
+
     if (argc < 2) {
         print_usage(argv[0]);
         return 1;
@@ -75,7 +87,7 @@ int main(int argc, char** argv) {
 
     if (cmd == "show") {
         if (argc < 3) {
-            std::cerr << "Usage: " << argv[0] << " show <model>" << std::endl;
+            Logger::error("Usage: {} show <model>", argv[0]);
             return 1;
         }
         return cmd_show(argv[2]);
@@ -83,7 +95,7 @@ int main(int argc, char** argv) {
 
     if (cmd == "rm" || cmd == "remove") {
         if (argc < 3) {
-            std::cerr << "Usage: " << argv[0] << " rm <model>" << std::endl;
+            Logger::error("Usage: {} rm <model>", argv[0]);
             return 1;
         }
         return cmd_rm(argv[2]);
@@ -99,6 +111,10 @@ int main(int argc, char** argv) {
 
     if (cmd == "chat" || cmd == "cli") {
         return cmd_chat(argc, argv);
+    }
+
+    if (cmd == "bench" || cmd == "benchmark") {
+        return cmd_bench();
     }
 
     if (cmd == "--help" || cmd == "-h" || cmd == "help") {

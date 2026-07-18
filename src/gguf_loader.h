@@ -12,6 +12,7 @@
  */
 #pragma once
 #include "model.h"
+#include "core/tokenizer.h"
 #include <string>
 #include <vector>
 #include <cstdint>
@@ -75,6 +76,13 @@ struct GGUFFile {
     std::vector<GGUFTensorInfo> tensors;
     std::vector<uint8_t> file_data;  // full file in memory
     bool valid{false};
+
+    // Tokenizer vocab (extracted from metadata arrays)
+    std::vector<std::string> tokenizer_tokens;
+    std::vector<float> tokenizer_scores;
+    std::vector<int32_t> tokenizer_types;
+    std::string tokenizer_model;  // "llama" or "gpt2"
+    int32_t bos_token_id{-1}, eos_token_id{-1};
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -157,4 +165,5 @@ bool load_gguf_model(const std::string& path,
                      std::vector<float>& embedding,
                      std::vector<NormWeights>& layer_norms,
                      std::vector<float>& final_norm,
-                     std::vector<LayerData>& layers);
+                     std::vector<LayerData>& layers,
+                     Tokenizer* tokenizer = nullptr);

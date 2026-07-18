@@ -1,0 +1,66 @@
+{
+  "models": [
+    {
+      "id": "tinyllama",
+      "name": "TinyLlama-1.1B",
+      "hf_repo": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+      "format": "als",
+      "size_mb": 139,
+      "context": 2048,
+      "description": "1.1B parameter Llama-based model — fast CPU inference"
+    },
+    {
+      "id": "smolLM2",
+      "name": "SmolLM2-135M",
+      "hf_repo": "HuggingFaceTB/SmolLM2-135M",
+      "format": "i2s",
+      "size_mb": 54,
+      "context": 2048,
+      "description": "135M parameter model — fastest possible inference"
+    },
+    {
+      "id": "mistral-7b",
+      "name": "Mistral-7B-v0.3",
+      "hf_repo": "mistralai/Mistral-7B-v0.3",
+      "format": "gguf",
+      "size_mb": 4100,
+      "context": 32768,
+      "description": "7B parameter Mistral — strong quality, high RAM"
+    },
+    {
+      "id": "mistral-v0.3",
+      "hf_repo": "QuantFactory/Mistral-7B-Instruct-v0.3-GGUF",
+      "format": "gguf",
+      "size_mb": 4096,
+      "context": 32768,
+      "description": "Mistral 7B v0.3 Instruct"
+    },
+    {
+      "id": "llama-3.1-8b",
+      "name": "Llama-3.1-8B",
+      "hf_repo": "meta-llama/Llama-3.1-8B",
+      "format": "gguf",
+      "size_mb": 4800,
+      "context": 131072,
+      "description": "8B Llama 3.1 — best quality, needs 8GB+ RAM"
+    },
+    {
+      "id": "phi-3.5-mini",
+      "name": "Phi-3.5-mini",
+      "hf_repo": "microsoft/Phi-3.5-mini-instruct",
+      "format": "gguf",
+      "size_mb": 2600,
+      "context": 4096,
+      "description": "3.8B Phi-3.5 — Microsoft's efficient instruct model"
+    },
+    {
+      "id": "gemma-2b",
+      "name": "Gemma-2B",
+      "hf_repo": "google/gemma-2b-it",
+      "format": "gguf",
+      "size_mb": 1400,
+      "context": 8192,
+      "description": "2B Gemma — Google's lightweight model (experimental)"
+    }
+  ]
+}

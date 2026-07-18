@@ -77,6 +77,7 @@ add_library(terllama_core OBJECT
     src/cli/commands.cpp
     src/core/inference.cpp
     src/core/logger.cpp
+    src/core/tokenizer.cpp
     src/server/handlers.cpp
     src/server.cpp
     src/downloader.cpp

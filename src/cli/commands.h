@@ -8,6 +8,16 @@
 #pragma once
 #include <string>
 #include <vector>
+#include <atomic>
+#include <csignal>
+
+#define TERLLAMA_VERSION "1.0.0"
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SIGNAL HANDLING (defined in commands.cpp, installed in main.cpp)
+// ═══════════════════════════════════════════════════════════════════════════
+extern std::atomic<bool> g_interrupted;
+extern "C" void handle_signal(int sig);
 
 // ═══════════════════════════════════════════════════════════════════════════
 // HELPERS (defined in main.cpp)
@@ -27,6 +37,7 @@ int cmd_chat(int argc, char** argv);
 int cmd_pull(int argc, char** argv);
 int cmd_serve(int argc, char** argv);
 int cmd_legacy(const std::string& prompt, int max_tokens, float temperature);
+int cmd_bench();
 void print_usage(const char* prog);
 
 // ═══════════════════════════════════════════════════════════════════════════

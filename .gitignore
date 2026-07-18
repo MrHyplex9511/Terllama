@@ -35,5 +35,6 @@ venv/
 *.onnx
 *.npy
 
-# Generated docs
-docs/
+# Generated docs (specific excludes, not whole dir)
+docs/*.json
+docs/*.html

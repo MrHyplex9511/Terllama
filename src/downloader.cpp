@@ -6,6 +6,7 @@
 // scripts/export_ternary_model_bitnet.py. This C++ stub finds the script
 // relative to the binary path and invokes it with the right args.
 
+#include "core/logger.h"
 #include <iostream>
 #include <string>
 #include <cstdlib>
@@ -14,6 +15,13 @@
 #include <unistd.h>   // readlink, access
 #include <limits.h>   // PATH_MAX
 #include <vector>
+#include <thread>
+#include <atomic>
+#include <chrono>
+#include <spawn.h>
+#include <sys/wait.h>
+
+extern char **environ;
 
 static std::string get_bin_dir(const char* argv0) {
     // Try /proc/self/exe first (Linux)
@@ -38,13 +46,16 @@ static std::string slugify(const std::string& repo) {
 }
 
 static void print_usage(const char* prog) {
-    std::cerr << "Usage: " << prog << " pull <hf_repo> [--format i2s|als]" << std::endl;
-    std::cerr << "\nDownload a model from HuggingFace and convert to Terllama format." << std::endl;
-    std::cerr << "\nArguments:" << std::endl;
-    std::cerr << "  <hf_repo>    HuggingFace repo (e.g. HuggingFaceTB/SmolLM2-135M)" << std::endl;
-    std::cerr << "  --format     'i2s' (default) or 'als'" << std::endl;
-    std::cerr << "\nModels stored in ~/.terllama/models/<repo-name>/" << std::endl;
-    std::cerr << "Tracked in ~/.terllama/models.json" << std::endl;
+    Logger::error("Usage: {} pull <hf_repo> [--format i2s|als]", prog);
+    Logger::error("");
+    Logger::error("Download a model from HuggingFace and convert to Terllama format.");
+    Logger::error("");
+    Logger::error("Arguments:");
+    Logger::error("  <hf_repo>    HuggingFace repo (e.g. HuggingFaceTB/SmolLM2-135M)");
+    Logger::error("  --format     'i2s' (default) or 'als'");
+    Logger::error("");
+    Logger::error("Models stored in ~/.terllama/models/<repo-name>/");
+    Logger::error("Tracked in ~/.terllama/models.json");
 }
 
 int downloader_main(int argc, char** argv) {
@@ -57,24 +68,24 @@ int downloader_main(int argc, char** argv) {
         std::string arg = argv[i];
         if (arg == "--format" || arg == "--fmt") {
             if (i + 1 >= argc) {
-                std::cerr << "Error: --format requires an argument" << std::endl;
+                Logger::error("Error: --format requires an argument");
                 return 1;
             }
             format = argv[++i];
-            if (format != "i2s" && format != "als") {
-                std::cerr << "Error: unknown format '" << format << "'" << std::endl;
+            if (format != "i2s" && format != "als" && format != "gguf") {
+                Logger::error("Error: unknown format '{}'", format);
                 return 1;
             }
         } else if (hf_repo.empty()) {
             hf_repo = arg;
         } else {
-            std::cerr << "Error: unexpected argument '" << arg << "'" << std::endl;
+            Logger::error("Error: unexpected argument '{}'", arg);
             return 1;
         }
     }
 
     if (hf_repo.empty()) {
-        std::cerr << "Error: missing HuggingFace repo" << std::endl;
+        Logger::error("Error: missing HuggingFace repo");
         print_usage(argv[0]);
         return 1;
     }
@@ -88,7 +99,7 @@ int downloader_main(int argc, char** argv) {
         // Try relative to CWD
         script_path = "scripts/export_ternary_model_bitnet.py";
         if (access(script_path.c_str(), F_OK) != 0) {
-            std::cerr << "Error: can't find export script at scripts/export_ternary_model_bitnet.py" << std::endl;
+            Logger::error("Error: can't find export script at scripts/export_ternary_model_bitnet.py");
             return 1;
         }
     }
@@ -97,24 +108,61 @@ int downloader_main(int argc, char** argv) {
     std::string out_dir = std::string(getenv("HOME") ? getenv("HOME") : "/root")
                         + "/.terllama/models/" + model_slug;
 
-    std::cout << "Downloading " << hf_repo << " from HuggingFace..." << std::endl;
-    std::cout << "Converting to " << format << " format..." << std::endl;
-    std::cout << "Output: " << out_dir << std::endl;
-    std::cout << std::endl;
+    Logger::info("Downloading {} from HuggingFace...", hf_repo);
+    Logger::info("Converting to {} format...", format);
+    Logger::info("Output: {}", out_dir);
 
-    // Build command
-    std::string cmd = "pip install transformers torch -q 2>/dev/null && "
-                    + std::string("python3 \"") + script_path + "\""
-                    + " --model \"" + hf_repo + "\""
-                    + " --outdir \"" + out_dir + "\""
-                    + " --format " + format;
+    // Run pip install via posix_spawnp (no shell)
+    auto run_spawn = [](const std::string& prog, const std::vector<std::string>& args) -> int {
+        pid_t pid;
+        std::vector<const char*> argv;
+        argv.push_back(prog.c_str());
+        for (const auto& a : args) argv.push_back(a.c_str());
+        argv.push_back(nullptr);
 
-    int ret = system(cmd.c_str());
+        int ret = posix_spawnp(&pid, prog.c_str(), nullptr, nullptr,
+                               const_cast<char* const*>(argv.data()), environ);
+        if (ret != 0) return -1;
+        int status;
+        waitpid(pid, &status, 0);
+        if (WIFEXITED(status)) return WEXITSTATUS(status);
+        return -1;
+    };
+
+    // Install dependencies first
+    Logger::info("  Installing Python dependencies...");
+    int pip_ret = run_spawn("pip", {"install", "transformers", "torch", "-q"});
+    if (pip_ret != 0) {
+        Logger::error("pip install failed (exit {}), continuing anyway...", pip_ret);
+    }
+
+    // Run export script with spinner
+    std::atomic<bool> downloading{true};
+    std::thread spinner([&]() {
+        const char* frames = "|/-\\";
+        int i = 0;
+        while (downloading) {
+            fprintf(stderr, "\r  Converting... %c", frames[i++ % 4]);
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        fprintf(stderr, "\r%*s\r", 40, "");
+    });
+
+    int ret = run_spawn("python3", {
+        script_path,
+        "--model", hf_repo,
+        "--outdir", out_dir,
+        "--format", format
+    });
+
+    downloading = false;
+    spinner.join();
+
     if (ret != 0) {
-        std::cerr << "Export failed (exit code " << ret << ")" << std::endl;
+        Logger::error("Export failed (exit code %d)", ret);
         return 1;
     }
 
-    std::cout << "\nModel downloaded to: " << out_dir << std::endl;
+    Logger::info("Model downloaded to: %s", out_dir.c_str());
     return 0;
 }

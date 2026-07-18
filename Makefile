@@ -40,7 +40,8 @@ MAIN_OBJS := $(BUILD_DIR)/main.o \
              $(BUILD_DIR)/dispatcher.o \
              $(BUILD_DIR)/gguf_loader.o \
              $(BUILD_DIR)/inference.o \
-             $(BUILD_DIR)/logger.o
+             $(BUILD_DIR)/logger.o \
+             $(BUILD_DIR)/tokenizer.o
 
 .PHONY: all build-terllama build-bench clean help
 
@@ -106,6 +107,10 @@ $(BUILD_DIR)/inference.o: $(SRC_DIR)/core/inference.cpp | $(BUILD_DIR)
 $(BUILD_DIR)/logger.o: $(SRC_DIR)/core/logger.cpp | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -I$(SRC_DIR) -c $< -o $@
 
+# Tokenizer
+$(BUILD_DIR)/tokenizer.o: $(SRC_DIR)/core/tokenizer.cpp $(SRC_DIR)/core/tokenizer.h | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) -I$(SRC_DIR) -c $< -o $@
+
 # Benchmark
 $(BUILD_DIR)/benchmark.o: $(SRC_DIR)/benchmark.cpp | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
@@ -115,7 +120,7 @@ $(TARGET): $(MAIN_OBJS) $(KERNEL_OBJS)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
 
 # Benchmark binary
-$(BENCH): $(BUILD_DIR)/benchmark.o $(BUILD_DIR)/dispatcher.o $(KERNEL_OBJS)
+$(BENCH): $(BUILD_DIR)/benchmark.o $(BUILD_DIR)/dispatcher.o $(BUILD_DIR)/logger.o $(KERNEL_OBJS)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
 
 clean:

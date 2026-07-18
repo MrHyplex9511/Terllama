@@ -12,6 +12,8 @@
 #pragma once
 #include "model.h"
 #include "gguf_loader.h"
+#include "core/tokenizer.h"
+#include "core/logger.h"
 #include <sys/stat.h>
 #include <dirent.h>
 #include <iostream>
@@ -80,7 +82,7 @@ inline void i2s_row_to_combined(const uint8_t* row_packed,
 // ═══════════════════════════════════════════════════════════════════════════
 inline ModelConfig load_config(const std::string& path) {
     std::ifstream f(path, std::ios::binary);
-    if (!f) { std::cerr << "Cannot open: " << path << std::endl; exit(1); }
+    if (!f) { Logger::error("Cannot open: {}", path); exit(1); }
     ModelConfig cfg;
     int32_t vs, hs, is, nl, nah, nkv, mpe;
     float rne, rt;
@@ -102,7 +104,7 @@ inline ModelConfig load_config(const std::string& path) {
 // ═══════════════════════════════════════════════════════════════════════════
 inline std::vector<float> load_embedding(const std::string& path, const ModelConfig& cfg) {
     std::ifstream f(path, std::ios::binary);
-    if (!f) { std::cerr << "Cannot open: " << path << std::endl; exit(1); }
+    if (!f) { Logger::error("Cannot open: {}", path); exit(1); }
     f.seekg(4*9, std::ios::beg); // skip 9 int32/float config fields
     std::vector<float> emb(cfg.vocab_size * cfg.hidden_size);
     f.read(reinterpret_cast<char*>(emb.data()), emb.size() * sizeof(float));
@@ -111,7 +113,7 @@ inline std::vector<float> load_embedding(const std::string& path, const ModelCon
 
 inline std::vector<float> load_final_norm(const std::string& path, const ModelConfig& cfg) {
     std::ifstream f(path, std::ios::binary);
-    if (!f) { std::cerr << "Cannot open: " << path << std::endl; exit(1); }
+    if (!f) { Logger::error("Cannot open: {}", path); exit(1); }
     f.seekg(36 + cfg.vocab_size * cfg.hidden_size * 4, std::ios::beg);
     std::vector<float> fn(cfg.hidden_size);
     f.read(reinterpret_cast<char*>(fn.data()), fn.size() * sizeof(float));
@@ -125,7 +127,7 @@ struct NormWeights {
 
 inline std::vector<NormWeights> load_layer_norms(const std::string& path, const ModelConfig& cfg) {
     std::ifstream f(path, std::ios::binary);
-    if (!f) { std::cerr << "Cannot open: " << path << std::endl; exit(1); }
+    if (!f) { Logger::error("Cannot open: {}", path); exit(1); }
     int64_t offset = 36 + (int64_t)cfg.vocab_size * cfg.hidden_size * 4 + cfg.hidden_size * 4;
     f.seekg(offset, std::ios::beg);
     std::vector<NormWeights> norms(cfg.num_hidden_layers);
@@ -144,7 +146,7 @@ inline std::vector<NormWeights> load_layer_norms(const std::string& path, const 
 inline int find_layer_index(const std::vector<LayerData>& layers, const std::string& name) {
     for (int i = 0; i < (int)layers.size(); i++)
         if (layers[i].name == name) return i;
-    std::cerr << "Layer not found: " << name << std::endl;
+    Logger::error("Layer not found: {}", name);
     exit(1);
     return -1;
 }
@@ -154,10 +156,10 @@ inline int find_layer_index(const std::vector<LayerData>& layers, const std::str
 // ═══════════════════════════════════════════════════════════════════════════
 inline std::vector<LayerData> load_decomposed_layers(const std::string& path) {
     std::ifstream f(path, std::ios::binary);
-    if (!f) { std::cerr << "Cannot open: " << path << std::endl; exit(1); }
+    if (!f) { Logger::error("Cannot open: {}", path); exit(1); }
     uint32_t magic;
     f.read(reinterpret_cast<char*>(&magic), 4);
-    if (magic != 0xDEADBEEF) { std::cerr << "Bad magic\n"; exit(1); }
+    if (magic != 0xDEADBEEF) { Logger::error("Bad magic"); exit(1); }
     uint32_t num_layers;
     f.read(reinterpret_cast<char*>(&num_layers), 4);
     std::vector<LayerData> layers(num_layers);
@@ -217,11 +219,11 @@ inline std::vector<LayerData> load_decomposed_layers(const std::string& path) {
 //   packed_data = codes(4val/byte) + scales(per-block float32)
 inline std::vector<LayerData> load_decomposed_layers_i2s(const std::string& path) {
     std::ifstream f(path, std::ios::binary);
-    if (!f) { std::cerr << "Cannot open: " << path << std::endl; exit(1); }
+    if (!f) { Logger::error("Cannot open: {}", path); exit(1); }
     uint32_t magic;
     f.read(reinterpret_cast<char*>(&magic), 4);
     if (magic != 0x5F533249) {  // "I2S_"
-        std::cerr << "Bad magic (expected I2S_): 0x" << std::hex << magic << std::endl;
+        Logger::error("Bad magic (expected I2S_): 0x{:x}", magic);
         exit(1);
     }
     uint32_t num_layers;
@@ -268,7 +270,7 @@ inline std::vector<LayerData> load_decomposed_layers_i2s(const std::string& path
                 int block_idx = row * n_blocks + b;
                 int offset = row * row_stride + b * (codes_per_block + (int)sizeof(float));
                 if (offset + codes_per_block + (int)sizeof(float) > (int)data_len) {
-                    std::cerr << "I2_S data truncated at row " << row << " block " << b << std::endl;
+                    Logger::error("I2_S data truncated at row {} block {}", row, b);
                     exit(1);
                 }
                 ld.i2s_blocks[block_idx].packed.assign(
@@ -360,6 +362,7 @@ struct LoadedModel {
     std::vector<float> final_norm;
     std::vector<NormWeights> layer_norms;
     std::vector<LayerData> layers;
+    Tokenizer tokenizer;  // populated from GGUF metadata
 };
 
 inline LoadedModel load_model_from(const std::string& model_path_or_dir) {
@@ -376,10 +379,11 @@ inline LoadedModel load_model_from(const std::string& model_path_or_dir) {
 
     if (!gguf_path.empty()) {
         // ── GGUF path ────────────────────────────────────────────────────
-        std::cout << "Loading GGUF model: " << gguf_path << std::endl;
+        Logger::info("Loading GGUF model: {}", gguf_path);
         if (!load_gguf_model(gguf_path, m.cfg, m.embedding,
-                              m.layer_norms, m.final_norm, m.layers)) {
-            std::cerr << "GGUF load failed" << std::endl;
+                              m.layer_norms, m.final_norm, m.layers,
+                              &m.tokenizer)) {
+            Logger::error("GGUF load failed");
             exit(1);
         }
     } else {
@@ -390,7 +394,7 @@ inline LoadedModel load_model_from(const std::string& model_path_or_dir) {
 
         struct stat st_extra;
         if (stat(extra_path.c_str(), &st_extra) != 0) {
-            std::cerr << "No model files found in " << model_path_or_dir << std::endl;
+            Logger::error("No model files found in {}", model_path_or_dir);
             exit(1);
         }
 

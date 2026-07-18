@@ -12,10 +12,35 @@ from pathlib import Path
 
 torch.manual_seed(42)
 DTYPE = torch.float32
-QUANTIZED_LAYERS = {'q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj'}
+QUANTIZED_LAYERS = {'q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj', 'qkv_proj'}
 
 def should_quantize(layer_name):
     return any(x in layer_name for x in QUANTIZED_LAYERS)
+
+def get_model_layers(model_hf, cfg):
+    """
+    Returns list of tuples (name, weight_tensor) representing the model layers.
+    Splits any fused layers (like qkv_proj in Phi-3) into separate q_proj, k_proj, v_proj layers.
+    """
+    layers = []
+    for name, mod in model_hf.named_modules():
+        if not isinstance(mod, torch.nn.Linear):
+            continue
+        W = mod.weight.data.to(dtype=DTYPE)
+        if "qkv_proj" in name:
+            num_heads = cfg.num_attention_heads
+            num_kv_heads = getattr(cfg, 'num_key_value_heads', num_heads)
+            head_dim = cfg.hidden_size // num_heads
+            q_dim = num_heads * head_dim
+            k_dim = num_kv_heads * head_dim
+            v_dim = num_kv_heads * head_dim
+            w_q, w_k, w_v = torch.split(W, [q_dim, k_dim, v_dim], dim=0)
+            layers.append((name.replace("qkv_proj", "q_proj"), w_q))
+            layers.append((name.replace("qkv_proj", "k_proj"), w_k))
+            layers.append((name.replace("qkv_proj", "v_proj"), w_v))
+        else:
+            layers.append((name, W))
+    return layers
 
 # ═══════════════════════════════════════════════════════════════════════════
 # I2_S: mean-block quantization, 4 vals/byte
@@ -178,10 +203,7 @@ def export_als(out_dir, model_name, num_terms=12):
     print(f"\n[ALS decomposition ({num_terms} terms per layer)...]\n")
     t0 = time.time()
 
-    for name, mod in model_hf.named_modules():
-        if not isinstance(mod, torch.nn.Linear):
-            continue
-        W = mod.weight.data.to(dtype=DTYPE)
+    for name, W in get_model_layers(model_hf, model_hf.config):
         out_f, in_f = W.shape
         fp32_bytes = out_f * in_f * 4
 
@@ -288,11 +310,8 @@ def export_i2s(out_dir, model_name):
     print("\n[Quantizing layers (BitNet style)...]\n")
     t0 = time.time()
 
-    for name, mod in model_hf.named_modules():
-        if not isinstance(mod, torch.nn.Linear):
-            continue
+    for name, W in get_model_layers(model_hf, model_hf.config):
         if not should_quantize(name):
-            W = mod.weight.data.to(dtype=DTYPE)
             out_f, in_f = W.shape
             raw_data = W.flatten().numpy().tobytes()
             q_layers.append({
@@ -303,7 +322,6 @@ def export_i2s(out_dir, model_name):
             n_skipped += 1
             continue
 
-        W = mod.weight.data.to(dtype=DTYPE)
         out_f, in_f = W.shape
         fp32_bytes = out_f * in_f * 4
 

@@ -23,7 +23,10 @@ public:
         if (DEBUG < level) return;
         std::lock_guard<std::mutex> lock(mutex);
         fprintf(stderr, "[DEBUG] ");
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-security"
         fprintf(stderr, fmt, args...);
+#pragma GCC diagnostic pop
         fprintf(stderr, "\n");
     }
 
@@ -32,7 +35,10 @@ public:
         if (INFO < level) return;
         std::lock_guard<std::mutex> lock(mutex);
         fprintf(stderr, "[INFO]  ");
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-security"
         fprintf(stderr, fmt, args...);
+#pragma GCC diagnostic pop
         fprintf(stderr, "\n");
     }
 
@@ -41,7 +47,10 @@ public:
         if (WARN < level) return;
         std::lock_guard<std::mutex> lock(mutex);
         fprintf(stderr, "[WARN]  ");
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-security"
         fprintf(stderr, fmt, args...);
+#pragma GCC diagnostic pop
         fprintf(stderr, "\n");
     }
 
@@ -50,7 +59,10 @@ public:
         if (ERROR < level) return;
         std::lock_guard<std::mutex> lock(mutex);
         fprintf(stderr, "[ERROR] ");
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-security"
         fprintf(stderr, fmt, args...);
+#pragma GCC diagnostic pop
         fprintf(stderr, "\n");
     }
 };

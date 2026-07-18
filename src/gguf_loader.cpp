@@ -7,6 +7,7 @@
  */
 #include "gguf_loader.h"
 #include "loader.h"
+#include "core/logger.h"
 #include <iostream>
 #include <fstream>
 #include <unordered_map>
@@ -42,7 +43,7 @@ static GGUFFile parse_gguf_internal(const std::string& path) {
     // Read entire file into memory
     std::ifstream f(path, std::ios::binary | std::ios::ate);
     if (!f) {
-        std::cerr << "GGUF: Cannot open " << path << std::endl;
+        Logger::error("GGUF: Cannot open {}", path);
         return gguf;
     }
     size_t file_size = (size_t)f.tellg();
@@ -57,14 +58,12 @@ static GGUFFile parse_gguf_internal(const std::string& path) {
     // ── Header ───────────────────────────────────────────────────────────
     uint32_t magic = r32(p, off);
     if (magic != GGUF_MAGIC) {
-        std::cerr << "GGUF: Bad magic 0x" << std::hex << magic
-                  << " (expected 0x" << GGUF_MAGIC << ")" << std::dec << std::endl;
+        Logger::error("GGUF: Bad magic 0x{:x} (expected 0x{:x})", magic, GGUF_MAGIC);
         return gguf;
     }
     uint32_t version = r32(p, off);
     if (version > GGUF_VERSION) {
-        std::cerr << "GGUF: Unsupported version " << version
-                  << " (max " << GGUF_VERSION << ")" << std::endl;
+        Logger::error("GGUF: Unsupported version {} (max {})", version, GGUF_VERSION);
         return gguf;
     }
     uint64_t tensor_count      = r64(p, off);
@@ -105,7 +104,10 @@ static GGUFFile parse_gguf_internal(const std::string& path) {
             }
             case GGUF_TYPE_INT32: {
                 uint32_t v = r32(p, off);
-                gguf.metadata_int[key] = (int32_t)v;
+                int32_t iv = (int32_t)v;
+                gguf.metadata_int[key] = iv;
+                if (key == "tokenizer.ggml.bos_token_id") gguf.bos_token_id = iv;
+                if (key == "tokenizer.ggml.eos_token_id") gguf.eos_token_id = iv;
                 break;
             }
             case GGUF_TYPE_UINT64: {
@@ -139,28 +141,50 @@ static GGUFFile parse_gguf_internal(const std::string& path) {
             }
             case GGUF_TYPE_STRING: {
                 std::string v = rstr(p, off);
-                gguf.metadata_str[key] = v;
+                if (key == "tokenizer.ggml.model") {
+                    gguf.tokenizer_model = v;
+                } else {
+                    gguf.metadata_str[key] = v;
+                }
                 break;
             }
             case GGUF_TYPE_ARRAY: {
                 if (off + 4 > file_size) break;
                 uint32_t elem_type = r32(p, off);
                 uint64_t elem_count = r64(p, off);
-                // Skip array elements (we don't need arrays for config)
-                for (uint64_t j = 0; j < elem_count; j++) {
-                    switch (elem_type) {
-                        case GGUF_TYPE_UINT8:
-                        case GGUF_TYPE_INT8:   off += 1; break;
-                        case GGUF_TYPE_UINT16:
-                        case GGUF_TYPE_INT16:  off += 2; break;
-                        case GGUF_TYPE_UINT32:
-                        case GGUF_TYPE_INT32:
-                        case GGUF_TYPE_FLOAT32: off += 4; break;
-                        case GGUF_TYPE_UINT64:
-                        case GGUF_TYPE_INT64:
-                        case GGUF_TYPE_FLOAT64: off += 8; break;
-                        case GGUF_TYPE_STRING: rstr(p, off); break;
-                        default: off += 4; break;
+
+                // Extract tokenizer vocab arrays instead of skipping
+                if (key == "tokenizer.ggml.tokens" && elem_type == GGUF_TYPE_STRING) {
+                    gguf.tokenizer_tokens.reserve((size_t)elem_count);
+                    for (uint64_t j = 0; j < elem_count; j++)
+                        gguf.tokenizer_tokens.push_back(rstr(p, off));
+                } else if (key == "tokenizer.ggml.scores" && elem_type == GGUF_TYPE_FLOAT32) {
+                    gguf.tokenizer_scores.reserve((size_t)elem_count);
+                    for (uint64_t j = 0; j < elem_count; j++)
+                        gguf.tokenizer_scores.push_back(rf32(p, off));
+                } else if (key == "tokenizer.ggml.types" && elem_type == GGUF_TYPE_INT32) {
+                    gguf.tokenizer_types.reserve((size_t)elem_count);
+                    for (uint64_t j = 0; j < elem_count; j++) {
+                        uint32_t v = r32(p, off);
+                        gguf.tokenizer_types.push_back((int32_t)v);
+                    }
+                } else {
+                    // Skip array elements (unused arrays)
+                    for (uint64_t j = 0; j < elem_count; j++) {
+                        switch (elem_type) {
+                            case GGUF_TYPE_UINT8:
+                            case GGUF_TYPE_INT8:   off += 1; break;
+                            case GGUF_TYPE_UINT16:
+                            case GGUF_TYPE_INT16:  off += 2; break;
+                            case GGUF_TYPE_UINT32:
+                            case GGUF_TYPE_INT32:
+                            case GGUF_TYPE_FLOAT32: off += 4; break;
+                            case GGUF_TYPE_UINT64:
+                            case GGUF_TYPE_INT64:
+                            case GGUF_TYPE_FLOAT64: off += 8; break;
+                            case GGUF_TYPE_STRING: rstr(p, off); break;
+                            default: off += 4; break;
+                        }
                     }
                 }
                 break;
@@ -253,8 +277,7 @@ static bool extract_f32_tensor(const GGUFFile& gguf,
             }
         }
     } else {
-        std::cerr << "GGUF: unexpected type " << ti.type
-                  << " for unquantized tensor " << ti.name << std::endl;
+        Logger::error("GGUF: unexpected type {} for unquantized tensor {}", ti.type, ti.name);
         return false;
     }
     return true;
@@ -359,12 +382,25 @@ bool load_gguf_model(const std::string& path,
                      std::vector<float>& embedding,
                      std::vector<NormWeights>& layer_norms,
                      std::vector<float>& final_norm,
-                     std::vector<LayerData>& layers) {
+                     std::vector<LayerData>& layers,
+                     Tokenizer* tokenizer) {
     // ── Parse GGUF file ──────────────────────────────────────────────────
     GGUFFile gguf = parse_gguf_internal(path);
     if (!gguf.valid) {
-        std::cerr << "Failed to parse GGUF file: " << path << std::endl;
+        Logger::error("Failed to parse GGUF file: {}", path);
         return false;
+    }
+
+    // ── Extract tokenizer vocab from metadata ────────────────────────────
+    if (tokenizer && !gguf.tokenizer_tokens.empty()) {
+        tokenizer->load_from_gguf(
+            gguf.tokenizer_tokens,
+            gguf.tokenizer_scores,
+            gguf.tokenizer_types,
+            gguf.tokenizer_model.empty() ? "llama" : gguf.tokenizer_model,
+            gguf.bos_token_id,
+            gguf.eos_token_id);
+        Logger::info("  Tokenizer: {}, vocab={}", tokenizer->model_type, tokenizer->vocab.size());
     }
 
     // ── Extract model config from metadata ───────────────────────────────
@@ -399,7 +435,7 @@ bool load_gguf_model(const std::string& path,
     float rope_freq_base       = get_float("rope.freq_base", 10000.0f);
 
     if (embedding_length == 0) {
-        std::cerr << "GGUF: missing embedding_length in metadata" << std::endl;
+        Logger::error("GGUF: missing embedding_length in metadata");
         return false;
     }
 
@@ -409,7 +445,7 @@ bool load_gguf_model(const std::string& path,
     if (embed_tensor && embed_tensor->dims.size() >= 2) {
         vocab_size = (int32_t)embed_tensor->dims[0];
     } else {
-        std::cerr << "GGUF: token_embd.weight not found" << std::endl;
+        Logger::error("GGUF: token_embd.weight not found");
         return false;
     }
 
@@ -427,7 +463,7 @@ bool load_gguf_model(const std::string& path,
 
     // ── Extract embedding ────────────────────────────────────────────────
     if (!extract_f32_tensor(gguf, *embed_tensor, embedding)) {
-        std::cerr << "GGUF: failed to extract embedding" << std::endl;
+        Logger::error("GGUF: failed to extract embedding");
         return false;
     }
 
@@ -485,13 +521,13 @@ bool load_gguf_model(const std::string& path,
                                  const std::string& terllama_name) {
             auto* ti = find_tensor(gguf.tensors, gguf_tensor_name);
             if (!ti) {
-                std::cerr << "GGUF: missing tensor " << gguf_tensor_name << std::endl;
+                Logger::error("GGUF: missing tensor {}", gguf_tensor_name);
                 return;
             }
             LayerData ld;
             ld.name = terllama_name;
             if (!convert_q2_0_to_layer(gguf, *ti, ld)) {
-                std::cerr << "GGUF: failed to convert " << gguf_tensor_name << std::endl;
+                Logger::error("GGUF: failed to convert {}", gguf_tensor_name);
                 return;
             }
             layers.push_back(std::move(ld));
@@ -541,9 +577,7 @@ bool load_gguf_model(const std::string& path,
         layers.push_back(std::move(lm_ld));
     }
 
-    std::cout << "  GGUF model loaded: " << arch
-              << ", " << cfg.num_hidden_layers << " layers"
-              << ", " << layers.size() << " linear layers" << std::endl;
+    Logger::info("  GGUF model loaded: {}, {} layers, {} linear layers", arch, cfg.num_hidden_layers, layers.size());
 
     return true;
 }

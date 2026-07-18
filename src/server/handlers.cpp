@@ -6,6 +6,7 @@
  */
 #include "server/handlers.h"
 #include "inference.h"
+#include "core/tokenizer.h"
 
 #include <json.hpp>
 
@@ -24,6 +25,13 @@
 #include <spawn.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <csignal>
+
+// Thread-local batch decode buffer (16-token batches for streaming)
+static thread_local std::vector<int> tls_decode_buffer;
+
+// Signal flag (defined in commands.cpp)
+extern std::atomic<bool> g_interrupted;
 
 using json = nlohmann::json;
 
@@ -86,23 +94,23 @@ static bool check_api_key(const httplib::Request& req,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// TOKENIZER (Python subprocess via posix_spawn)
+// TOKENIZER (Python subprocess for encode only; native C++ decode)
 // ═══════════════════════════════════════════════════════════════════════════
+// The encode path (tokenize) is called once per request and uses Python
+// via posix_spawn. The decode path is called per-token in streaming and
+// uses native C++ (Tokenizer from GGUF metadata) for performance.
 
 extern char **environ;
 
 static int run_python_script(const std::string& script_path) {
     pid_t pid;
-    const char* python = "python3";
-    char* const argv[] = {
-        const_cast<char*>(python),
-        const_cast<char*>(script_path.c_str()),
-        nullptr
-    };
-    int ret = posix_spawnp(&pid, python, nullptr, nullptr, argv, environ);
+    std::string python = "python3";
+    const char* argv[] = {"python3", script_path.c_str(), nullptr};
+
+    int ret = posix_spawnp(&pid, python.c_str(), nullptr, nullptr,
+                           const_cast<char* const*>(argv), environ);
     if (ret != 0) {
-        std::cerr << "posix_spawnp failed for " << script_path
-                  << " (errno=" << ret << ")" << std::endl;
+        Logger::error("posix_spawnp failed for {} (errno={})", script_path, ret);
         return -1;
     }
     int status;
@@ -111,48 +119,25 @@ static int run_python_script(const std::string& script_path) {
     return -1;
 }
 
-std::vector<int> tokenize_with_python(const std::string& prompt,
+std::vector<int> tokenize_with_helper(const std::string& prompt,
                                       const std::string& helper_dir)
 {
     std::string prompt_file = "/tmp/ternary_prompt.txt";
     std::string token_file  = "/tmp/ternary_tokens.txt";
     {
         std::ofstream pf(prompt_file);
-        if (!pf) { std::cerr << "Cannot write prompt file\n"; return {}; }
+        if (!pf) { Logger::error("Cannot write prompt file"); return {}; }
         pf << prompt;
     }
     std::string script = helper_dir + "/tokenize_helper.py";
     int ret = run_python_script(script);
-    if (ret != 0) { std::cerr << "Tokenization failed\n"; return {}; }
+    if (ret != 0) { Logger::error("Tokenization failed"); return {}; }
 
     std::vector<int> tokens;
     std::ifstream tf(token_file);
     int tid;
     while (tf >> tid) tokens.push_back(tid);
     return tokens;
-}
-
-std::string decode_with_python(const std::vector<int>& tokens,
-                               const std::string& helper_dir)
-{
-    std::string token_file = "/tmp/ternary_decode_in.txt";
-    std::string out_file   = "/tmp/ternary_decode_out.txt";
-    {
-        std::ofstream tf(token_file);
-        if (!tf) return "?";
-        for (size_t i = 0; i < tokens.size(); i++) {
-            if (i > 0) tf << " ";
-            tf << tokens[i];
-        }
-    }
-    std::string script = helper_dir + "/decode_helper.py";
-    int ret = run_python_script(script);
-    if (ret != 0) { std::cerr << "Decoding failed\n"; return "?"; }
-
-    std::ifstream of(out_file);
-    std::stringstream ss;
-    ss << of.rdbuf();
-    return ss.str();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -203,8 +188,75 @@ struct ModelSnap {
     std::vector<float> final_norm;
     std::vector<NormWeights> layer_norms;
     RoPECache rope;
-    std::string helper_dir;
 };
+
+#include <sys/stat.h>
+
+struct RequestGuard {
+    RequestGuard() {
+        g_active_requests++;
+    }
+    ~RequestGuard() {
+        g_active_requests--;
+        g_last_request_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+};
+
+// Touch last request time — called at start of every public handler to
+// prevent keep-alive watchdog from shutting down during active use.
+static void touch_last_request() {
+    g_last_request_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+size_t get_model_size_bytes() {
+    std::lock_guard<std::mutex> lock(g_model_mutex);
+    if (!g_model.loaded) {
+        size_t total = 0;
+        struct stat st;
+        if (g_model.model_dir.empty()) return 0;
+        std::vector<std::string> files = {
+            g_model.model_dir + "/model_extra.bin",
+            g_model.model_dir + "/model_decomposed_i2s.bin",
+            g_model.model_dir + "/model_decomposed.bin",
+            g_model.model_dir + "/model.gguf"
+        };
+        for (const auto& path : files) {
+            if (stat(path.c_str(), &st) == 0) {
+                total += st.st_size;
+            }
+        }
+        return total;
+    }
+    size_t total = g_model.embedding.size() * sizeof(float);
+    total += g_model.final_norm.size() * sizeof(float);
+    for (const auto& w : g_model.layer_norms) {
+        total += w.input_layernorm.size() * sizeof(float);
+        total += w.post_attention_layernorm.size() * sizeof(float);
+    }
+    for (const auto& l : g_model.layers) {
+        total += l.raw_weights.size() * sizeof(float);
+        for (const auto& t : l.terms) {
+            total += t.combined.size() * sizeof(uint32_t);
+        }
+        for (const auto& b : l.i2s_blocks) {
+            total += b.packed.size() * sizeof(uint8_t);
+        }
+    }
+    total += g_model.rope.sin.size() * sizeof(float);
+    total += g_model.rope.cos.size() * sizeof(float);
+    return total;
+}
+
+size_t get_kv_cache_size_bytes() {
+    std::lock_guard<std::mutex> lock(g_model_mutex);
+    if (!g_model.loaded) {
+        return 128 * 1024 * 1024;
+    }
+    const auto& cfg = g_model.cfg;
+    return (size_t)cfg.num_hidden_layers * cfg.max_position_embeddings * cfg.num_key_value_heads * cfg.head_dim * sizeof(float) * 2;
+}
 
 static ModelSnap snapshot_model() {
     std::lock_guard<std::mutex> lock(g_model_mutex);
@@ -214,8 +266,7 @@ static ModelSnap snapshot_model() {
         g_model.layers,
         g_model.final_norm,
         g_model.layer_norms,
-        g_model.rope,
-        g_model.helper_dir
+        g_model.rope
     };
 }
 
@@ -228,6 +279,7 @@ static ModelSnap snapshot_model() {
 void handle_models(const httplib::Request& req, httplib::Response& res) {
     (void)req;
     add_cors_headers(res);
+    touch_last_request();
     if (!check_api_key(req, res)) return;
 
     json entry = {
@@ -249,12 +301,36 @@ void handle_chat_completions(const httplib::Request& req,
                              httplib::Response& res)
 {
     add_cors_headers(res);
+    touch_last_request();
     if (!check_api_key(req, res)) return;
 
     if (!g_model.loaded) {
-        send_error(res, "Model not loaded", 503, "model_not_loaded");
-        return;
+        if (!g_model.model_dir.empty()) {
+            Logger::info("Auto-reloading model from {}...", g_model.model_dir);
+            if (!init_server(g_model.model_dir)) {
+                send_error(res, "Failed to auto-reload model", 500, "model_load_failed");
+                return;
+            }
+        } else {
+            send_error(res, "Model not loaded and no directory configured", 503, "model_not_loaded");
+            return;
+        }
     }
+
+    if (g_memory_limit > 0) {
+        size_t model_mem = get_model_size_bytes();
+        size_t kv_mem = get_kv_cache_size_bytes();
+        int active = g_active_requests.load();
+        size_t projected_mem = model_mem + (active + 1) * kv_mem;
+        if (projected_mem > g_memory_limit) {
+            Logger::warn("Request rejected: projected memory ({} MB) exceeds limit ({} MB)", 
+                projected_mem / (1024 * 1024), g_memory_limit / (1024 * 1024));
+            send_error(res, "Service Unavailable: Request would exceed memory limit", 503, "service_unavailable");
+            return;
+        }
+    }
+
+    auto req_guard = std::make_shared<RequestGuard>();
 
     // Parse request body via nlohmann/json
     json req_body;
@@ -291,7 +367,7 @@ void handle_chat_completions(const httplib::Request& req,
     std::vector<int> prompt_tokens;
     {
         std::lock_guard<std::mutex> lock(g_model_mutex);
-        prompt_tokens = tokenize_with_python(prompt, g_model.helper_dir);
+        prompt_tokens = tokenize_with_helper(prompt, g_model.helper_dir);
     }
     if (prompt_tokens.empty()) {
         send_error(res, "Tokenization failed", 500, "tokenization_error");
@@ -309,14 +385,12 @@ void handle_chat_completions(const httplib::Request& req,
 
         struct CbCtx {
             httplib::DataSink* sink{nullptr};
-            std::string helper_dir;
             std::string id;
             long created{0};
         };
         auto ctx = std::make_shared<CbCtx>();
-        ctx->helper_dir = snap->helper_dir;
-        ctx->id         = id;
-        ctx->created    = created;
+        ctx->id      = id;
+        ctx->created = created;
 
         res.status = 200;
         res.set_header("Content-Type", "text/event-stream");
@@ -325,36 +399,43 @@ void handle_chat_completions(const httplib::Request& req,
         res.set_header("Access-Control-Allow-Origin", "*");
 
         res.set_chunked_content_provider("text/event-stream",
-            [snap, prompt_tokens, temperature, max_tokens, ctx](
+            [snap, prompt_tokens, temperature, max_tokens, ctx, req_guard](
                 size_t offset, httplib::DataSink& sink) -> bool
             {
                 if (offset > 0) return false;
                 ctx->sink = &sink;
 
+                tls_decode_buffer.clear();
                 StreamCallback cb = [](int token, float*, void* userdata) -> bool {
                     auto* c = static_cast<CbCtx*>(userdata);
-                    std::vector<int> single = {token};
-                    std::string text = decode_with_python(single, c->helper_dir);
+                    if (g_interrupted) return false;
 
-                    json delta = {
-                        {"role",    "assistant"},
-                        {"content", text}
-                    };
-                    json choice = {
-                        {"index", 0},
-                        {"delta", delta}
-                    };
-                    json chunk = {
-                        {"id",      c->id},
-                        {"object",  "chat.completion.chunk"},
-                        {"created", std::to_string(c->created)},
-                        {"model",   "default"},
-                        {"choices", {choice}}
-                    };
-
-                    std::string sse = "data: " + chunk.dump() + "\n\n";
-                    if (!c->sink->write(sse.data(), sse.size()))
-                        return false;
+                    tls_decode_buffer.push_back(token);
+                    bool is_eos = (token == 0);
+                    if (tls_decode_buffer.size() >= 16 || is_eos) {
+                        std::string text = g_model.tokenizer.decode(tls_decode_buffer);
+                        if (!text.empty()) {
+                            json delta = {
+                                {"role",    "assistant"},
+                                {"content", text}
+                            };
+                            json choice = {
+                                {"index", 0},
+                                {"delta", delta}
+                            };
+                            json chunk = {
+                                {"id",      c->id},
+                                {"object",  "chat.completion.chunk"},
+                                {"created", std::to_string(c->created)},
+                                {"model",   "default"},
+                                {"choices", {choice}}
+                            };
+                            std::string sse = "data: " + chunk.dump() + "\n\n";
+                            if (!c->sink->write(sse.data(), sse.size()))
+                                return false;
+                        }
+                        tls_decode_buffer.clear();
+                    }
                     return true;
                 };
 
@@ -362,6 +443,22 @@ void handle_chat_completions(const httplib::Request& req,
                     snap->cfg, snap->embedding, snap->layers,
                     snap->final_norm, snap->layer_norms, snap->rope,
                     cb, ctx.get());
+
+                // Flush remaining buffered tokens
+                if (!tls_decode_buffer.empty()) {
+                    std::string text = g_model.tokenizer.decode(tls_decode_buffer);
+                    if (!text.empty()) {
+                        json delta = {{"role","assistant"}, {"content",text}};
+                        json chunk = {
+                            {"id",ctx->id}, {"object","chat.completion.chunk"},
+                            {"created",std::to_string(ctx->created)}, {"model","default"},
+                            {"choices",{{{"index",0},{"delta",delta}}}}
+                        };
+                        std::string sse = "data: " + chunk.dump() + "\n\n";
+                        sink.write(sse.data(), sse.size());
+                    }
+                    tls_decode_buffer.clear();
+                }
 
                 sink.write("data: [DONE]\n\n", 16);
                 sink.done();
@@ -389,8 +486,8 @@ void handle_chat_completions(const httplib::Request& req,
         std::string prompt_decoded;
         {
             std::lock_guard<std::mutex> lock(g_model_mutex);
-            decoded        = decode_with_python(all_tokens, g_model.helper_dir);
-            prompt_decoded = decode_with_python(prompt_tokens, g_model.helper_dir);
+            decoded        = g_model.tokenizer.decode(all_tokens);
+            prompt_decoded = g_model.tokenizer.decode(prompt_tokens);
         }
 
         std::string generated_text;
@@ -443,12 +540,36 @@ void handle_completions(const httplib::Request& req,
                         httplib::Response& res)
 {
     add_cors_headers(res);
+    touch_last_request();
     if (!check_api_key(req, res)) return;
 
     if (!g_model.loaded) {
-        send_error(res, "Model not loaded", 503, "model_not_loaded");
-        return;
+        if (!g_model.model_dir.empty()) {
+            Logger::info("Auto-reloading model from {}...", g_model.model_dir);
+            if (!init_server(g_model.model_dir)) {
+                send_error(res, "Failed to auto-reload model", 500, "model_load_failed");
+                return;
+            }
+        } else {
+            send_error(res, "Model not loaded and no directory configured", 503, "model_not_loaded");
+            return;
+        }
     }
+
+    if (g_memory_limit > 0) {
+        size_t model_mem = get_model_size_bytes();
+        size_t kv_mem = get_kv_cache_size_bytes();
+        int active = g_active_requests.load();
+        size_t projected_mem = model_mem + (active + 1) * kv_mem;
+        if (projected_mem > g_memory_limit) {
+            Logger::warn("Request rejected: projected memory ({} MB) exceeds limit ({} MB)", 
+                projected_mem / (1024 * 1024), g_memory_limit / (1024 * 1024));
+            send_error(res, "Service Unavailable: Request would exceed memory limit", 503, "service_unavailable");
+            return;
+        }
+    }
+
+    auto req_guard = std::make_shared<RequestGuard>();
 
     json req_body;
     try {
@@ -471,7 +592,7 @@ void handle_completions(const httplib::Request& req,
     std::vector<int> prompt_tokens;
     {
         std::lock_guard<std::mutex> lock(g_model_mutex);
-        prompt_tokens = tokenize_with_python(prompt, g_model.helper_dir);
+        prompt_tokens = tokenize_with_helper(prompt, g_model.helper_dir);
     }
     if (prompt_tokens.empty()) {
         send_error(res, "Tokenization failed", 500, "tokenization_error");
@@ -489,14 +610,12 @@ void handle_completions(const httplib::Request& req,
 
         struct CbCtx {
             httplib::DataSink* sink{nullptr};
-            std::string helper_dir;
             std::string id;
             long created{0};
         };
         auto ctx = std::make_shared<CbCtx>();
-        ctx->helper_dir = snap->helper_dir;
-        ctx->id         = id;
-        ctx->created    = created;
+        ctx->id      = id;
+        ctx->created = created;
 
         res.status = 200;
         res.set_header("Content-Type", "text/event-stream");
@@ -505,34 +624,41 @@ void handle_completions(const httplib::Request& req,
         res.set_header("Access-Control-Allow-Origin", "*");
 
         res.set_chunked_content_provider("text/event-stream",
-            [snap, prompt_tokens, temperature, max_tokens, ctx](
+            [snap, prompt_tokens, temperature, max_tokens, ctx, req_guard](
                 size_t offset, httplib::DataSink& sink) -> bool
             {
                 if (offset > 0) return false;
                 ctx->sink = &sink;
 
+                tls_decode_buffer.clear();
                 StreamCallback cb = [](int token, float*, void* userdata) -> bool {
                     auto* c = static_cast<CbCtx*>(userdata);
-                    std::vector<int> single = {token};
-                    std::string text = decode_with_python(single, c->helper_dir);
+                    if (g_interrupted) return false;
 
-                    json choice = {
-                        {"index",         0},
-                        {"text",          text},
-                        {"logprobs",      nullptr},
-                        {"finish_reason", nullptr}
-                    };
-                    json chunk = {
-                        {"id",      c->id},
-                        {"object",  "text_completion"},
-                        {"created", std::to_string(c->created)},
-                        {"model",   "default"},
-                        {"choices", {choice}}
-                    };
-
-                    std::string sse = "data: " + chunk.dump() + "\n\n";
-                    if (!c->sink->write(sse.data(), sse.size()))
-                        return false;
+                    tls_decode_buffer.push_back(token);
+                    bool is_eos = (token == 0);
+                    if (tls_decode_buffer.size() >= 16 || is_eos) {
+                        std::string text = g_model.tokenizer.decode(tls_decode_buffer);
+                        if (!text.empty()) {
+                            json choice = {
+                                {"index",         0},
+                                {"text",          text},
+                                {"logprobs",      nullptr},
+                                {"finish_reason", nullptr}
+                            };
+                            json chunk = {
+                                {"id",      c->id},
+                                {"object",  "text_completion"},
+                                {"created", std::to_string(c->created)},
+                                {"model",   "default"},
+                                {"choices", {choice}}
+                            };
+                            std::string sse = "data: " + chunk.dump() + "\n\n";
+                            if (!c->sink->write(sse.data(), sse.size()))
+                                return false;
+                        }
+                        tls_decode_buffer.clear();
+                    }
                     return true;
                 };
 
@@ -540,6 +666,25 @@ void handle_completions(const httplib::Request& req,
                     snap->cfg, snap->embedding, snap->layers,
                     snap->final_norm, snap->layer_norms, snap->rope,
                     cb, ctx.get());
+
+                // Flush remaining buffered tokens
+                if (!tls_decode_buffer.empty()) {
+                    std::string text = g_model.tokenizer.decode(tls_decode_buffer);
+                    if (!text.empty()) {
+                        json choice = {
+                            {"index",0}, {"text",text},
+                            {"logprobs",nullptr}, {"finish_reason",nullptr}
+                        };
+                        json chunk = {
+                            {"id",ctx->id}, {"object","text_completion"},
+                            {"created",std::to_string(ctx->created)}, {"model","default"},
+                            {"choices",{choice}}
+                        };
+                        std::string sse = "data: " + chunk.dump() + "\n\n";
+                        sink.write(sse.data(), sse.size());
+                    }
+                    tls_decode_buffer.clear();
+                }
 
                 sink.write("data: [DONE]\n\n", 16);
                 sink.done();
@@ -566,8 +711,8 @@ void handle_completions(const httplib::Request& req,
         std::string decoded, prompt_decoded;
         {
             std::lock_guard<std::mutex> lock(g_model_mutex);
-            decoded        = decode_with_python(all_tokens, g_model.helper_dir);
-            prompt_decoded = decode_with_python(prompt_tokens, g_model.helper_dir);
+            decoded        = g_model.tokenizer.decode(all_tokens);
+            prompt_decoded = g_model.tokenizer.decode(prompt_tokens);
         }
 
         std::string generated_text;
@@ -615,6 +760,7 @@ void handle_completions(const httplib::Request& req,
 void handle_health(const httplib::Request& req, httplib::Response& res) {
     (void)req;
     add_cors_headers(res);
+    touch_last_request();
     send_json(res, json{
         {"status", g_model.loaded ? "ok" : "not_loaded"},
         {"model",  "default"}
