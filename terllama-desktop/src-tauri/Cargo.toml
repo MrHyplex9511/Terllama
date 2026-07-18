@@ -1,0 +1,23 @@
+[package]
+name = "terllama-desktop"
+version = "1.0.0"
+edition = "2021"
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-shell = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["stream", "json", "rustls-tls"] }
+tokio = { version = "1", features = ["full"] }
+futures-util = "0.3"
+dirs = "5"
+uuid = { version = "1", features = ["v4"] }
+chrono = "0.4"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }

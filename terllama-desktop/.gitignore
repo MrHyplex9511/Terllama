@@ -1,0 +1,11 @@
+node_modules/
+dist/
+target/
+.svelte-kit/
+sysroot/
+pkg-config-bin/
+pkgconf-bin/
+webkit2gtk-dev/
+*.deb
+*.log
+.DS_Store

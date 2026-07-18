@@ -1,4 +1,7 @@
 {
+  "schema_version": "2.0",
+  "description": "Terllama model registry — ternary (1.58-bit) and planned Q4_K_M/Q8_0 support",
+  "note": "Q4_K_M and Q8_0 quants are listed as schema placeholders. Terllama v1.0 binary only supports Q2_0 ternary GGUF and native i2s/als formats. GGUF Q4/Q8 support is planned for a future release with llama.cpp backend.",
   "models": [
     {
       "id": "tinyllama",
@@ -7,7 +10,12 @@
       "format": "als",
       "size_mb": 139,
       "context": 2048,
-      "description": "1.1B parameter Llama-based model — fast CPU inference"
+      "description": "1.1B parameter Llama-based model — fast CPU inference with ternary precision",
+      "quants": {
+        "ternary": { "available": true, "size_mb": 139, "filename": "model.als" },
+        "q4_k_m": { "available": false, "size_mb": 700, "filename": "tinyllama-q4_k_m.gguf" },
+        "q8_0": { "available": false, "size_mb": 1100, "filename": "tinyllama-q8_0.gguf" }
+      }
     },
     {
       "id": "smolLM2",
@@ -16,7 +24,12 @@
       "format": "i2s",
       "size_mb": 54,
       "context": 2048,
-      "description": "135M parameter model — fastest possible inference"
+      "description": "135M parameter model — fastest possible inference on CPU",
+      "quants": {
+        "ternary": { "available": true, "size_mb": 54, "filename": "model.i2s" },
+        "q4_k_m": { "available": false, "size_mb": 90, "filename": "smolm2-q4_k_m.gguf" },
+        "q8_0": { "available": false, "size_mb": 140, "filename": "smolm2-q8_0.gguf" }
+      }
     },
     {
       "id": "mistral-7b",
@@ -25,15 +38,26 @@
       "format": "gguf",
       "size_mb": 4100,
       "context": 32768,
-      "description": "7B parameter Mistral — strong quality, high RAM"
+      "description": "7B parameter Mistral — strong quality, requires 4GB+ RAM",
+      "quants": {
+        "ternary": { "available": true, "size_mb": 2600, "filename": "mistral-q2_0.gguf" },
+        "q4_k_m": { "available": false, "size_mb": 4100, "filename": "mistral-q4_k_m.gguf" },
+        "q8_0": { "available": false, "size_mb": 7000, "filename": "mistral-q8_0.gguf" }
+      }
     },
     {
       "id": "mistral-v0.3",
+      "name": "Mistral-7B-Instruct-v0.3",
       "hf_repo": "QuantFactory/Mistral-7B-Instruct-v0.3-GGUF",
       "format": "gguf",
       "size_mb": 4096,
       "context": 32768,
-      "description": "Mistral 7B v0.3 Instruct"
+      "description": "Mistral 7B v0.3 Instruct — instruction-tuned variant",
+      "quants": {
+        "ternary": { "available": true, "size_mb": 2600, "filename": "mistral-v0.3-q2_0.gguf" },
+        "q4_k_m": { "available": false, "size_mb": 4096, "filename": "mistral-v0.3-q4_k_m.gguf" },
+        "q8_0": { "available": false, "size_mb": 7000, "filename": "mistral-v0.3-q8_0.gguf" }
+      }
     },
     {
       "id": "llama-3.1-8b",
@@ -42,7 +66,12 @@
       "format": "gguf",
       "size_mb": 4800,
       "context": 131072,
-      "description": "8B Llama 3.1 — best quality, needs 8GB+ RAM"
+      "description": "8B Llama 3.1 — best quality, needs 8GB+ RAM",
+      "quants": {
+        "ternary": { "available": true, "size_mb": 3200, "filename": "llama-3.1-8b-q2_0.gguf" },
+        "q4_k_m": { "available": false, "size_mb": 4800, "filename": "llama-3.1-8b-q4_k_m.gguf" },
+        "q8_0": { "available": false, "size_mb": 8000, "filename": "llama-3.1-8b-q8_0.gguf" }
+      }
     },
     {
       "id": "phi-3.5-mini",
@@ -51,7 +80,12 @@
       "format": "gguf",
       "size_mb": 2600,
       "context": 4096,
-      "description": "3.8B Phi-3.5 — Microsoft's efficient instruct model"
+      "description": "3.8B Phi-3.5 — Microsoft's efficient instruct model",
+      "quants": {
+        "ternary": { "available": true, "size_mb": 1600, "filename": "phi-3.5-q2_0.gguf" },
+        "q4_k_m": { "available": false, "size_mb": 2600, "filename": "phi-3.5-q4_k_m.gguf" },
+        "q8_0": { "available": false, "size_mb": 3800, "filename": "phi-3.5-q8_0.gguf" }
+      }
     },
     {
       "id": "gemma-2b",
@@ -60,7 +94,12 @@
       "format": "gguf",
       "size_mb": 1400,
       "context": 8192,
-      "description": "2B Gemma — Google's lightweight model (experimental)"
+      "description": "2B Gemma — Google's lightweight model (experimental)",
+      "quants": {
+        "ternary": { "available": true, "size_mb": 800, "filename": "gemma-2b-q2_0.gguf" },
+        "q4_k_m": { "available": false, "size_mb": 1400, "filename": "gemma-2b-q4_k_m.gguf" },
+        "q8_0": { "available": false, "size_mb": 2000, "filename": "gemma-2b-q8_0.gguf" }
+      }
     }
   ]
 }
