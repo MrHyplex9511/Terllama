@@ -12,7 +12,7 @@
 
 [![Install](https://img.shields.io/badge/install-one--liner-brightgreen)](install.sh)
 
-Heavily Vibed
+## ⚠️ Heavily Vibed
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/MrHyplex9511/Terllama/main/install.sh | bash
