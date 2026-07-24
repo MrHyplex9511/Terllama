@@ -268,3 +268,7 @@ third_party/   cpp-httplib (single header)
 ## License
 
 MIT
+
+---
+
+![TerLlama Banner](Banner.png)
