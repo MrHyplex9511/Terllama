@@ -1,7 +1,7 @@
 # Terllama
 
 <p align="center">
-  <img src="TerLlama.png" alt="Terllama Logo" width="200">
+  <img src="Banner.png" alt="TerLlama Banner">
 </p>
 
 <p align="center">
@@ -271,4 +271,6 @@ MIT
 
 ---
 
-![TerLlama Banner](Banner.png)
+<p align="center">
+  <img src="Banner.png" alt="TerLlama Banner">
+</p>
