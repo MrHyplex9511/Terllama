@@ -413,3 +413,318 @@ inline LoadedModel load_model_from(const std::string& model_path_or_dir) {
 
     return m;
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MoTE FORMAT SAVE/LOAD
+// ═══════════════════════════════════════════════════════════════════════════
+// Magic: "MOTE" = 0x45544F4D
+// Format:
+//   Magic: uint32 = 0x45544F4D
+//   config_len: uint32
+//   config_json: char[config_len]
+//   num_layers: uint32
+//   Per layer:
+//     name_len, name
+//     num_experts: uint32
+//     top_k: uint32
+//     has_shared: uint8
+//     shared_gate_len + shared_gate_data
+//     shared_up_len + shared_up_data
+//     shared_down_len + shared_down_data
+//     For each expert:
+//       expert_gate_len + expert_gate_data
+//       expert_up_len + expert_up_data
+//       expert_down_len + expert_down_data
+//     router_weight_len: uint32
+//     router_weights: float32[router_weight_len]
+
+constexpr uint32_t MOTE_MAGIC = 0x45544F4D;  // "MOTE"
+
+// ─── Serialize a LayerData to bytes ────────────────────────────────────────
+inline std::vector<uint8_t> serialize_layer_data(const LayerData& ld) {
+    std::vector<uint8_t> buf;
+    auto append = [&](const void* data, size_t sz) {
+        const uint8_t* ptr = (const uint8_t*)data;
+        buf.insert(buf.end(), ptr, ptr + sz);
+    };
+
+    uint32_t nl = (uint32_t)ld.name.size();
+    append(&nl, 4);
+    append(ld.name.data(), nl);
+    append(&ld.out_features, 4);
+    append(&ld.in_features, 4);
+    uint32_t nt = (uint32_t)ld.num_terms;
+    append(&nt, 4);
+
+    uint8_t has_raw = ld.has_raw_weights ? 1 : 0;
+    uint8_t has_i2s = ld.has_i2s ? 1 : 0;
+    append(&has_raw, 1);
+
+    if (ld.has_raw_weights) {
+        uint32_t dw = (uint32_t)(ld.raw_weights.size() * sizeof(float));
+        append(&dw, 4);
+        append(ld.raw_weights.data(), dw);
+        return buf;
+    }
+
+    append(&has_i2s, 1);
+
+    if (ld.has_i2s) {
+        uint32_t nb = (uint32_t)ld.i2s_blocks.size();
+        append(&nb, 4);
+        append(&ld.i2s_qk, 4);
+        for (auto& blk : ld.i2s_blocks) {
+            uint32_t ps = (uint32_t)blk.packed.size();
+            append(&ps, 4);
+            append(blk.packed.data(), ps);
+            append(&blk.scale, 4);
+        }
+        return buf;
+    }
+
+    // Bitplane terms
+    uint32_t nterms = (uint32_t)ld.terms.size();
+    append(&nterms, 4);
+    for (auto& term : ld.terms) {
+        append(&term.alpha_exp, 4);
+        uint64_t ne = (uint64_t)term.n_elements;
+        append(&ne, 8);
+        uint32_t cs = (uint32_t)(term.combined.size() * sizeof(uint32_t));
+        append(&cs, 4);
+        append(term.combined.data(), cs);
+    }
+    return buf;
+}
+
+// ─── Deserialize a LayerData from buffer, return bytes consumed ───────────
+inline size_t deserialize_layer_data(const uint8_t* buf, size_t offset, LayerData& ld) {
+    size_t pos = offset;
+    auto read32 = [&]() -> uint32_t {
+        uint32_t v; std::memcpy(&v, buf + pos, 4); pos += 4; return v;
+    };
+
+    uint32_t nl = read32();
+    ld.name.assign((const char*)buf + pos, nl); pos += nl;
+    ld.out_features = (int32_t)read32();
+    ld.in_features = (int32_t)read32();
+    ld.num_terms = (int32_t)read32();
+
+    uint8_t has_raw = buf[pos++];
+    if (has_raw) {
+        ld.has_raw_weights = true;
+        uint32_t dw = read32();
+        ld.raw_weights.resize(dw / sizeof(float));
+        std::memcpy(ld.raw_weights.data(), buf + pos, dw); pos += dw;
+        return pos - offset;
+    }
+
+    uint8_t has_i2s = buf[pos++];
+    if (has_i2s) {
+        ld.has_i2s = true;
+        uint32_t nb = read32();
+        ld.i2s_qk = (int32_t)read32();
+        ld.i2s_blocks.resize(nb);
+        for (uint32_t b = 0; b < nb; b++) {
+            uint32_t ps = read32();
+            ld.i2s_blocks[b].packed.resize(ps);
+            std::memcpy(ld.i2s_blocks[b].packed.data(), buf + pos, ps); pos += ps;
+            std::memcpy(&ld.i2s_blocks[b].scale, buf + pos, 4); pos += 4;
+        }
+        return pos - offset;
+    }
+
+    // Bitplane terms
+    uint32_t nterms = read32();
+    ld.terms.resize(nterms);
+    for (uint32_t t = 0; t < nterms; t++) {
+        std::memcpy(&ld.terms[t].alpha_exp, buf + pos, 4); pos += 4;
+        uint64_t ne; std::memcpy(&ne, buf + pos, 8); pos += 8;
+        ld.terms[t].n_elements = (size_t)ne;
+        uint32_t cs = read32();
+        ld.terms[t].combined.resize(cs / sizeof(uint32_t));
+        std::memcpy(ld.terms[t].combined.data(), buf + pos, cs); pos += cs;
+    }
+    return pos - offset;
+}
+
+// ─── Save MoTE model ──────────────────────────────────────────────────────
+inline void save_mote_model(const std::string& path,
+                             const MoTEConfig& config,
+                             const std::vector<MoTELayerData>& mote_layers) {
+    std::ofstream f(path, std::ios::binary);
+    if (!f) { Logger::error("Cannot write: {}", path); exit(1); }
+
+    uint32_t magic = MOTE_MAGIC;
+    f.write((const char*)&magic, 4);
+
+    std::string cfg_str = "{\"num_experts\":" + std::to_string(config.num_experts)
+                        + ",\"top_k\":" + std::to_string(config.top_k)
+                        + ",\"use_shared_expert\":" + (config.use_shared_expert ? "true" : "false")
+                        + "}";
+    uint32_t cfg_len = (uint32_t)cfg_str.size();
+    f.write((const char*)&cfg_len, 4);
+    f.write(cfg_str.data(), cfg_len);
+
+    uint32_t nl = (uint32_t)mote_layers.size();
+    f.write((const char*)&nl, 4);
+
+    for (auto& ml : mote_layers) {
+        uint32_t name_len = (uint32_t)ml.gate_proj.name.size();
+        f.write((const char*)&name_len, 4);
+        f.write(ml.gate_proj.name.data(), name_len);
+        uint32_t ne = (uint32_t)ml.num_experts;
+        uint32_t tk = (uint32_t)ml.top_k;
+        f.write((const char*)&ne, 4);
+        f.write((const char*)&tk, 4);
+        uint8_t hs = 1;
+        f.write((const char*)&hs, 1);
+
+        auto write_ld = [&](const LayerData& ld) {
+            auto ser = serialize_layer_data(ld);
+            uint32_t sz = (uint32_t)ser.size();
+            f.write((const char*)&sz, 4);
+            f.write((const char*)ser.data(), sz);
+        };
+
+        write_ld(ml.gate_proj);
+        write_ld(ml.up_proj);
+        write_ld(ml.down_proj);
+
+        for (int e = 0; e < (int)ne; e++) {
+            write_ld(ml.expert_gate[e]);
+            write_ld(ml.expert_up[e]);
+            write_ld(ml.expert_down[e]);
+        }
+
+        uint32_t rwl = (uint32_t)(ml.router_weight.size() * sizeof(float));
+        f.write((const char*)&rwl, 4);
+        f.write((const char*)ml.router_weight.data(), rwl);
+    }
+
+    Logger::info("MoTE model saved: {} ({} layers)", path, mote_layers.size());
+}
+
+// ─── Peek MoTE config from file ────────────────────────────────────────────
+inline MoTEConfig peek_mote_config(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) { Logger::error("Cannot open: {}", path); exit(1); }
+
+    uint32_t magic;
+    f.read((char*)&magic, 4);
+    if (magic != MOTE_MAGIC) {
+        Logger::error("Bad MoTE magic: 0x{:x}", magic);
+        exit(1);
+    }
+
+    uint32_t cfg_len;
+    f.read((char*)&cfg_len, 4);
+    std::string cfg_str(cfg_len, '\0');
+    f.read(&cfg_str[0], cfg_len);
+
+    MoTEConfig cfg;
+    auto extract_int = [&](const std::string& key, int def) {
+        auto p = cfg_str.find("\"" + key + "\":");
+        if (p == std::string::npos) return def;
+        p = cfg_str.find(':', p) + 1;
+        while (p < cfg_str.size() && (cfg_str[p] == ' ' || cfg_str[p] == '\t')) p++;
+        int v = 0, sign = 1;
+        if (cfg_str[p] == '-') { sign = -1; p++; }
+        while (p < cfg_str.size() && cfg_str[p] >= '0' && cfg_str[p] <= '9')
+            v = v * 10 + (cfg_str[p++] - '0');
+        return sign * v;
+    };
+    auto extract_bool = [&](const std::string& key, bool def) {
+        auto p = cfg_str.find("\"" + key + "\":");
+        if (p == std::string::npos) return def;
+        p = cfg_str.find(':', p) + 1;
+        while (p < cfg_str.size() && (cfg_str[p] == ' ' || cfg_str[p] == '\t')) p++;
+        return cfg_str.substr(p, 4) == "true";
+    };
+
+    cfg.num_experts = extract_int("num_experts", 4);
+    cfg.top_k = extract_int("top_k", 1);
+    cfg.use_shared_expert = extract_bool("use_shared_expert", true);
+
+    return cfg;
+}
+
+// ─── Load MoTE layers from file ────────────────────────────────────────────
+inline std::vector<MoTELayerData> load_mote_layers(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) { Logger::error("Cannot open: {}", path); exit(1); }
+
+    f.seekg(0, std::ios::end);
+    size_t file_size = (size_t)f.tellg();
+    f.seekg(0, std::ios::beg);
+    std::vector<uint8_t> buf(file_size);
+    f.read((char*)buf.data(), file_size);
+
+    size_t pos = 0;
+    auto rd32 = [&]() -> uint32_t {
+        uint32_t v; std::memcpy(&v, buf.data() + pos, 4); pos += 4; return v;
+    };
+
+    uint32_t magic = rd32();
+    if (magic != MOTE_MAGIC) {
+        Logger::error("Bad MoTE magic: 0x{:x}", magic);
+        exit(1);
+    }
+
+    uint32_t cfg_len = rd32();
+    pos += cfg_len;
+
+    uint32_t num_layers = rd32();
+    std::vector<MoTELayerData> layers(num_layers);
+
+    auto read_ld = [&](const std::string& lname) -> LayerData {
+        uint32_t lsz = rd32();
+        LayerData ld;
+        deserialize_layer_data(buf.data(), pos, ld);
+        ld.name = lname;
+        pos += lsz;
+        return ld;
+    };
+
+    for (uint32_t i = 0; i < num_layers; i++) {
+        auto& ml = layers[i];
+        uint32_t nl = rd32();
+        std::string lname((const char*)buf.data() + pos, nl); pos += nl;
+        ml.num_experts = (int)rd32();
+        ml.top_k = (int)rd32();
+        uint8_t hs = buf[pos++]; (void)hs;
+
+        ml.gate_proj = read_ld(lname + ".gate_proj");
+        ml.up_proj   = read_ld(lname + ".up_proj");
+        ml.down_proj = read_ld(lname + ".down_proj");
+
+        ml.expert_gate.resize(ml.num_experts);
+        ml.expert_up.resize(ml.num_experts);
+        ml.expert_down.resize(ml.num_experts);
+        for (int e = 0; e < ml.num_experts; e++) {
+            std::string es = lname + ".expert." + std::to_string(e);
+            ml.expert_gate[e] = read_ld(es + ".gate_proj");
+            ml.expert_up[e]   = read_ld(es + ".up_proj");
+            ml.expert_down[e] = read_ld(es + ".down_proj");
+        }
+
+        uint32_t rwl = rd32();
+        ml.router_weight.resize(rwl / sizeof(float));
+        std::memcpy(ml.router_weight.data(), buf.data() + pos, rwl); pos += rwl;
+        ml.router_scale = 1.0f;
+        ml.is_mote = true;
+    }
+
+    Logger::info("MoTE model loaded: {} layers", num_layers);
+    return layers;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MoTE FILE DETECTION
+// ═══════════════════════════════════════════════════════════════════════════
+inline bool is_mote_file(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return false;
+    uint32_t magic;
+    f.read((char*)&magic, 4);
+    return magic == MOTE_MAGIC;
+}

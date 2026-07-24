@@ -41,6 +41,12 @@ int cmd_bench();
 void print_usage(const char* prog);
 
 // ═══════════════════════════════════════════════════════════════════════════
+// MoTE commands (defined in mote_builder.cpp)
+// ═══════════════════════════════════════════════════════════════════════════
+int cmd_mote_build(int argc, char** argv);
+int cmd_mote_list(int argc, char** argv);
+
+// ═══════════════════════════════════════════════════════════════════════════
 // External entry points (defined in server.cpp / downloader.cpp)
 // ═══════════════════════════════════════════════════════════════════════════
 int server_main(int argc, char** argv);

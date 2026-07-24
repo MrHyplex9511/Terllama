@@ -60,6 +60,36 @@ struct alignas(64) LayerData {
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
+// MoTE — Mixture of Ternary Experts
+// ═══════════════════════════════════════════════════════════════════════════
+struct MoTEConfig {
+    int num_experts = 4;
+    int top_k = 1;
+    bool use_shared_expert = true;
+};
+
+struct MoTELayerData {
+    // Shared expert (original FFN — always active)
+    LayerData gate_proj, up_proj, down_proj;
+
+    // Expert config
+    int num_experts{0};
+    int top_k{1};
+
+    // K routed ternary experts (each has own gate/up/down)
+    std::vector<LayerData> expert_gate;
+    std::vector<LayerData> expert_up;
+    std::vector<LayerData> expert_down;
+
+    // Router weights: FP32 [hidden_size × num_experts], row-major
+    std::vector<float> router_weight;
+    float router_scale{1.0f};
+
+    // Flag
+    bool is_mote{false};
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
 // CPU ARCHITECTURE ENUM
 // ═══════════════════════════════════════════════════════════════════════════
 enum class CPUArch : uint8_t {

@@ -25,7 +25,7 @@ try_isa = $(shell echo 'int x;' | $(CXX) -x c++ $(1) -c - -o /dev/null 2>/dev/nu
 HAVE_AVX2   := $(call try_isa,-mavx2 -mfma)
 
 # Kernel objects
-KERNEL_OBJS := $(BUILD_DIR)/kernel_scalar.o $(BUILD_DIR)/kernel_avx2.o
+KERNEL_OBJS := $(BUILD_DIR)/kernel_scalar.o $(BUILD_DIR)/kernel_avx2.o $(BUILD_DIR)/kernel_mote.o
 
 ifneq (,$(filter aarch64 arm64, $(shell uname -m)))
   KERNEL_OBJS += $(BUILD_DIR)/kernel_neon.o
@@ -41,7 +41,8 @@ MAIN_OBJS := $(BUILD_DIR)/main.o \
              $(BUILD_DIR)/gguf_loader.o \
              $(BUILD_DIR)/inference.o \
              $(BUILD_DIR)/logger.o \
-             $(BUILD_DIR)/tokenizer.o
+             $(BUILD_DIR)/tokenizer.o \
+             $(BUILD_DIR)/mote_builder.o
 
 .PHONY: all build-terllama build-bench clean help
 
@@ -71,6 +72,10 @@ endif
 $(BUILD_DIR)/kernel_neon.o: $(SRC_DIR)/kernel_neon.cpp | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -march=armv8-a+fp+simd -c $< -o $@
 
+# MoTE kernel
+$(BUILD_DIR)/kernel_mote.o: $(SRC_DIR)/kernel_mote.cpp | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) -I$(SRC_DIR) -c $< -o $@
+
 # Dispatcher
 $(BUILD_DIR)/dispatcher.o: $(SRC_DIR)/dispatcher.cpp | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
@@ -94,6 +99,10 @@ $(BUILD_DIR)/handlers.o: $(SRC_DIR)/server/handlers.cpp | $(BUILD_DIR)
 # Downloader (HuggingFace model pull)
 $(BUILD_DIR)/downloader.o: $(SRC_DIR)/downloader.cpp | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+# MoTE builder
+$(BUILD_DIR)/mote_builder.o: $(SRC_DIR)/mote_builder.cpp | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) -I$(SRC_DIR) -c $< -o $@
 
 # GGUF loader
 $(BUILD_DIR)/gguf_loader.o: $(SRC_DIR)/gguf_loader.cpp $(SRC_DIR)/gguf_loader.h | $(BUILD_DIR)

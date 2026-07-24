@@ -1,4 +1,7 @@
 <script lang="ts">
+  import BlurText from './ui/BlurText.svelte';
+  import FadeContent from './ui/FadeContent.svelte';
+
   let { onComplete }: { onComplete?: () => void } = $props();
 
   let step = $state(1);
@@ -22,11 +25,8 @@
   ];
 
   function next() {
-    if (step < 3) {
-      step++;
-    } else {
-      finish();
-    }
+    if (step < 3) step++;
+    else finish();
   }
 
   function prev() {
@@ -48,9 +48,18 @@
     </div>
 
     <div class="content">
-      <div class="icon">{steps[step - 1].icon}</div>
-      <h2>{steps[step - 1].title}</h2>
-      <p>{steps[step - 1].desc}</p>
+      <FadeContent duration={0.4} delay={0.05} direction="up">
+        <div class="icon">{steps[step - 1].icon}</div>
+        <BlurText
+          text={steps[step - 1].title}
+          animateBy="words"
+          direction="top"
+          delay={40}
+          duration={0.5}
+          class="onboarding-title"
+        />
+        <p>{steps[step - 1].desc}</p>
+      </FadeContent>
     </div>
 
     <div class="nav-buttons">
@@ -80,14 +89,14 @@
   }
 
   .card {
-    background: var(--bg-secondary);
-    border: 1px solid var(--border);
+    background: hsla(var(--surface-secondary), 0.9);
+    border: 1px solid hsla(var(--border), 0.5);
     border-radius: 16px;
     padding: 40px;
     width: 440px;
     max-width: 90vw;
     box-shadow: 0 8px 40px rgba(0, 0, 0, 0.4);
-    background-image: linear-gradient(135deg, rgba(124, 58, 237, 0.08), transparent 60%);
+    background-image: linear-gradient(135deg, hsla(var(--brand), 0.08), transparent 60%);
   }
 
   .step-indicator {
@@ -101,18 +110,18 @@
     width: 8px;
     height: 8px;
     border-radius: 50%;
-    background: var(--bg-tertiary);
+    background: hsl(var(--surface-tertiary));
     transition: all 0.3s;
   }
 
   .dot.active {
-    background: var(--accent);
+    background: hsl(var(--brand));
     width: 24px;
     border-radius: 4px;
   }
 
   .dot.done {
-    background: var(--accent);
+    background: hsl(var(--brand));
     opacity: 0.5;
   }
 
@@ -126,15 +135,16 @@
     margin-bottom: 16px;
   }
 
-  h2 {
+  :global(.onboarding-title) {
     font-size: 22px;
     font-weight: 700;
     margin: 0 0 12px;
+    color: hsl(var(--content));
   }
 
   p {
     font-size: 14px;
-    color: var(--text-secondary);
+    color: hsl(var(--content-muted));
     line-height: 1.6;
     margin: 0;
   }
@@ -161,7 +171,7 @@
   }
 
   .btn.primary {
-    background: var(--accent-gradient);
+    background: linear-gradient(135deg, hsl(var(--brand)), hsl(var(--brand-hover)));
     color: white;
   }
 
@@ -170,12 +180,12 @@
   }
 
   .btn.secondary {
-    background: var(--bg-tertiary);
-    color: var(--text-primary);
-    border: 1px solid var(--border);
+    background: hsla(var(--surface-tertiary), 0.8);
+    color: hsl(var(--content));
+    border: 1px solid hsla(var(--border), 0.5);
   }
 
   .btn.secondary:hover {
-    background: var(--border);
+    background: hsl(var(--border));
   }
 </style>

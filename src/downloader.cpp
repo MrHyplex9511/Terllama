@@ -90,9 +90,15 @@ int downloader_main(int argc, char** argv) {
         return 1;
     }
 
-    // Find scripts dir relative to binary
-    std::string bin_dir = get_bin_dir(argv[0]);
-    std::string script_path = bin_dir + "/../scripts/export_ternary_model_bitnet.py";
+    // Find scripts dir: env var > relative to binary > CWD
+    std::string script_path;
+    const char* env_script_dir = getenv("TERLLAMA_SCRIPT_DIR");
+    if (env_script_dir) {
+        script_path = std::string(env_script_dir) + "/export_ternary_model_bitnet.py";
+    } else {
+        std::string bin_dir = get_bin_dir(argv[0]);
+        script_path = bin_dir + "/../scripts/export_ternary_model_bitnet.py";
+    }
 
     // Check if script exists
     if (access(script_path.c_str(), F_OK) != 0) {

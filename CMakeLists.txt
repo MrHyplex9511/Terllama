@@ -123,6 +123,7 @@ endif()
 if(BUILD_BENCHMARK)
     add_executable(terllama-bench
         src/benchmark.cpp
+        src/core/logger.cpp
         $<TARGET_OBJECTS:terllama_kernel_scalar>
         $<TARGET_OBJECTS:terllama_kernel_avx2>
         $<TARGET_OBJECTS:terllama_dispatcher>

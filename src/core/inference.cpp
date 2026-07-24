@@ -224,13 +224,23 @@ void mlp_forward(float* x, const LayerData& gate_proj,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// MoTE MLP
+// ═══════════════════════════════════════════════════════════════════════════
+void mote_mlp_forward(float* x, const MoTELayerData& mote,
+                       int hidden_size, int intermediate_size) {
+    Logger::debug("mote_mlp_forward experts=%d top_k=%d", mote.num_experts, mote.top_k);
+    mote_ternary_linear(mote, x, x, hidden_size, intermediate_size);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // TRANSFORMER BLOCK
 // ═══════════════════════════════════════════════════════════════════════════
 void transformer_block(float* x, int seq_pos, int layer_idx,
                        const ModelConfig& cfg,
                        const std::vector<LayerData>& layers,
                        const NormWeights& norms,
-                       const RoPECache& rope, KVCache& kv_cache) {
+                       const RoPECache& rope, KVCache& kv_cache,
+                       const std::vector<MoTELayerData>* mote_layers) {
     int HS = cfg.hidden_size;
     int IS = cfg.intermediate_size;
 
@@ -244,9 +254,6 @@ void transformer_block(float* x, int seq_pos, int layer_idx,
     int idx_k = find_layer_index(layers, layer_name("self_attn.k_proj"));
     int idx_v = find_layer_index(layers, layer_name("self_attn.v_proj"));
     int idx_o = find_layer_index(layers, layer_name("self_attn.o_proj"));
-    int idx_g = find_layer_index(layers, layer_name("mlp.gate_proj"));
-    int idx_u = find_layer_index(layers, layer_name("mlp.up_proj"));
-    int idx_d = find_layer_index(layers, layer_name("mlp.down_proj"));
 
     // Attention with residual
     std::vector<float> residual(x, x + HS);
@@ -256,10 +263,21 @@ void transformer_block(float* x, int seq_pos, int layer_idx,
               rope, kv_cache, layer_idx);
     for (int i = 0; i < HS; i++) x[i] += residual[i];
 
-    // MLP with residual
+    // MLP with residual — check for MoTE first
     std::copy(x, x + HS, residual.begin());
     rms_norm(x, norms.post_attention_layernorm.data(), HS, cfg.rms_norm_eps);
-    mlp_forward(x, layers[idx_g], layers[idx_u], layers[idx_d], IS);
+
+    if (mote_layers && layer_idx < (int)mote_layers->size() && (*mote_layers)[layer_idx].is_mote) {
+        // MoTE FFN
+        mote_mlp_forward(x, (*mote_layers)[layer_idx], HS, IS);
+    } else {
+        // Standard ternary FFN
+        int idx_g = find_layer_index(layers, layer_name("mlp.gate_proj"));
+        int idx_u = find_layer_index(layers, layer_name("mlp.up_proj"));
+        int idx_d = find_layer_index(layers, layer_name("mlp.down_proj"));
+        mlp_forward(x, layers[idx_g], layers[idx_u], layers[idx_d], IS);
+    }
+
     for (int i = 0; i < HS; i++) x[i] += residual[i];
 }
 
@@ -272,7 +290,8 @@ float* model_forward(int token, int seq_pos,
                      const std::vector<LayerData>& layers,
                      const std::vector<float>& final_norm,
                      const std::vector<NormWeights>& layer_norms,
-                     const RoPECache& rope, KVCache& kv_cache) {
+                     const RoPECache& rope, KVCache& kv_cache,
+                     const std::vector<MoTELayerData>* mote_layers) {
     Logger::debug("model_forward token=%d seq_pos=%d", token, seq_pos);
 
     if (tls_x.size() != (size_t)cfg.hidden_size)
@@ -286,7 +305,7 @@ float* model_forward(int token, int seq_pos,
     // Transformer blocks
     for (int i = 0; i < cfg.num_hidden_layers; i++) {
         transformer_block(tls_x.data(), seq_pos, i, cfg, layers,
-                          layer_norms[i], rope, kv_cache);
+                          layer_norms[i], rope, kv_cache, mote_layers);
     }
 
     // Final RMSNorm
@@ -349,7 +368,8 @@ bool generate_stream(const std::vector<int>& prompt_tokens,
                      const std::vector<float>& final_norm,
                      const std::vector<NormWeights>& layer_norms,
                      const RoPECache& rope,
-                     StreamCallback callback, void* userdata) {
+                     StreamCallback callback, void* userdata,
+                     const std::vector<MoTELayerData>* mote_layers) {
 
     Logger::info("generate_stream: prompt=%zu tokens max=%d temp=%.2f",
                  prompt_tokens.size(), max_tokens, temperature);
@@ -360,7 +380,7 @@ bool generate_stream(const std::vector<int>& prompt_tokens,
     // Prefill
     for (int pos = 0; pos < (int)prompt_tokens.size(); pos++) {
         model_forward(prompt_tokens[pos], pos, cfg, embedding,
-                      layers, final_norm, layer_norms, rope, kv_cache);
+                      layers, final_norm, layer_norms, rope, kv_cache, mote_layers);
     }
 
     // Autoregressive
@@ -369,7 +389,7 @@ bool generate_stream(const std::vector<int>& prompt_tokens,
     for (int i = 0; i < max_tokens; i++) {
         int pos = (int)prompt_tokens.size() + i;
         float* logits = model_forward(next_token, pos, cfg, embedding,
-                                       layers, final_norm, layer_norms, rope, kv_cache);
+                                        layers, final_norm, layer_norms, rope, kv_cache, mote_layers);
 
         std::vector<int> recent;
         for (int j = std::max(0, (int)output_tokens.size() - 8);
@@ -406,7 +426,8 @@ std::pair<std::vector<int>, double> generate(
     const std::vector<LayerData>& layers,
     const std::vector<float>& final_norm,
     const std::vector<NormWeights>& layer_norms,
-    const RoPECache& rope) {
+    const RoPECache& rope,
+    const std::vector<MoTELayerData>* mote_layers) {
 
     Logger::info("generate: prompt=%zu tokens max=%d temp=%.2f",
                  prompt_tokens.size(), max_tokens, temperature);
@@ -419,7 +440,7 @@ std::pair<std::vector<int>, double> generate(
     // Prefill
     for (int pos = 0; pos < (int)prompt_tokens.size(); pos++) {
         model_forward(prompt_tokens[pos], pos, cfg, embedding,
-                      layers, final_norm, layer_norms, rope, kv_cache);
+                      layers, final_norm, layer_norms, rope, kv_cache, mote_layers);
     }
 
     // Autoregressive
@@ -428,7 +449,7 @@ std::pair<std::vector<int>, double> generate(
     for (int i = 0; i < max_tokens; i++) {
         int pos = (int)prompt_tokens.size() + i;
         float* logits = model_forward(next_token, pos, cfg, embedding,
-                                       layers, final_norm, layer_norms, rope, kv_cache);
+                                        layers, final_norm, layer_norms, rope, kv_cache, mote_layers);
 
         std::vector<int> recent;
         for (int j = std::max(0, (int)output_tokens.size() - 8);

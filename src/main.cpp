@@ -117,6 +117,14 @@ int main(int argc, char** argv) {
         return cmd_bench();
     }
 
+    if (cmd == "mote-build") {
+        return cmd_mote_build(argc, argv);
+    }
+
+    if (cmd == "mote-list") {
+        return cmd_mote_list(argc, argv);
+    }
+
     if (cmd == "--help" || cmd == "-h" || cmd == "help") {
         print_usage(argv[0]);
         return 0;

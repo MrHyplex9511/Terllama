@@ -35,6 +35,7 @@
     disabled={disabled}
     role="switch"
     aria-checked={checked}
+    aria-label={label || 'Toggle'}
   >
     <span class="toggle-knob"></span>
   </button>

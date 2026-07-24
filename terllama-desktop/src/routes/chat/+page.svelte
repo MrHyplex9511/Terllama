@@ -1,10 +1,13 @@
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core';
   import { listen } from '@tauri-apps/api/event';
-  import { getChatState } from '../../lib/stores/chat';
-  import { getModelsState } from '../../lib/stores/models';
-  import { getSettingsState } from '../../lib/stores/settings';
+  import { getChatState } from '../../lib/stores/chat.svelte';
+  import { getModelsState } from '../../lib/stores/models.svelte';
+  import { getSettingsState } from '../../lib/stores/settings.svelte';
   import ChatMessage from '../../lib/components/ChatMessage.svelte';
+  import FadeContent from '../../lib/components/ui/FadeContent.svelte';
+  import Counter from '../../lib/components/ui/Counter.svelte';
+  import LiquidEther from '../../lib/components/bg/LiquidEther.svelte';
 
   const chat = getChatState();
   const models = getModelsState();
@@ -47,14 +50,12 @@
     chat.setIsGenerating(true);
     chat.setCurrentResponse('');
 
-    // Get all messages for context
     const messages = chat.messages.map((m) => ({
       role: m.role,
       content: m.content,
     }));
 
     try {
-      // Listen for streaming events
       const unlistenToken = await listen<string>('chat-token', (event) => {
         try {
           const data = JSON.parse(event.payload);
@@ -109,57 +110,48 @@
 </script>
 
 <div class="chat-page">
-  <!-- Header -->
-  <div class="chat-header">
-    <div class="header-left">
-      <span class="model-name">
-        {models.activeModel || 'No model loaded'}
-      </span>
-      <span class="mode-badge ternary">Ternary</span>
-    </div>
-    <div class="header-right">
-      {#if chat.tokensPerSecond > 0}
-        <span class="tps">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <polyline points="23 6 13.5 15.5 8.5 10.5 1 18" />
-            <polyline points="17 6 23 6 23 12" />
-          </svg>
-          {chat.tokensPerSecond.toFixed(1)} t/s
-        </span>
-      {/if}
-    </div>
-  </div>
-
   <!-- Messages -->
   <div class="messages-area">
     {#if chat.messages.length === 0 && !chat.isGenerating}
       <div class="empty-state">
-        <div class="empty-icon">
-          <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-            <path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z" />
-          </svg>
-        </div>
-        <h2>Start a conversation</h2>
-        <p>Type a message below to begin chatting with your model.</p>
+        <LiquidEther colors={['#7C3AED', '#3B82F6', '#EC4899']} speed={15} blur={60} />
+        <FadeContent duration={0.6} direction="up">
+          <div class="empty-icon">
+            <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z" />
+            </svg>
+          </div>
+          <h2>Start a conversation</h2>
+          <p>Type a message below to begin chatting with your model.</p>
+          {#if !models.activeModel}
+            <p class="hint">Tip: Load a model from the Library first</p>
+          {/if}
+        </FadeContent>
       </div>
     {:else}
-      {#each chat.messages as msg}
-        <ChatMessage message={msg} />
-      {/each}
+      <div class="messages-scroll">
+        {#each chat.messages as msg, i}
+          <FadeContent duration={0.3} delay={i === chat.messages.length - 1 ? 0 : 0}>
+            <ChatMessage message={msg} />
+          </FadeContent>
+        {/each}
 
-      {#if chat.isGenerating && chat.currentResponse}
-        <ChatMessage message={{ role: 'assistant', content: chat.currentResponse }} />
-      {/if}
+        {#if chat.isGenerating && chat.currentResponse}
+          <FadeContent duration={0.3}>
+            <ChatMessage message={{ role: 'assistant', content: chat.currentResponse }} />
+          </FadeContent>
+        {/if}
 
-      {#if chat.isGenerating && !chat.currentResponse}
-        <div class="loading-dots">
-          <span class="dot"></span>
-          <span class="dot"></span>
-          <span class="dot"></span>
-        </div>
-      {/if}
+        {#if chat.isGenerating && !chat.currentResponse}
+          <div class="loading-dots">
+            <span class="dot"></span>
+            <span class="dot"></span>
+            <span class="dot"></span>
+          </div>
+        {/if}
+      </div>
     {/if}
-    <div bind:this={messagesEndRef} />
+    <div bind:this={messagesEndRef}></div>
   </div>
 
   <!-- Input -->
@@ -175,14 +167,14 @@
       ></textarea>
 
       {#if chat.isGenerating}
-        <button class="stop-btn" onclick={stopGeneration}>
+        <button class="stop-btn" onclick={stopGeneration} aria-label="Stop generation">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
             <rect x="6" y="6" width="12" height="12" rx="2" />
           </svg>
         </button>
       {:else}
-        <button class="send-btn" onclick={sendMessage} disabled={!inputText.trim()}>
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <button class="send-btn" onclick={sendMessage} disabled={!inputText.trim()} aria-label="Send message">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <line x1="22" y1="2" x2="11" y2="13" />
             <polygon points="22 2 15 22 11 13 2 9 22 2" />
           </svg>
@@ -190,7 +182,16 @@
       {/if}
     </div>
     <div class="input-footer">
-      <span class="token-count">{chat.messages.length} messages</span>
+      <span class="model-badge">
+        {models.activeModel || 'No model loaded'}
+        {#if models.activeModel}
+          <span class="mode-indicator">Ternary</span>
+        {/if}
+      </span>
+      <Counter value={chat.messages.length} duration={300} suffix=" messages" class="msg-count" />
+      {#if chat.tokensPerSecond > 0}
+        <Counter value={chat.tokensPerSecond} duration={500} decimals={1} suffix=" t/s" class="tps" />
+      {/if}
     </div>
   </div>
 </div>
@@ -202,56 +203,14 @@
     height: 100%;
   }
 
-  .chat-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 12px 20px;
-    border-bottom: 1px solid var(--border);
-    background: var(--bg-secondary);
-  }
-
-  .header-left {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-  }
-
-  .model-name {
-    font-size: 14px;
-    font-weight: 600;
-  }
-
-  .mode-badge {
-    font-size: 11px;
-    font-weight: 600;
-    padding: 2px 8px;
-    border-radius: 4px;
-    text-transform: uppercase;
-  }
-
-  .mode-badge.ternary {
-    background: rgba(124, 58, 237, 0.15);
-    color: var(--accent-hover);
-  }
-
-  .header-right {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-  }
-
-  .tps {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    font-size: 12px;
-    color: var(--success);
-  }
-
   .messages-area {
     flex: 1;
     overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .messages-scroll {
     padding: 8px 0;
   }
 
@@ -262,23 +221,37 @@
     justify-content: center;
     height: 100%;
     gap: 12px;
-    color: var(--text-secondary);
+    color: hsl(var(--content-muted));
+    padding: 40px;
+    position: relative;
+    overflow: hidden;
+  }
+
+  .empty-state > *:not(.liquid-ether) {
+    position: relative;
+    z-index: 1;
   }
 
   .empty-icon {
-    opacity: 0.4;
+    opacity: 0.3;
   }
 
   .empty-state h2 {
     margin: 0;
     font-size: 20px;
     font-weight: 600;
-    color: var(--text-primary);
+    color: hsl(var(--content));
   }
 
   .empty-state p {
     margin: 0;
     font-size: 14px;
+  }
+
+  .empty-state .hint {
+    font-size: 12px;
+    color: hsl(var(--brand-hover));
+    margin-top: 4px;
   }
 
   .loading-dots {
@@ -292,7 +265,7 @@
     width: 8px;
     height: 8px;
     border-radius: 50%;
-    background: var(--text-secondary);
+    background: hsl(var(--content-muted));
     animation: bounce 1.4s infinite ease-in-out;
   }
 
@@ -305,30 +278,34 @@
   }
 
   .input-area {
-    border-top: 1px solid var(--border);
-    padding: 16px 20px;
-    background: var(--bg-secondary);
+    border-top: 1px solid hsl(var(--border));
+    padding: 16px 24px;
+    background: hsla(var(--surface-secondary), 0.4);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
   }
 
   .input-wrapper {
     display: flex;
     align-items: flex-end;
     gap: 10px;
-    background: var(--bg-tertiary);
-    border: 1px solid var(--border);
+    background: hsla(var(--surface-tertiary), 0.6);
+    border: 1px solid hsla(var(--border), 0.6);
     border-radius: var(--radius);
     padding: 8px 12px;
+    transition: border-color 0.15s;
   }
 
   .input-wrapper:focus-within {
-    border-color: var(--accent);
+    border-color: hsl(var(--brand));
+    box-shadow: 0 0 12px hsla(var(--brand), 0.1);
   }
 
   textarea {
     flex: 1;
     background: transparent;
     border: none;
-    color: var(--text-primary);
+    color: hsl(var(--content));
     font-size: 14px;
     resize: none;
     font-family: inherit;
@@ -338,7 +315,7 @@
   }
 
   textarea::placeholder {
-    color: var(--text-secondary);
+    color: hsl(var(--content-muted));
   }
 
   textarea:disabled {
@@ -360,12 +337,13 @@
   }
 
   .send-btn {
-    background: var(--accent-gradient);
+    background: linear-gradient(135deg, hsl(var(--brand)), hsl(var(--brand-hover)));
     color: white;
   }
 
   .send-btn:hover:not(:disabled) {
     opacity: 0.9;
+    box-shadow: 0 0 12px hsla(var(--brand), 0.3);
   }
 
   .send-btn:disabled {
@@ -374,7 +352,7 @@
   }
 
   .stop-btn {
-    background: var(--danger);
+    background: hsl(var(--danger));
     color: white;
     animation: pulse 1.5s infinite;
   }
@@ -386,12 +364,38 @@
 
   .input-footer {
     display: flex;
-    justify-content: flex-end;
+    justify-content: space-between;
+    align-items: center;
     padding: 6px 4px 0;
+    gap: 12px;
   }
 
-  .token-count {
+  .model-badge {
     font-size: 11px;
-    color: var(--text-secondary);
+    color: hsl(var(--content-muted));
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .mode-indicator {
+    font-size: 10px;
+    font-weight: 600;
+    padding: 1px 6px;
+    border-radius: 3px;
+    background: hsla(var(--brand), 0.15);
+    color: hsl(var(--brand-hover));
+    text-transform: uppercase;
+  }
+
+  :global(.msg-count) {
+    font-size: 11px;
+    color: hsl(var(--content-muted));
+  }
+
+  :global(.tps) {
+    font-size: 11px;
+    color: hsl(var(--success));
+    font-weight: 500;
   }
 </style>

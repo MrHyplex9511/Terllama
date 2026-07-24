@@ -19,7 +19,10 @@
   let isDownloading = $state(false);
   let progress = $state<DownloadProgress | null>(null);
   let completed = $state(false);
+  let errorMessage = $state<string | null>(null);
   let cleanup: (() => void) | null = null;
+
+  let dialogEl: HTMLDivElement | undefined = $state();
 
   $effect(() => {
     if (show) {
@@ -43,19 +46,16 @@
     return mb + ' MB';
   }
 
-  function getSelectedInfo() {
-    if (!model) return null;
-    return model.quants[selectedQuant as keyof typeof model.quants];
-  }
-
   async function handleDownload() {
     if (!model) return;
     isDownloading = true;
     completed = false;
     progress = null;
+    errorMessage = null;
     try {
       await invoke('download_model', { modelId: model.id, quant: selectedQuant });
     } catch (e) {
+      errorMessage = typeof e === 'string' ? e : e?.message || 'Download failed — check console for details';
       console.error('Download failed:', e);
       isDownloading = false;
     }
@@ -66,6 +66,7 @@
     completed = false;
     progress = null;
     isDownloading = false;
+    errorMessage = null;
     onClose?.();
   }
 
@@ -85,11 +86,12 @@
   <!-- Overlay -->
   <div class="overlay" onclick={handleClose} role="presentation">
     <!-- Dialog -->
-    <div class="dialog" onclick={(e) => e.stopPropagation()} role="dialog">
+    <!-- svelte-ignore a11y_no_static_element_interactions -->
+    <div class="dialog" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()} role="dialog" tabindex="0" bind:this={dialogEl}>
       <div class="header">
         <h2>{model.name || model.id}</h2>
-        <button class="close-btn" onclick={handleClose}>
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <button class="close-btn" onclick={handleClose} aria-label="Close dialog">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" />
           </svg>
         </button>
@@ -99,7 +101,7 @@
 
       <!-- Quant selector -->
       <div class="quant-section">
-        <label class="section-label">Select Quantization</label>
+        <span class="section-label">Select Quantization</span>
         <div class="quant-grid">
           <button
             class="quant-card"
@@ -148,6 +150,16 @@
         </div>
       </div>
 
+      <!-- Error message -->
+      {#if errorMessage}
+        <div class="error-section">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="10" /><line x1="12" y1="8" x2="12" y2="12" /><line x1="12" y1="16" x2="12.01" y2="16" />
+          </svg>
+          <span>{errorMessage}</span>
+        </div>
+      {/if}
+
       <!-- Progress -->
       {#if isDownloading}
         <div class="progress-section">
@@ -167,7 +179,7 @@
       <div class="actions">
         {#if completed}
           <button class="btn primary" onclick={handleLoad}>
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <polyline points="20 6 9 17 4 12" />
             </svg>
             Load Model
@@ -195,11 +207,19 @@
     justify-content: center;
     z-index: 100;
     backdrop-filter: blur(4px);
+    animation: overlayFadeIn 0.2s ease-out;
+  }
+
+  @keyframes overlayFadeIn {
+    from { opacity: 0; }
+    to { opacity: 1; }
   }
 
   .dialog {
-    background: var(--bg-secondary);
-    border: 1px solid var(--border);
+    background: hsla(var(--surface-secondary), 0.85);
+    backdrop-filter: blur(24px);
+    -webkit-backdrop-filter: blur(24px);
+    border: 1px solid hsla(var(--border), 0.6);
     border-radius: var(--radius);
     padding: 28px;
     width: 520px;
@@ -207,6 +227,12 @@
     max-height: 90vh;
     overflow-y: auto;
     box-shadow: var(--shadow);
+    animation: dialogSlideUp 0.25s ease-out;
+  }
+
+  @keyframes dialogSlideUp {
+    from { opacity: 0; transform: translateY(16px) scale(0.98); }
+    to { opacity: 1; transform: translateY(0) scale(1); }
   }
 
   .header {
@@ -220,24 +246,25 @@
     margin: 0;
     font-size: 20px;
     font-weight: 700;
+    color: hsl(var(--content));
   }
 
   .close-btn {
     background: none;
     border: none;
-    color: var(--text-secondary);
+    color: hsl(var(--content-muted));
     cursor: pointer;
     padding: 4px;
     border-radius: 4px;
   }
 
   .close-btn:hover {
-    background: var(--bg-tertiary);
-    color: var(--text-primary);
+    background: hsla(var(--surface-tertiary), 0.6);
+    color: hsl(var(--content));
   }
 
   .desc {
-    color: var(--text-secondary);
+    color: hsl(var(--content-muted));
     font-size: 13px;
     margin: 0 0 20px;
     line-height: 1.5;
@@ -251,7 +278,7 @@
     display: block;
     font-size: 12px;
     font-weight: 600;
-    color: var(--text-secondary);
+    color: hsl(var(--content-muted));
     margin-bottom: 10px;
     text-transform: uppercase;
     letter-spacing: 0.05em;
@@ -268,9 +295,9 @@
     flex-direction: column;
     gap: 4px;
     padding: 14px;
-    border: 1px solid var(--border);
+    border: 1px solid hsla(var(--border), 0.5);
     border-radius: var(--radius-sm);
-    background: var(--bg-tertiary);
+    background: hsla(var(--surface-tertiary), 0.4);
     cursor: pointer;
     transition: all 0.15s;
     text-align: left;
@@ -278,12 +305,14 @@
   }
 
   .quant-card:hover:not(:disabled) {
-    border-color: var(--accent);
+    border-color: hsl(var(--brand));
+    background: hsla(var(--brand), 0.05);
   }
 
   .quant-card.selected {
-    border-color: var(--accent);
-    background: rgba(124, 58, 237, 0.1);
+    border-color: hsl(var(--brand));
+    background: hsla(var(--brand), 0.1);
+    box-shadow: 0 0 12px hsla(var(--brand), 0.1);
   }
 
   .quant-card:disabled {
@@ -294,14 +323,14 @@
   .quant-name {
     font-size: 14px;
     font-weight: 600;
-    color: var(--text-primary);
+    color: hsl(var(--content));
   }
 
   .quant-info {
     display: flex;
     gap: 16px;
     font-size: 12px;
-    color: var(--text-secondary);
+    color: hsl(var(--content-muted));
   }
 
   .quant-badge {
@@ -315,13 +344,33 @@
   }
 
   .quant-badge.ternary {
-    background: var(--accent);
+    background: linear-gradient(135deg, hsl(var(--brand)), hsl(var(--brand-hover)));
     color: white;
   }
 
   .quant-badge.coming-soon {
-    background: var(--warning);
-    color: #000;
+    background: hsla(var(--warning), 0.2);
+    color: hsl(var(--warning));
+  }
+
+  .error-section {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    padding: 12px 14px;
+    margin-bottom: 16px;
+    background: hsla(0, 70%, 50%, 0.1);
+    border: 1px solid hsla(0, 70%, 50%, 0.3);
+    border-radius: var(--radius-sm);
+    color: hsl(0, 70%, 70%);
+    font-size: 13px;
+    line-height: 1.5;
+    animation: dialogSlideUp 0.2s ease-out;
+  }
+
+  .error-section svg {
+    flex-shrink: 0;
+    margin-top: 1px;
   }
 
   .progress-section {
@@ -330,7 +379,7 @@
 
   .progress-bar {
     height: 6px;
-    background: var(--bg-tertiary);
+    background: hsla(var(--surface-tertiary), 0.6);
     border-radius: 3px;
     overflow: hidden;
     margin-bottom: 8px;
@@ -338,16 +387,16 @@
 
   .progress-fill {
     height: 100%;
-    background: var(--accent-gradient);
+    background: linear-gradient(135deg, hsl(var(--brand)), hsl(var(--brand-hover)));
     border-radius: 3px;
-    transition: width 0.3s;
+    transition: width 0.3s ease;
   }
 
   .progress-info {
     display: flex;
     justify-content: space-between;
     font-size: 12px;
-    color: var(--text-secondary);
+    color: hsl(var(--content-muted));
   }
 
   .actions {
@@ -376,21 +425,22 @@
   }
 
   .btn.primary {
-    background: var(--accent-gradient);
+    background: linear-gradient(135deg, hsl(var(--brand)), hsl(var(--brand-hover)));
     color: white;
   }
 
   .btn.primary:hover:not(:disabled) {
     opacity: 0.9;
+    box-shadow: 0 0 16px hsla(var(--brand), 0.3);
   }
 
   .btn.secondary {
-    background: var(--bg-tertiary);
-    color: var(--text-primary);
-    border: 1px solid var(--border);
+    background: hsla(var(--surface-tertiary), 0.6);
+    color: hsl(var(--content));
+    border: 1px solid hsla(var(--border), 0.5);
   }
 
   .btn.secondary:hover:not(:disabled) {
-    background: var(--border);
+    background: hsla(var(--border), 0.6);
   }
 </style>

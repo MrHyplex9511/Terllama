@@ -75,7 +75,7 @@ ALS requires the Python export script and is slower to convert than I2_S.
 |--------|-----|-----------------|
 | FP16 | ~14 GB | ~2 |
 | GGUF Q4 | ~4.5 GB | ~8 |
-| Terllary (I2_S) | **~2.1 GB** | **~18** |
+| Ternary (I2_S) | **~2.1 GB** | **~18** |
 
 ## Kernel Dispatch
 

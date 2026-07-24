@@ -3,7 +3,11 @@
   import type { RegistryModel, DownloadedModel } from '../../types';
   import ModelCard from '../../lib/components/ModelCard.svelte';
   import DownloadDialog from '../../lib/components/DownloadDialog.svelte';
-  import { getModelsState } from '../../lib/stores/models';
+  import { getModelsState } from '../../lib/stores/models.svelte';
+  import BlurText from '../../lib/components/ui/BlurText.svelte';
+  import FadeContent from '../../lib/components/ui/FadeContent.svelte';
+  import ShinyText from '../../lib/components/ui/ShinyText.svelte';
+  import ShuffleText from '../../lib/components/ui/ShuffleText.svelte';
 
   const models = getModelsState();
 
@@ -44,7 +48,7 @@
 
   async function handleLoad(modelId: string) {
     try {
-      const { getSettingsState } = await import('../../lib/stores/settings');
+      const { getSettingsState } = await import('../../lib/stores/settings.svelte');
       const settings = getSettingsState();
       await invoke('start_server', { modelId, port: settings.settings.port });
       models.setActiveModel(modelId);
@@ -67,12 +71,20 @@
 
 <div class="library-page">
   <div class="page-header">
-    <h1>Model Library</h1>
+    <BlurText
+      text="Model Library"
+      animateBy="words"
+      direction="top"
+      delay={60}
+      duration={0.6}
+      class="page-title"
+    />
     <div class="header-actions">
       <span class="model-count">{models.registry.length} models</span>
       <button class="refresh-btn" onclick={loadData} disabled={models.loading}>
         <svg
           width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+          stroke-linecap="round" stroke-linejoin="round"
           class:spinning={models.loading}
         >
           <polyline points="23 4 23 10 17 10" />
@@ -86,7 +98,7 @@
 
   {#if error}
     <div class="error-banner">
-      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
         <circle cx="12" cy="12" r="10" /><line x1="15" y1="9" x2="9" y2="15" /><line x1="9" y1="9" x2="15" y2="15" />
       </svg>
       {error}
@@ -96,19 +108,21 @@
   {#if models.loading}
     <div class="loading">
       <div class="spinner"></div>
-      <span>Loading models...</span>
+      <ShuffleText text="Loading models..." speed={0.04} duration={0.8} />
     </div>
   {:else}
-    <div class="model-grid">
-      {#each models.registry as model}
-        <ModelCard
-          {model}
-          isDownloaded={isDownloaded(model.id)}
-          onDownload={handleDownload}
-          onLoad={handleLoad}
-        />
-      {/each}
-    </div>
+    <FadeContent duration={0.4} stagger={0.04}>
+      <div class="model-grid">
+        {#each models.registry as model}
+          <ModelCard
+            {model}
+            isDownloaded={isDownloaded(model.id)}
+            onDownload={handleDownload}
+            onLoad={handleLoad}
+          />
+        {/each}
+      </div>
+    </FadeContent>
   {/if}
 </div>
 
@@ -133,10 +147,11 @@
     margin-bottom: 24px;
   }
 
-  h1 {
+  :global(.page-title) {
     margin: 0;
     font-size: 24px;
     font-weight: 700;
+    color: hsl(var(--content));
   }
 
   .header-actions {
@@ -147,7 +162,7 @@
 
   .model-count {
     font-size: 13px;
-    color: var(--text-secondary);
+    color: hsl(var(--content-muted));
   }
 
   .refresh-btn {
@@ -155,17 +170,17 @@
     align-items: center;
     gap: 6px;
     padding: 8px 14px;
-    border: 1px solid var(--border);
+    border: 1px solid hsl(var(--border));
     border-radius: var(--radius-sm);
-    background: var(--bg-secondary);
-    color: var(--text-primary);
+    background: hsla(var(--surface-secondary), 0.6);
+    color: hsl(var(--content));
     font-size: 13px;
     cursor: pointer;
     transition: all 0.15s;
   }
 
   .refresh-btn:hover:not(:disabled) {
-    border-color: var(--accent);
+    border-color: hsl(var(--brand));
   }
 
   .refresh-btn:disabled {
@@ -186,10 +201,10 @@
     align-items: center;
     gap: 10px;
     padding: 12px 16px;
-    background: rgba(239, 68, 68, 0.1);
-    border: 1px solid rgba(239, 68, 68, 0.3);
+    background: hsla(var(--danger), 0.1);
+    border: 1px solid hsla(var(--danger), 0.3);
     border-radius: var(--radius-sm);
-    color: var(--danger);
+    color: hsl(var(--danger));
     font-size: 13px;
     margin-bottom: 20px;
   }
@@ -201,14 +216,14 @@
     justify-content: center;
     padding: 80px;
     gap: 16px;
-    color: var(--text-secondary);
+    color: hsl(var(--content-muted));
   }
 
   .spinner {
     width: 32px;
     height: 32px;
-    border: 3px solid var(--bg-tertiary);
-    border-top-color: var(--accent);
+    border: 3px solid hsla(var(--surface-tertiary), 0.8);
+    border-top-color: hsl(var(--brand));
     border-radius: 50%;
     animation: spin 0.8s linear infinite;
   }

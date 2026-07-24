@@ -70,12 +70,19 @@ void mlp_forward(float* x, const LayerData& gate_proj,
                  const LayerData& up_proj, const LayerData& down_proj,
                  int intermediate_size);
 
+// ─── MoTE MLP ─────────────────────────────────────────────────────────────
+struct MoTELayerData;  // forward decl from model.h
+void mote_mlp_forward(float* x, const MoTELayerData& mote,
+                       int hidden_size, int intermediate_size);
+
 // ─── Transformer Block ────────────────────────────────────────────────────
+struct MoTELayerData;  // forward decl
 void transformer_block(float* x, int seq_pos, int layer_idx,
                        const ModelConfig& cfg,
                        const std::vector<LayerData>& layers,
                        const NormWeights& norms,
-                       const RoPECache& rope, KVCache& kv_cache);
+                       const RoPECache& rope, KVCache& kv_cache,
+                       const std::vector<MoTELayerData>* mote_layers = nullptr);
 
 // ─── Full Model Forward ───────────────────────────────────────────────────
 float* model_forward(int token, int seq_pos,
@@ -84,7 +91,8 @@ float* model_forward(int token, int seq_pos,
                      const std::vector<LayerData>& layers,
                      const std::vector<float>& final_norm,
                      const std::vector<NormWeights>& layer_norms,
-                     const RoPECache& rope, KVCache& kv_cache);
+                     const RoPECache& rope, KVCache& kv_cache,
+                     const std::vector<MoTELayerData>* mote_layers = nullptr);
 
 // ─── Sampling ─────────────────────────────────────────────────────────────
 int sample_argmax(const float* logits, int n);
@@ -101,7 +109,8 @@ bool generate_stream(const std::vector<int>& prompt_tokens,
                      const std::vector<float>& final_norm,
                      const std::vector<NormWeights>& layer_norms,
                      const RoPECache& rope,
-                     StreamCallback callback, void* userdata);
+                     StreamCallback callback, void* userdata,
+                     const std::vector<MoTELayerData>* mote_layers = nullptr);
 
 std::pair<std::vector<int>, double> generate(
     const std::vector<int>& prompt_tokens,
@@ -111,4 +120,5 @@ std::pair<std::vector<int>, double> generate(
     const std::vector<LayerData>& layers,
     const std::vector<float>& final_norm,
     const std::vector<NormWeights>& layer_norms,
-    const RoPECache& rope);
+    const RoPECache& rope,
+    const std::vector<MoTELayerData>* mote_layers = nullptr);

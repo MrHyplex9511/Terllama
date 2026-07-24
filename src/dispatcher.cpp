@@ -139,6 +139,13 @@ void ternary_linear_i2s(const LayerData& layer, const float* input, float* outpu
     ternary_linear(layer, input, output, override_arch);
 }
 
+// ─── MoTE dispatch ─────────────────────────────────────────────────────────
+void mote_linear_dispatch(const MoTELayerData& mote, const float* x,
+                           float* output, int hidden_size,
+                           int intermediate_size) {
+    mote_ternary_linear(mote, x, output, hidden_size, intermediate_size);
+}
+
 float validate_all_kernels(const LayerData& layer, const float* input,
                            float* output_reference, const char* reference_name) {
     struct K { CPUArch arch; const char* name; void (*func)(); };

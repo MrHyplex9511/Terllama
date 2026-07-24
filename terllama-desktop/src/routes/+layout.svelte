@@ -1,12 +1,15 @@
 <script lang="ts">
-  import { getSettingsState } from '../lib/stores/settings';
-  import { getModelsState } from '../lib/stores/models';
-  import { getChatState } from '../lib/stores/chat';
+  import { getSettingsState } from '../lib/stores/settings.svelte';
+  import { getModelsState } from '../lib/stores/models.svelte';
+  import { getChatState } from '../lib/stores/chat.svelte';
   import Sidebar from '../lib/components/Sidebar.svelte';
   import Onboarding from '../lib/components/Onboarding.svelte';
   import LibraryPage from './library/+page.svelte';
   import ChatPage from './chat/+page.svelte';
+  import ConvertPage from './convert/+page.svelte';
   import SettingsPage from './settings/+page.svelte';
+  import Dither from '../lib/components/bg/Dither.svelte';
+  import BlobCursor from '../lib/components/ui/BlobCursor.svelte';
   import '../app.css';
 
   const settings = getSettingsState();
@@ -14,9 +17,15 @@
   const chat = getChatState();
 
   let currentRoute = $state('library');
-  let sidebarCollapsed = $state(false);
   let showOnboarding = $state(false);
   let updateInfo = $state<{ latest: string; current: string; url: string } | null>(null);
+
+  let viewTitle = $derived(
+    currentRoute === 'library' ? 'Model Library'
+    : currentRoute === 'chat' ? 'Chat'
+    : currentRoute === 'settings' ? 'Settings'
+    : 'Convert'
+  );
 
   // Load settings on mount
   $effect(() => {
@@ -45,12 +54,8 @@
         };
       }
     } catch {
-      // Silently fail — offline or rate-limited
+      // Silently fail
     }
-  }
-
-  function navigate(route: string) {
-    currentRoute = route;
   }
 
   // Server status polling
@@ -84,45 +89,28 @@
       Update <strong>v{updateInfo.latest}</strong> available (you have v{updateInfo.current})
     </span>
     <div class="update-actions">
-      <a href={updateInfo.url} target="_blank" rel="noopener noreferrer" class="update-btn">
-        Download
-      </a>
+      <a href={updateInfo.url} target="_blank" rel="noopener noreferrer" class="update-btn">Download</a>
       <button class="update-dismiss" onclick={() => (updateInfo = null)}>×</button>
     </div>
   </div>
 {/if}
 
 <div class="app-layout">
-  <Sidebar bind:currentRoute bind:collapsed={sidebarCollapsed} />
+  <Sidebar bind:currentRoute />
 
   <div class="main-area">
-    <!-- Top bar -->
-    <header class="topbar">
-      <nav class="tabs">
-        <button
-          class="tab"
-          class:active={currentRoute === 'library'}
-          onclick={() => (currentRoute = 'library')}
-        >Library</button>
-        <button
-          class="tab"
-          class:active={currentRoute === 'chat'}
-          onclick={() => (currentRoute = 'chat')}
-        >Chat</button>
-        <button
-          class="tab"
-          class:active={currentRoute === 'settings'}
-          onclick={() => (currentRoute = 'settings')}
-        >Settings</button>
-      </nav>
+    <!-- Subtle noise texture + cursor glow -->
+    <Dither opacity={0.02} />
+    <BlobCursor size={300} blur={100} followSpeed={0.08} />
 
-      <div class="status-bar">
-        <span class="server-status" class:running={serverStatus === 'Running'}>
-          <span class="status-dot"></span>
-          {serverStatus}
-        </span>
+    <!-- Header bar (status only — no navigation) -->
+    <header class="header-bar">
+      <div class="header-left">
+        <h1 class="header-title">{viewTitle}</h1>
+      </div>
+      <div class="header-right">
         {#if models.activeModel}
-          <span class="active-model">
+          <span class="active-model-badge" title="Active model">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <polyline points="23 6 13.5 15.5 8.5 10.5 1 18" />
               <polyline points="17 6 23 6 23 12" />
@@ -130,6 +118,24 @@
             {models.activeModel}
           </span>
         {/if}
+
+        <span class="server-status" class:running={serverStatus === 'Running'}>
+          <span class="status-dot"></span>
+          {serverStatus}
+        </span>
+
+        <button
+          class="mode-toggle"
+          class:gguf={settings.settings.ggufMode}
+          onclick={() => settings.updateSetting('ggufMode', !settings.settings.ggufMode)}
+          title={settings.settings.ggufMode ? 'Switch to Ternary mode' : 'Switch to GGUF mode'}
+        >
+          <span class="mode-dot" class:active={!settings.settings.ggufMode}></span>
+          Ternary
+          <span class="mode-divider"></span>
+          <span class="mode-dot" class:active={settings.settings.ggufMode}></span>
+          GGUF
+        </button>
       </div>
     </header>
 
@@ -139,6 +145,8 @@
         <LibraryPage />
       {:else if currentRoute === 'chat'}
         <ChatPage />
+      {:else if currentRoute === 'convert'}
+        <ConvertPage />
       {:else if currentRoute === 'settings'}
         <SettingsPage />
       {/if}
@@ -159,13 +167,11 @@
     z-index: 100;
     position: relative;
   }
-
   .update-actions {
     display: flex;
     align-items: center;
     gap: 8px;
   }
-
   .update-btn {
     padding: 4px 14px;
     background: white;
@@ -176,11 +182,7 @@
     text-decoration: none;
     transition: opacity 0.15s;
   }
-
-  .update-btn:hover {
-    opacity: 0.9;
-  }
-
+  .update-btn:hover { opacity: 0.9; }
   .update-dismiss {
     background: none;
     border: none;
@@ -190,10 +192,7 @@
     padding: 0 4px;
     opacity: 0.7;
   }
-
-  .update-dismiss:hover {
-    opacity: 1;
-  }
+  .update-dismiss:hover { opacity: 1; }
 
   .app-layout {
     display: flex;
@@ -208,77 +207,122 @@
     min-width: 0;
   }
 
-  .topbar {
+  .header-bar {
     height: 48px;
-    border-bottom: 1px solid var(--border);
+    border-bottom: 1px solid hsl(var(--border));
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 0 20px;
+    padding: 0 24px;
     flex-shrink: 0;
-    background: var(--bg-secondary);
+    background: hsla(var(--surface-secondary), 0.6);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    gap: 16px;
   }
 
-  .tabs {
+  .header-left {
     display: flex;
-    gap: 4px;
+    align-items: center;
   }
 
-  .tab {
-    padding: 8px 16px;
-    border: none;
-    background: transparent;
-    color: var(--text-secondary);
-    font-size: 13px;
-    font-weight: 500;
-    cursor: pointer;
-    border-radius: var(--radius-sm);
-    transition: all 0.15s;
+  .header-title {
+    margin: 0;
+    font-size: 16px;
+    font-weight: 600;
+    color: hsl(var(--content));
   }
 
-  .tab:hover {
-    background: var(--bg-tertiary);
-    color: var(--text-primary);
-  }
-
-  .tab.active {
-    background: rgba(124, 58, 237, 0.15);
-    color: var(--accent-hover);
-  }
-
-  .status-bar {
+  .header-right {
     display: flex;
     align-items: center;
     gap: 16px;
+  }
+
+  .active-model-badge {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: hsl(var(--brand-hover));
+    padding: 4px 10px;
+    background: hsla(var(--brand), 0.1);
+    border-radius: 6px;
+    max-width: 200px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .server-status {
     display: flex;
     align-items: center;
     gap: 6px;
-    font-size: 12px;
-    color: var(--text-secondary);
+    font-size: 11px;
+    color: hsl(var(--content-muted));
     text-transform: uppercase;
-    letter-spacing: 0.03em;
+    letter-spacing: 0.05em;
   }
 
   .status-dot {
-    width: 8px;
-    height: 8px;
+    width: 7px;
+    height: 7px;
     border-radius: 50%;
-    background: var(--danger);
+    background: hsl(var(--danger));
+    flex-shrink: 0;
   }
 
   .server-status.running .status-dot {
-    background: var(--success);
+    background: hsl(var(--success));
+    box-shadow: 0 0 6px hsla(var(--success), 0.5);
   }
 
-  .active-model {
+  .mode-toggle {
     display: flex;
     align-items: center;
     gap: 6px;
-    font-size: 12px;
-    color: var(--accent-hover);
+    padding: 4px 12px;
+    border: 1px solid hsl(var(--border));
+    border-radius: 20px;
+    background: hsla(var(--surface-tertiary), 0.5);
+    color: hsl(var(--content-muted));
+    font-size: 11px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.15s;
+    letter-spacing: 0.02em;
+  }
+
+  .mode-toggle:hover {
+    border-color: hsl(var(--brand));
+  }
+
+  .mode-toggle.gguf {
+    border-color: hsl(var(--gpu));
+  }
+
+  .mode-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: hsl(var(--content-muted));
+    transition: all 0.2s;
+  }
+
+  .mode-dot.active {
+    background: hsl(var(--brand));
+    box-shadow: 0 0 6px hsla(var(--brand), 0.5);
+  }
+
+  .mode-toggle.gguf .mode-dot.active {
+    background: hsl(var(--gpu));
+    box-shadow: 0 0 6px hsla(var(--gpu), 0.5);
+  }
+
+  .mode-divider {
+    width: 1px;
+    height: 12px;
+    background: hsl(var(--border));
   }
 
   .content {

@@ -3,6 +3,7 @@
 
 mod commands;
 mod config;
+mod convert;
 mod download;
 mod server;
 
@@ -53,6 +54,10 @@ fn main() {
             commands::get_settings,
             commands::save_settings,
             commands::check_update,
+            commands::convert_model,
+            commands::cancel_conversion,
+            commands::check_python,
+            commands::check_convert_deps,
         ])
         .setup(|app| {
             // Tray icon and menu

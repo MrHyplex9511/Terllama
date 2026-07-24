@@ -70,7 +70,7 @@ Approximate resource comparison for inference on CPU:
 |--------|------------------|-----------------|
 | FP16 | ~14 GB | ~2 |
 | GGUF Q4 | ~4.5 GB | ~8 |
-| Terllary | **~2.1 GB** | **~18** |
+| Ternary | **~2.1 GB** | **~18** |
 
 ## Benchmarks
 

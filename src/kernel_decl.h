@@ -53,3 +53,8 @@ void ternary_linear_i2s(const LayerData& layer, const float* input, float* outpu
 float validate_all_kernels(const LayerData& layer, const float* input,
                            float* output_reference = nullptr,
                            const char* reference_name = "scalar");
+
+// ─── MoTE kernel ───────────────────────────────────────────────────────────
+void mote_ternary_linear(const MoTELayerData& mote, const float* x,
+                          float* output, int hidden_size,
+                          int intermediate_size);

@@ -774,6 +774,8 @@ void print_usage(const char* prog) {
     Logger::error("  {} rm <model>                      Remove a model", prog);
     Logger::error("  {} serve [--port N] [--keep-alive SEC] [--memory-limit MB]  Start API server", prog);
     Logger::error("  {} chat --model <m> [--prompt p]   CLI chat", prog);
+    Logger::error("  {} mote-build <input> <output> --experts K --topk k  Convert dense → MoTE", prog);
+    Logger::error("  {} mote-list <path>                List MoTE layers", prog);
     Logger::error("");
     Logger::error("Environment:");
     Logger::error("  TERLLAMA_MODEL_DIR   model file directory");
