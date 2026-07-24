@@ -35,6 +35,9 @@ venv/
 *.onnx
 *.npy
 
+# OpenCode agent config
+.opencode/
+
 # Generated docs (specific excludes, not whole dir)
 docs/*.json
 docs/*.html
