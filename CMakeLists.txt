@@ -21,7 +21,7 @@ option(BUILD_SERVER    "Build API server" ON)
 option(BUILD_DOWNLOADER "Build model downloader" ON)
 
 # ─── Dependencies ─────────────────────────────────────────────────────────
-find_package(OpenMP REQUIRED)
+find_package(OpenMP QUIET)
 find_package(CURL QUIET)
 if(NOT CURL_FOUND)
     message(STATUS "libcurl: not found (downloader will use Python subprocess only)")
@@ -107,12 +107,15 @@ target_include_directories(terllama_core PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${THIRD_PARTY_DIR}
 )
-target_compile_options(terllama_core PRIVATE -O3 -ffast-math)
+target_compile_options(terllama_core PRIVATE -O3)
 target_link_libraries(terllama_core PRIVATE
-    OpenMP::OpenMP_CXX
     pthread
     dl
 )
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(terllama_core PRIVATE OpenMP::OpenMP_CXX)
+    target_compile_options(terllama_core PRIVATE -fopenmp)
+endif()
 if(CURL_FOUND)
     target_link_libraries(terllama_core PRIVATE CURL::libcurl)
     target_compile_definitions(terllama_core PRIVATE TERLLAMA_HAVE_CURL)
@@ -134,10 +137,12 @@ target_include_directories(terllama PRIVATE
     ${THIRD_PARTY_DIR}
 )
 target_link_libraries(terllama PRIVATE
-    OpenMP::OpenMP_CXX
     pthread
     dl
 )
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(terllama PRIVATE OpenMP::OpenMP_CXX)
+endif()
 if(CURL_FOUND)
     target_link_libraries(terllama PRIVATE CURL::libcurl)
 endif()
@@ -169,10 +174,12 @@ if(BUILD_BENCHMARK)
         ${THIRD_PARTY_DIR}
     )
     target_link_libraries(terllama-bench PRIVATE
-        OpenMP::OpenMP_CXX
         pthread
         dl
     )
+    if(OpenMP_CXX_FOUND)
+        target_link_libraries(terllama-bench PRIVATE OpenMP::OpenMP_CXX)
+    endif()
     if(CURL_FOUND)
         target_link_libraries(terllama-bench PRIVATE CURL::libcurl)
     endif()

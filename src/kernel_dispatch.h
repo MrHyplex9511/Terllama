@@ -62,6 +62,9 @@ inline CPUArch detect_cpu_arch() {
 #endif
 }
 
+// Max ternary terms supported. All kernel vacc arrays use this bound.
+constexpr int MAX_TERMS = 32;
+
 // ═══════════════════════════════════════════════════════════════════════════
 // KERNEL COMMON HELPERS
 // ═══════════════════════════════════════════════════════════════════════════
@@ -135,7 +138,7 @@ inline void ternary_mul_sse42(const uint32_t* const* term_data,
 
     #pragma omp parallel for
     for (int i = 0; i < out_f; i++) {
-        __m128 vacc[32];
+        __m128 vacc[MAX_TERMS];
         for (int t = 0; t < n_active; t++) vacc[t] = _mm_setzero_ps();
 
         for (int w = 0; w < full_words; w++) {
@@ -270,7 +273,7 @@ inline void ternary_mul_avx(const uint32_t* const* term_data,
 
     #pragma omp parallel for
     for (int i = 0; i < out_f; i++) {
-        __m256 vacc[32];
+        __m256 vacc[MAX_TERMS];
         for (int t = 0; t < n_active; t++) vacc[t] = _mm256_setzero_ps();
 
         for (int w = 0; w < full_words; w++) {
@@ -389,7 +392,7 @@ inline void ternary_mul_avx2(const uint32_t* const* term_data,
 
     #pragma omp parallel for
     for (int i = 0; i < out_f; i++) {
-        __m256 vacc[32];
+        __m256 vacc[MAX_TERMS];
         for (int t = 0; t < n_active; t++) vacc[t] = _mm256_setzero_ps();
 
         for (int w = 0; w < full_words; w++) {
@@ -504,7 +507,7 @@ inline void ternary_mul_avx512(const uint32_t* const* term_data,
 
     #pragma omp parallel for
     for (int i = 0; i < out_f; i++) {
-        __m512 vacc[32];
+        __m512 vacc[MAX_TERMS];
         for (int t = 0; t < n_active; t++) vacc[t] = _mm512_setzero_ps();
 
         for (int w = 0; w < full_words; w++) {
@@ -558,7 +561,7 @@ inline void ternary_mul_neon(const uint32_t* const* term_data,
 
     #pragma omp parallel for
     for (int i = 0; i < out_f; i++) {
-        float32x4_t vacc[32];
+        float32x4_t vacc[MAX_TERMS];
         for (int t = 0; t < n_active; t++) vacc[t] = vdupq_n_f32(0.0f);
 
         for (int w = 0; w < full_words; w++) {
@@ -682,9 +685,9 @@ inline void ternary_linear(const LayerData& layer,
                             const float* input,
                             float* output,
                             CPUArch override_arch) {
-    const int max_terms = 32;
-    const uint32_t* term_data[32];
-    int alpha_exps[32];
+    const int max_terms = MAX_TERMS;
+    const uint32_t* term_data[MAX_TERMS];
+    int alpha_exps[MAX_TERMS];
 
     int n_active = extract_term_data(layer, term_data, alpha_exps, max_terms);
     if (n_active == 0) {
@@ -749,9 +752,9 @@ inline float validate_all_kernels(const LayerData& layer,
 #endif
     };
 
-    const int max_terms = 32;
-    const uint32_t* term_data[32];
-    int alpha_exps[32];
+    const int max_terms = MAX_TERMS;
+    const uint32_t* term_data[MAX_TERMS];
+    int alpha_exps[MAX_TERMS];
     int n_active = extract_term_data(layer, term_data, alpha_exps, max_terms);
     if (n_active == 0) return 0.0f;
 

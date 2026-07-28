@@ -149,23 +149,28 @@ int server_main(int argc, char** argv) {
 
     // Port — handle --port N, -p N, positional, or env
     int port = 8375;
-    for (int i = 1; i < argc - 1; i++) {
-        std::string a = argv[i];
-        if (a == "--port" || a == "-p") {
-            port = std::stoi(argv[i + 1]);
-            break;
-        }
-    }
-    if (port == 8375) {
-        // Check positional: skip subcommand name if present
-        for (int i = 1; i < argc; i++) {
+    try {
+        for (int i = 1; i < argc - 1; i++) {
             std::string a = argv[i];
-            if (a == "serve" || a == "server") continue;
-            if (a[0] != '-') { port = std::stoi(a); break; }
+            if (a == "--port" || a == "-p") {
+                port = std::stoi(argv[i + 1]);
+                break;
+            }
         }
-    }
-    if (const char* env_port = std::getenv("TERLLAMA_PORT")) {
-        port = std::stoi(env_port);
+        if (port == 8375) {
+            // Check positional: skip subcommand name if present
+            for (int i = 1; i < argc; i++) {
+                std::string a = argv[i];
+                if (a == "serve" || a == "server") continue;
+                if (a[0] != '-') { port = std::stoi(a); break; }
+            }
+        }
+        if (const char* env_port = std::getenv("TERLLAMA_PORT")) {
+            port = std::stoi(env_port);
+        }
+    } catch (...) {
+        Logger::error("Invalid port argument");
+        return 1;
     }
 
     // API key — --api-key <key> or env

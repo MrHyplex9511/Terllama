@@ -20,6 +20,7 @@
 #include <string>
 #include <unordered_map>
 #include <thread>
+#include <mutex>
 #include <atomic>
 #include <chrono>
 #include <sys/stat.h>
@@ -48,6 +49,19 @@ extern "C" void handle_signal(int sig) {
 // ═══════════════════════════════════════════════════════════════════════════
 // INTERNAL HELPERS
 // ═══════════════════════════════════════════════════════════════════════════
+
+// Forward declarations
+static void add_model_entry(const std::string& model_id,
+                             const std::string& format,
+                             int64_t size_bytes);
+
+static std::string slugify(const std::string& repo) {
+    std::string s = repo;
+    for (auto& c : s) {
+        if (c == '/') c = '-';
+    }
+    return s;
+}
 
 // Resolve scripts/ directory relative to the running binary via
 // /proc/self/exe, not CWD.
@@ -118,12 +132,12 @@ static std::vector<int> tokenize_with_helper(const std::string& prompt,
                                               const std::string& helper_dir,
                                               const std::string& model_dir = "") {
     // ── Try GigaToken (fast Rust) ─────────────────────────────────────
+    // Thread-safe init via std::call_once
     if (!model_dir.empty()) {
         static GigaTokenWrapper gt;
-        static bool gt_tried = false;
         static bool gt_ok = false;
-        if (!gt_tried) {
-            gt_tried = true;
+        static std::once_flag gt_flag;
+        std::call_once(gt_flag, [&]() {
             // Search for .so next to binary, then CWD, then third_party
             char exe_buf[4096];
             ssize_t exe_len = readlink("/proc/self/exe", exe_buf, sizeof(exe_buf) - 1);
@@ -147,7 +161,7 @@ static std::vector<int> tokenize_with_helper(const std::string& prompt,
             } else {
                 Logger::info("GigaToken: .so not found, using Python subprocess");
             }
-        }
+        });
         if (gt_ok && gt.has_tokenizer()) {
             auto ids = gt.encode(prompt);
             if (!ids.empty()) {
@@ -164,7 +178,7 @@ static std::vector<int> tokenize_with_helper(const std::string& prompt,
         pf << prompt;
     }
     int ret = run_python_script(helper_dir + "/tokenize_helper.py");
-    if (ret != 0) { Logger::error("Tokenization failed"); exit(1); }
+    if (ret != 0) { Logger::error("Tokenization failed"); return {}; }
 
     std::vector<int> tokens;
     std::ifstream tf(token_file);
@@ -403,6 +417,14 @@ static int cmd_chat_simple(const std::string& model_id,
     auto& final_norm = loaded.final_norm;
     auto& layers = loaded.layers;
     Logger::info("  Loaded {} layers.", layers.size());
+    Logger::info("  Final norm (first 5): {:.4f} {:.4f} {:.4f} {:.4f} {:.4f}",
+                 final_norm[0], final_norm[1], final_norm[2], final_norm[3], final_norm[4]);
+    {
+        int last_start = std::max(0, (int)final_norm.size() - 5);
+        Logger::info("  Final norm (last 5):  {:.4f} {:.4f} {:.4f} {:.4f} {:.4f}",
+            final_norm[last_start], final_norm[last_start+1], final_norm[last_start+2],
+            final_norm[last_start+3], final_norm[last_start+4]);
+    }
 
     auto rope = build_rope_cache(cfg.max_position_embeddings, cfg.head_dim, cfg.rope_theta);
 
@@ -587,8 +609,93 @@ int cmd_pull(int argc, char** argv) {
 
     if (ret == 0) {
         Logger::info("Download complete!");
+        // Compute model directory size for registry
+        int64_t total_size = 0;
+        std::string mdir = models_dir() + "/" + slugify(hf_repo);
+        DIR* d = opendir(mdir.c_str());
+        if (d) {
+            struct dirent* e;
+            while ((e = readdir(d)) != nullptr) {
+                if (e->d_type == DT_REG) {
+                    std::string fpath = mdir + "/" + e->d_name;
+                    struct stat st;
+                    if (stat(fpath.c_str(), &st) == 0)
+                        total_size += st.st_size;
+                }
+            }
+            closedir(d);
+        }
+        add_model_entry(slugify(hf_repo), auto_fmt.empty() ? "gguf" : auto_fmt, total_size);
     }
     return ret;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MODEL REGISTRY PERSISTENCE — write entry to ~/.terllama/models.json
+// ═══════════════════════════════════════════════════════════════════════════
+
+static void add_model_entry(const std::string& model_id,
+                             const std::string& format,
+                             int64_t size_bytes) {
+    std::string jpath = models_json_path();
+    std::string timestamp;
+    {
+        time_t now = time(nullptr);
+        char buf[64];
+        strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", localtime(&now));
+        timestamp = buf;
+    }
+
+    // Read existing entries
+    std::vector<std::string> entries;
+    std::ifstream inf(jpath);
+    if (inf) {
+        std::string content((std::istreambuf_iterator<char>(inf)),
+                             std::istreambuf_iterator<char>());
+        // Extract existing entries as raw JSON blocks
+        size_t pos = 0;
+        while (true) {
+            auto start = content.find("{\"id\"", pos);
+            if (start == std::string::npos) break;
+            auto end = content.find("}", start);
+            if (end == std::string::npos) break;
+            entries.push_back(content.substr(start, end - start + 1));
+            pos = end + 1;
+        }
+    }
+
+    // Check if entry already exists; if so, remove it
+    auto entry_exists = [&](const std::string& block) -> bool {
+        auto p = block.find("\"id\":\"");
+        if (p == std::string::npos) return false;
+        p += 6;
+        auto q = block.find("\"", p);
+        if (q == std::string::npos) return false;
+        return block.substr(p, q - p) == model_id;
+    };
+    entries.erase(std::remove_if(entries.begin(), entries.end(), entry_exists),
+                  entries.end());
+
+    // Add new entry
+    std::string new_entry = "{\"id\":\"" + model_id
+        + "\",\"format\":\"" + format
+        + "\",\"size\":" + std::to_string(size_bytes)
+        + ",\"downloaded\":\"" + timestamp + "\"}";
+    entries.push_back(new_entry);
+
+    // Write back
+    std::ofstream of(jpath);
+    if (!of) {
+        Logger::warn("Cannot write {}", jpath);
+        return;
+    }
+    of << "{\n  \"models\": [\n";
+    for (size_t i = 0; i < entries.size(); i++) {
+        if (i > 0) of << ",\n";
+        of << "    " << entries[i];
+    }
+    of << "\n  ]\n}\n";
+    Logger::info("Model entry saved to {}", jpath);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

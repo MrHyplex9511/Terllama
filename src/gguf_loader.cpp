@@ -509,8 +509,6 @@ bool load_gguf_model(const std::string& path,
 
         // Input layernorm
         auto* in_norm = find_tensor(gguf.tensors, "blk." + layer_str + ".attn_norm.weight");
-        if (!in_norm) in_norm = find_tensor(gguf.tensors,
-            "blk." + layer_str + ".attn_norm.weight"); // fallback
         if (in_norm) {
             extract_f32_tensor(gguf, *in_norm, layer_norms[i].input_layernorm);
         } else {
@@ -519,8 +517,6 @@ bool load_gguf_model(const std::string& path,
 
         // Post-attention layernorm
         auto* pa_norm = find_tensor(gguf.tensors, "blk." + layer_str + ".ffn_norm.weight");
-        if (!pa_norm) pa_norm = find_tensor(gguf.tensors,
-            "blk." + layer_str + ".ffn_norm.weight"); // fallback
         if (pa_norm) {
             extract_f32_tensor(gguf, *pa_norm, layer_norms[i].post_attention_layernorm);
         } else {

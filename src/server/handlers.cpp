@@ -30,6 +30,9 @@
 // Thread-local batch decode buffer (16-token batches for streaming)
 static thread_local std::vector<int> tls_decode_buffer;
 
+// Mutex serializing Python tokenizer subprocess (fixed /tmp file paths)
+static std::mutex g_tokenize_mutex;
+
 // Signal flag (defined in commands.cpp)
 extern std::atomic<bool> g_interrupted;
 
@@ -122,6 +125,8 @@ static int run_python_script(const std::string& script_path) {
 std::vector<int> tokenize_with_helper(const std::string& prompt,
                                       const std::string& helper_dir)
 {
+    // Serialize via mutex: Python script uses fixed /tmp file paths
+    std::lock_guard<std::mutex> lock(g_tokenize_mutex);
     std::string prompt_file = "/tmp/ternary_prompt.txt";
     std::string token_file  = "/tmp/ternary_tokens.txt";
     {
@@ -188,6 +193,7 @@ struct ModelSnap {
     std::vector<float> final_norm;
     std::vector<NormWeights> layer_norms;
     RoPECache rope;
+    Tokenizer tokenizer;
 };
 
 #include <sys/stat.h>
@@ -266,7 +272,8 @@ static ModelSnap snapshot_model() {
         g_model.layers,
         g_model.final_norm,
         g_model.layer_norms,
-        g_model.rope
+        g_model.rope,
+        g_model.tokenizer
     };
 }
 
@@ -387,10 +394,12 @@ void handle_chat_completions(const httplib::Request& req,
             httplib::DataSink* sink{nullptr};
             std::string id;
             long created{0};
+            ModelSnap* snap{nullptr};
         };
         auto ctx = std::make_shared<CbCtx>();
         ctx->id      = id;
         ctx->created = created;
+        ctx->snap    = snap.get();
 
         res.status = 200;
         res.set_header("Content-Type", "text/event-stream");
@@ -413,7 +422,7 @@ void handle_chat_completions(const httplib::Request& req,
                     tls_decode_buffer.push_back(token);
                     bool is_eos = (token == 0);
                     if (tls_decode_buffer.size() >= 16 || is_eos) {
-                        std::string text = g_model.tokenizer.decode(tls_decode_buffer);
+                        std::string text = c->snap->tokenizer.decode(tls_decode_buffer);
                         if (!text.empty()) {
                             json delta = {
                                 {"role",    "assistant"},
@@ -446,7 +455,7 @@ void handle_chat_completions(const httplib::Request& req,
 
                 // Flush remaining buffered tokens
                 if (!tls_decode_buffer.empty()) {
-                    std::string text = g_model.tokenizer.decode(tls_decode_buffer);
+                    std::string text = ctx->snap->tokenizer.decode(tls_decode_buffer);
                     if (!text.empty()) {
                         json delta = {{"role","assistant"}, {"content",text}};
                         json chunk = {
@@ -473,8 +482,8 @@ void handle_chat_completions(const httplib::Request& req,
             std::lock_guard<std::mutex> lock(g_model_mutex);
             auto result = generate(
                 prompt_tokens, max_tokens, temperature,
-                g_model.cfg, g_model.embedding, g_model.layers,
-                g_model.final_norm, g_model.layer_norms, g_model.rope);
+                snap->cfg, snap->embedding, snap->layers,
+                snap->final_norm, snap->layer_norms, snap->rope);
             output_tokens = result.first;
         }
 
@@ -485,9 +494,8 @@ void handle_chat_completions(const httplib::Request& req,
         std::string decoded;
         std::string prompt_decoded;
         {
-            std::lock_guard<std::mutex> lock(g_model_mutex);
-            decoded        = g_model.tokenizer.decode(all_tokens);
-            prompt_decoded = g_model.tokenizer.decode(prompt_tokens);
+            decoded        = snap->tokenizer.decode(all_tokens);
+            prompt_decoded = snap->tokenizer.decode(prompt_tokens);
         }
 
         std::string generated_text;
@@ -612,10 +620,12 @@ void handle_completions(const httplib::Request& req,
             httplib::DataSink* sink{nullptr};
             std::string id;
             long created{0};
+            ModelSnap* snap{nullptr};
         };
         auto ctx = std::make_shared<CbCtx>();
         ctx->id      = id;
         ctx->created = created;
+        ctx->snap    = snap.get();
 
         res.status = 200;
         res.set_header("Content-Type", "text/event-stream");
@@ -638,7 +648,7 @@ void handle_completions(const httplib::Request& req,
                     tls_decode_buffer.push_back(token);
                     bool is_eos = (token == 0);
                     if (tls_decode_buffer.size() >= 16 || is_eos) {
-                        std::string text = g_model.tokenizer.decode(tls_decode_buffer);
+                        std::string text = c->snap->tokenizer.decode(tls_decode_buffer);
                         if (!text.empty()) {
                             json choice = {
                                 {"index",         0},
@@ -669,7 +679,7 @@ void handle_completions(const httplib::Request& req,
 
                 // Flush remaining buffered tokens
                 if (!tls_decode_buffer.empty()) {
-                    std::string text = g_model.tokenizer.decode(tls_decode_buffer);
+                    std::string text = ctx->snap->tokenizer.decode(tls_decode_buffer);
                     if (!text.empty()) {
                         json choice = {
                             {"index",0}, {"text",text},
@@ -699,8 +709,8 @@ void handle_completions(const httplib::Request& req,
             std::lock_guard<std::mutex> lock(g_model_mutex);
             auto result = generate(
                 prompt_tokens, max_tokens, temperature,
-                g_model.cfg, g_model.embedding, g_model.layers,
-                g_model.final_norm, g_model.layer_norms, g_model.rope);
+                snap->cfg, snap->embedding, snap->layers,
+                snap->final_norm, snap->layer_norms, snap->rope);
             output_tokens = result.first;
         }
 
@@ -710,9 +720,8 @@ void handle_completions(const httplib::Request& req,
 
         std::string decoded, prompt_decoded;
         {
-            std::lock_guard<std::mutex> lock(g_model_mutex);
-            decoded        = g_model.tokenizer.decode(all_tokens);
-            prompt_decoded = g_model.tokenizer.decode(prompt_tokens);
+            decoded        = snap->tokenizer.decode(all_tokens);
+            prompt_decoded = snap->tokenizer.decode(prompt_tokens);
         }
 
         std::string generated_text;

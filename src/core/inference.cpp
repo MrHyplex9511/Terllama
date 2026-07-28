@@ -293,6 +293,17 @@ void transformer_block(float* x, int seq_pos, int layer_idx,
     }
 }
 
+// ─── Debug file helper ──────────────────────────────────────────────
+// Only writes debug files if TERLLAMA_DEBUG_DIR env var is set.
+// Avoids hardcoded paths in the binary.
+static FILE* debug_fopen(const char* name, const char* mode) {
+    const char* dir = getenv("TERLLAMA_DEBUG_DIR");
+    if (!dir) return nullptr;
+    static std::string path;
+    path = std::string(dir) + "/" + name;
+    return fopen(path.c_str(), mode);
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // FULL MODEL FORWARD
 // ═══════════════════════════════════════════════════════════════════════════
@@ -314,14 +325,50 @@ float* model_forward(int token, int seq_pos,
               &embedding[(token + 1) * cfg.hidden_size],
               tls_x.data());
 
+    // Debug: check embedding for NaN (enabled via TERLLAMA_DEBUG_DIR)
+    FILE* dbg = debug_fopen("nan_trace.txt", "a");
+    {
+        bool emb_nan = false;
+        for (int j = 0; j < cfg.hidden_size && !emb_nan; j++)
+            if (std::isnan(tls_x[j])) emb_nan = true;
+        if (dbg) fprintf(dbg, "token=%d seq=%d emb_nan=%d first5=(%.4f %.4f %.4f %.4f %.4f)\n",
+            token, seq_pos, emb_nan, tls_x[0], tls_x[1], tls_x[2], tls_x[3], tls_x[4]);
+    }
+
     // Transformer blocks
     for (int i = 0; i < cfg.num_hidden_layers; i++) {
         transformer_block(tls_x.data(), seq_pos, i, cfg, layers,
                           layer_norms[i], rope, kv_cache, mote_layers);
+        if (dbg && (i == 0 || i == 5 || i == 10 || i == 20 || i == 25 || i == 29)) {
+            double mean = 0.0; float max_abs = 0.0f;
+            for (int j = 0; j < cfg.hidden_size; j++) {
+                mean += std::fabs(tls_x[j]);
+                float a = std::fabs(tls_x[j]);
+                if (a > max_abs) max_abs = a;
+            }
+            mean /= cfg.hidden_size;
+            fprintf(dbg, "  LAYER %d: avg_abs=%.4e max_abs=%.4e first5=(%.4f %.4f %.4f %.4f %.4f)\n",
+                i, mean, max_abs, tls_x[0], tls_x[1], tls_x[2], tls_x[3], tls_x[4]);
+        }
     }
 
     // Final RMSNorm
     rms_norm(tls_x.data(), final_norm.data(), cfg.hidden_size, cfg.rms_norm_eps);
+    if (dbg) {
+        bool nan = false; int nan_count = 0;
+        float max_abs = 0.0f;
+        for (int j = 0; j < cfg.hidden_size; j++) {
+            if (std::isnan(tls_x[j])) { nan = true; nan_count++; }
+            if (std::isinf(tls_x[j])) nan_count++;
+            float a = std::fabs(tls_x[j]);
+            if (a > max_abs) max_abs = a;
+        }
+        uint32_t hex0, hex1;
+        std::memcpy(&hex0, &tls_x[0], 4);
+        std::memcpy(&hex1, &tls_x[1], 4);
+        fprintf(dbg, "  after_final_norm: nan=%d nan_count=%d inf_in_any=%d max_abs=%.6e first2_hex=0x%08x,0x%08x\n",
+            nan, nan_count, std::isinf(max_abs) ? 1 : 0, max_abs, hex0, hex1);
+    }
 
     // LM head — try ternary layer first, fall back to tied embeddings (no output.weight)
     int idx_lmhead = -1;
@@ -346,6 +393,23 @@ float* model_forward(int token, int seq_pos,
         }
     }
 
+    // Quick logit stats for first generated token
+    {
+        double mean = 0.0; float max_v = -1e30f, min_v = 1e30f;
+        int max_idx = 0;
+        for (int i = 0; i < cfg.vocab_size; i++) {
+            mean += tls_logits[i];
+            if (tls_logits[i] > max_v) { max_v = tls_logits[i]; max_idx = i; }
+            if (tls_logits[i] < min_v) min_v = tls_logits[i];
+        }
+        mean /= cfg.vocab_size;
+        static int dbg_count = 0;
+        if (dbg_count++ < 3) {
+            printf("[LOGIT] min=%.2f max=%.2f mean=%.2f max_idx=%d\n", min_v, max_v, mean, max_idx);
+        }
+    }
+
+    if (dbg) fclose(dbg);
     return tls_logits.data();
 }
 
@@ -423,10 +487,27 @@ bool generate_stream(const std::vector<int>& prompt_tokens,
     // Autoregressive
     std::vector<int> output_tokens;
     int next_token = prompt_tokens.back();
+    FILE* log_debug = debug_fopen("logits.txt", "w");
     for (int i = 0; i < max_tokens; i++) {
         int pos = (int)prompt_tokens.size() + i;
         float* logits = model_forward(next_token, pos, cfg, embedding,
                                         layers, final_norm, layer_norms, rope, kv_cache, mote_layers);
+
+        // DEBUG: dump top-5 logits
+        if (log_debug && i < 5) {
+            // Find top-5
+            std::vector<std::pair<float,int>> scored;
+            for (int v = 0; v < cfg.vocab_size; v++)
+                scored.push_back({logits[v], v});
+            std::partial_sort(scored.begin(), scored.begin()+5, scored.end(),
+                [](auto& a, auto& b) { return a.first > b.first; });
+            fprintf(log_debug, "=== Step %d (pos=%d, input_token=%d) ===\n", i, pos, next_token);
+            for (int k = 0; k < 5; k++)
+                fprintf(log_debug, "  top-%d: token=%d logit=%.4f\n", k, scored[k].second, scored[k].first);
+            // Also dump token 250's logit specifically
+            fprintf(log_debug, "  token_250_logit=%.4f\n", logits[250]);
+            fflush(log_debug);
+        }
 
         std::vector<int> recent;
         for (int j = std::max(0, (int)output_tokens.size() - 8);
@@ -443,11 +524,13 @@ bool generate_stream(const std::vector<int>& prompt_tokens,
 
         if (callback && !callback(next_token, logits, userdata)) {
             Logger::info("generate_stream: aborted by callback at token %d", i);
+            if (log_debug) fclose(log_debug);
             return false;
         }
 
         if (next_token == cfg.eos_token_id) break;
     }
+    if (log_debug) fclose(log_debug);
     Logger::info("generate_stream: completed %zu output tokens", output_tokens.size());
     return true;
 }
@@ -488,10 +571,25 @@ std::pair<std::vector<int>, double> generate(
     scheduler.apply(GenPhase::DECODE);
     std::vector<int> output_tokens;
     int next_token = prompt_tokens.back();
+    FILE* log_debug = debug_fopen("logits.txt", "a");
     for (int i = 0; i < max_tokens; i++) {
         int pos = (int)prompt_tokens.size() + i;
         float* logits = model_forward(next_token, pos, cfg, embedding,
                                         layers, final_norm, layer_norms, rope, kv_cache, mote_layers);
+
+        // DEBUG: dump top-5 logits
+        if (log_debug && i < 10) {
+            std::vector<std::pair<float,int>> scored;
+            for (int v = 0; v < cfg.vocab_size; v++)
+                scored.push_back({logits[v], v});
+            std::partial_sort(scored.begin(), scored.begin()+5, scored.end(),
+                [](auto& a, auto& b) { return a.first > b.first; });
+            fprintf(log_debug, "=== gen Step %d (pos=%d, input=%d) ===\n", i, pos, next_token);
+            for (int k = 0; k < 5; k++)
+                fprintf(log_debug, "  top-%d: token=%d logit=%.4f\n", k, scored[k].second, scored[k].first);
+            fprintf(log_debug, "  token_250_logit=%.4f\n", logits[250]);
+            fflush(log_debug);
+        }
 
         std::vector<int> recent;
         for (int j = std::max(0, (int)output_tokens.size() - 8);
@@ -510,6 +608,14 @@ std::pair<std::vector<int>, double> generate(
 
     auto t_end = std::chrono::high_resolution_clock::now();
     double total_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+
+    if (log_debug) {
+        fprintf(log_debug, "=== Final output tokens ===\n");
+        for (size_t i = 0; i < output_tokens.size(); i++)
+            fprintf(log_debug, "%d ", output_tokens[i]);
+        fprintf(log_debug, "\n");
+        fclose(log_debug);
+    }
 
     Logger::info("generate: %zu tokens in %.0f ms (%.1f tok/s)",
                  output_tokens.size(), total_ms,

@@ -136,8 +136,15 @@ int main(int argc, char** argv) {
     // ─── Legacy mode: terllama "prompt" [max_tokens] [temp] ──────────────
     {
         std::string prompt = argv[1];
-        int max_tokens = (argc > 2) ? std::stoi(argv[2]) : 40;
-        float temperature = (argc > 3) ? std::stof(argv[3]) : 0.7f;
+        int max_tokens = 40;
+        float temperature = 0.7f;
+        try {
+            if (argc > 2) max_tokens = std::stoi(argv[2]);
+            if (argc > 3) temperature = std::stof(argv[3]);
+        } catch (...) {
+            Logger::error("Invalid max_tokens or temperature argument");
+            return 1;
+        }
         return cmd_legacy(prompt, max_tokens, temperature);
     }
 }
