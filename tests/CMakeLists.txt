@@ -52,3 +52,20 @@ target_link_libraries(test_inference PRIVATE
     pthread
 )
 add_test(NAME test_inference COMMAND test_inference)
+
+# ─── Test: GigaToken integration ──────────────────────────────────────────
+add_executable(test_gigatoken
+    test_gigatoken.cpp
+    catch_amalgamated.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/gigatoken_wrapper.cpp
+)
+target_include_directories(test_gigatoken PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/third_party
+    ${CATCH_INCLUDE_DIR}
+)
+target_link_libraries(test_gigatoken PRIVATE
+    dl
+    pthread
+)
+add_test(NAME test_gigatoken COMMAND test_gigatoken)

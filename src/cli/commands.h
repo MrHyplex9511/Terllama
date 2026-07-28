@@ -38,6 +38,7 @@ int cmd_pull(int argc, char** argv);
 int cmd_serve(int argc, char** argv);
 int cmd_legacy(const std::string& prompt, int max_tokens, float temperature);
 int cmd_bench();
+int cmd_bench_tokenizer(int argc, char** argv);
 void print_usage(const char* prog);
 
 // ═══════════════════════════════════════════════════════════════════════════

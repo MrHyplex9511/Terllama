@@ -123,6 +123,8 @@ inline std::vector<float> load_final_norm(const std::string& path, const ModelCo
 struct NormWeights {
     std::vector<float> input_layernorm;
     std::vector<float> post_attention_layernorm;
+    std::vector<float> attn_sub_norm;  // BitNet: scale attention output before residual
+    std::vector<float> ffn_sub_norm;   // BitNet: scale FFN output before residual
 };
 
 inline std::vector<NormWeights> load_layer_norms(const std::string& path, const ModelConfig& cfg) {
@@ -146,7 +148,7 @@ inline std::vector<NormWeights> load_layer_norms(const std::string& path, const 
 inline int find_layer_index(const std::vector<LayerData>& layers, const std::string& name) {
     for (int i = 0; i < (int)layers.size(); i++)
         if (layers[i].name == name) return i;
-    Logger::error("Layer not found: {}", name);
+    Logger::error("Layer not found: %s", name.c_str());
     exit(1);
     return -1;
 }
@@ -310,6 +312,135 @@ inline std::vector<LayerData> load_decomposed_layers_i2s(const std::string& path
                     if (tv == 1)      term.combined[abs_word] |= (1 << (bit + 16));
                     else if (tv == -1) term.combined[abs_word] |= (1 << (bit + 16)) | (1 << bit);
                 }
+            }
+        }
+        ld.num_terms = 1;
+        ld.terms.push_back(std::move(term));
+    }
+    return layers;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// TQ1.0 LAYER LOADER (model_tq1.bin)
+// ═══════════════════════════════════════════════════════════════════════════
+// Format: magic(TQ1_=0x5F315154), num_layers(uint32)
+//   per layer: name_len(uint32), name, out_f(uint32), in_f(uint32),
+//              layer_type(uint8), data_len(uint32), packed_data
+//   layer_type: 0=TQ1, 1=RAW_FP32
+//   TQ1 packed_data = Base-3 codes(24 bytes per 120-element block) + scales(float per block)
+//
+// TQ1.0 packs 5 ternary trits per byte (vs I2_S's 4), giving ~27% smaller files
+// and ~1.58 bits/weight.  At load time we convert TQ1→I2_S so all existing
+// I2_S kernels work transparently.
+inline std::vector<LayerData> load_decomposed_layers_tq1(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) { Logger::error("Cannot open: {}", path); exit(1); }
+    uint32_t magic;
+    f.read(reinterpret_cast<char*>(&magic), 4);
+    if (magic != 0x5F315154) {  // "TQ1_"
+        Logger::error("Bad magic (expected TQ1_): 0x{:x}", magic);
+        exit(1);
+    }
+    uint32_t num_layers;
+    f.read(reinterpret_cast<char*>(&num_layers), 4);
+    std::vector<LayerData> layers(num_layers);
+    for (uint32_t i = 0; i < num_layers; i++) {
+        auto& ld = layers[i];
+        uint32_t name_len;
+        f.read(reinterpret_cast<char*>(&name_len), 4);
+        ld.name.resize(name_len);
+        f.read(&ld.name[0], name_len);
+        f.read(reinterpret_cast<char*>(&ld.out_features), 4);
+        f.read(reinterpret_cast<char*>(&ld.in_features), 4);
+        uint8_t layer_type;
+        f.read(reinterpret_cast<char*>(&layer_type), 1);
+        uint32_t data_len;
+        f.read(reinterpret_cast<char*>(&data_len), 4);
+
+        std::vector<uint8_t> data(data_len);
+        f.read(reinterpret_cast<char*>(data.data()), data_len);
+
+        if (layer_type == 1) {
+            ld.has_raw_weights = true;
+            ld.raw_weights.resize(data_len / sizeof(float));
+            std::memcpy(ld.raw_weights.data(), data.data(), data_len);
+            continue;
+        }
+
+        // TQ1.0 → convert to I2_S for kernel compatibility
+        int tq1_qk = 120;
+        int i2s_qk = 128;
+        int n_tq1_blocks = (ld.in_features + tq1_qk - 1) / tq1_qk;
+        int n_i2s_blocks = (ld.in_features + i2s_qk - 1) / i2s_qk;
+
+        // Decode TQ1 → int8 ternary, then repack as I2_S
+        std::vector<int8_t> all_ternary((size_t)ld.out_features * ld.in_features);
+
+        // Data layout (per row): [block0_codes(24B)][block0_scale(4B)]...
+        int tq1_codes_per_block = tq1_qk / 5;  // 24
+        int row_stride = n_tq1_blocks * (tq1_codes_per_block + (int)sizeof(float));
+
+        for (int row = 0; row < ld.out_features; row++) {
+            for (int b = 0; b < n_tq1_blocks; b++) {
+                int block_start = b * tq1_qk;
+                int block_end = std::min(block_start + tq1_qk, ld.in_features);
+                int block_size = block_end - block_start;
+                int offset = row * row_stride + b * (tq1_codes_per_block + (int)sizeof(float));
+
+                // Decode TQ1 codes to int8 ternary
+                tq1_decode_block(data.data() + offset,
+                                 &all_ternary[(size_t)row * ld.in_features + block_start],
+                                 block_size);
+            }
+        }
+
+        // Store as I2_S blocks (128 elements per block)
+        ld.has_i2s = true;
+        ld.i2s_qk = i2s_qk;
+        ld.i2s_blocks.resize((size_t)ld.out_features * n_i2s_blocks);
+
+        for (int row = 0; row < ld.out_features; row++) {
+            for (int b = 0; b < n_i2s_blocks; b++) {
+                int block_idx = row * n_i2s_blocks + b;
+                int block_start = b * i2s_qk;
+                int block_end = std::min(block_start + i2s_qk, ld.in_features);
+                int block_size = block_end - block_start;
+
+                // Encode int8 ternary → I2_S
+                ld.i2s_blocks[block_idx].packed.resize(i2s_qk / 4, 0);
+                for (int j = 0; j < block_size; j++) {
+                    int8_t tv = all_ternary[(size_t)row * ld.in_features + block_start + j];
+                    uint8_t code = (uint8_t)(tv + 1);  // -1→0, 0→1, +1→2
+                    int byte_idx = j / 4;
+                    int shift = 6 - 2 * (j % 4);
+                    ld.i2s_blocks[block_idx].packed[byte_idx] |= (code << shift);
+                }
+                // Compute block scale: max absolute value
+                float max_abs = 0.0f;
+                for (int j = 0; j < block_size; j++) {
+                    float v = std::abs((float)all_ternary[(size_t)row * ld.in_features + block_start + j]);
+                    if (v > max_abs) max_abs = v;
+                }
+                ld.i2s_blocks[block_idx].scale = max_abs > 0.0f ? max_abs : 1.0f;
+            }
+        }
+
+        // Also decode to bitplane combined[] for backward compatibility
+        int words_per_row = (ld.in_features + 15) / 16;
+        size_t n_words = (size_t)ld.out_features * words_per_row;
+        BitplaneTerm term;
+        term.alpha_exp = 0;
+        term.n_elements = (size_t)ld.out_features * ld.in_features;
+        term.combined.assign(n_words, 0);
+
+        for (int row = 0; row < ld.out_features; row++) {
+            for (int j = 0; j < ld.in_features; j++) {
+                int8_t tv = all_ternary[(size_t)row * ld.in_features + j];
+                int word = j / 16;
+                int bit = j % 16;
+                size_t abs_word = (size_t)row * words_per_row + word;
+                if (tv == 1)      term.combined[abs_word] |= (1 << (bit + 16));
+                else if (tv == -1) term.combined[abs_word] |= (1 << (bit + 16)) | (1 << bit);
             }
         }
         ld.num_terms = 1;

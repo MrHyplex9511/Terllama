@@ -20,11 +20,19 @@ __attribute__((weak)) void ternary_mul_avx2(const uint32_t* const*, const int*, 
 __attribute__((weak)) void ternary_mul_neon(const uint32_t* const*, const int*, int, int, int, const float*, float*);
 #endif
 
+// Use CPU detection from kernel_dispatch.h's inline variants for fine-grained ISA
+// but keep the dispatch functions here for I2_S and MoTE-specific logic
 CPUArch detect_cpu_arch() {
 #if defined(__x86_64__) || defined(_M_X64)
     #if defined(__GNUC__) || defined(__clang__)
+        if (__builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512dq"))
+            return CPUArch::X86_64_AVX512;
         if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma"))
             if (ternary_mul_avx2) return CPUArch::X86_64_AVX2;
+        if (__builtin_cpu_supports("avx"))
+            return CPUArch::X86_64_AVX;
+        if (__builtin_cpu_supports("sse4.2"))
+            return CPUArch::X86_64_SSE42;
     #endif
     return CPUArch::X86_64_SCALAR;
 #elif defined(__aarch64__) || defined(_M_ARM64)
@@ -64,6 +72,7 @@ void ternary_linear(const LayerData& layer, const float* input, float* output,
 
     switch (arch) {
 #if defined(__x86_64__) || defined(_M_X64)
+        case CPUArch::X86_64_AVX512:
         case CPUArch::X86_64_AVX2:
             if (ternary_mul_avx2) { ternary_mul_avx2(term_data, alpha_exps, n_active, layer.out_features, layer.in_features, input, output); return; }
             break;
@@ -72,6 +81,8 @@ void ternary_linear(const LayerData& layer, const float* input, float* output,
             if (ternary_mul_neon) { ternary_mul_neon(term_data, alpha_exps, n_active, layer.out_features, layer.in_features, input, output); return; }
             break;
 #endif
+        case CPUArch::X86_64_AVX:
+        case CPUArch::X86_64_SSE42:
         case CPUArch::X86_64_SCALAR:
         case CPUArch::ARM64_SCALAR:
         default:
@@ -84,6 +95,8 @@ void ternary_linear(const LayerData& layer, const float* input, float* output,
 }
 
 __attribute__((weak)) void ternary_mul_avx2_i2s(
+    const uint8_t* const*, const float* const*, int, int, int, const float*, float*);
+__attribute__((weak)) void ternary_mul_avx512_i2s_fairyfuse(
     const uint8_t* const*, const float* const*, int, int, int, const float*, float*);
 __attribute__((weak)) void ternary_mul_scalar_i2s(
     const uint8_t* const*, const float* const*, int, int, int, const float*, float*);
@@ -98,9 +111,7 @@ void ternary_linear_i2s(const LayerData& layer, const float* input, float* outpu
     int n_blocks = (layer.in_features + layer.i2s_qk - 1) / layer.i2s_qk;
     int codes_per_block = layer.i2s_qk / 4;  // 32 for qk=128
 
-    // Build contiguous per-row data for the kernel, which expects
-    // i2s_block_data[row] to point to row's codes (n_blocks*32 contiguous bytes)
-    // and i2s_block_scales[row] to point to row's scales (n_blocks floats).
+    // Build contiguous per-row data for the kernel
     std::vector<uint8_t> contiguous_data((size_t)layer.out_features * n_blocks * codes_per_block);
     std::vector<float>   contiguous_scales((size_t)layer.out_features * n_blocks);
     for (int row = 0; row < layer.out_features; row++) {
@@ -121,6 +132,15 @@ void ternary_linear_i2s(const LayerData& layer, const float* input, float* outpu
     CPUArch arch = (override_arch != CPUArch::UNKNOWN) ? override_arch : detect_cpu_arch();
 
 #if defined(__x86_64__) || defined(_M_X64)
+    // FairyFuse AVX-512 path — zero-multiplication masked ternary kernel
+    if (arch == CPUArch::X86_64_AVX512) {
+        if (ternary_mul_avx512_i2s_fairyfuse) {
+            ternary_mul_avx512_i2s_fairyfuse(block_data.data(), block_scales.data(),
+                                              layer.out_features, layer.in_features, n_blocks,
+                                              input, output);
+            return;
+        }
+    }
     if (arch == CPUArch::X86_64_AVX2) {
         if (ternary_mul_avx2_i2s) {
             ternary_mul_avx2_i2s(block_data.data(), block_scales.data(),

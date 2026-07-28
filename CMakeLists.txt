@@ -42,6 +42,19 @@ endif()
 set(THIRD_PARTY_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
 set(TESTS_DIR       ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 
+# ─── GigaToken (Rust tokenizer) ───────────────────────────────────────────
+set(GIGATOKEN_DIR     ${THIRD_PARTY_DIR}/gigatoken)
+set(GIGATOKEN_LIB     ${GIGATOKEN_DIR}/target/release/libgigatoken_rs.so)
+set(GIGATOKEN_BUILD   ${CMAKE_BINARY_DIR}/libgigatoken_rs.so)
+
+if(EXISTS ${GIGATOKEN_LIB})
+    set(GIGATOKEN_FOUND YES)
+else()
+    set(GIGATOKEN_FOUND NO)
+    message(STATUS "GigaToken .so: NOT FOUND — run 'cargo build --release -p gigatoken' in third_party/gigatoken/")
+    message(STATUS "  Python tokenizer fallback will be used at runtime.")
+endif()
+
 # ─── Kernel object libraries (separate compile for ISA-specific flags) ────
 
 # Scalar fallback (always)
@@ -66,6 +79,11 @@ if(ARCH_ARM64)
     target_compile_definitions(terllama_kernel_neon PRIVATE __ARM_NEON)
 endif()
 
+# MoTE kernel (always — compiles with inline dispatch)
+add_library(terllama_kernel_mote OBJECT src/kernel_mote.cpp)
+target_compile_options(terllama_kernel_mote PRIVATE -O3)
+target_include_directories(terllama_kernel_mote PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
 # Dispatcher (always)
 add_library(terllama_dispatcher OBJECT src/dispatcher.cpp)
 target_compile_options(terllama_dispatcher PRIVATE -O3)
@@ -78,6 +96,8 @@ add_library(terllama_core OBJECT
     src/core/inference.cpp
     src/core/logger.cpp
     src/core/tokenizer.cpp
+    src/core/gigatoken_wrapper.cpp
+    src/mote_builder.cpp
     src/server/handlers.cpp
     src/server.cpp
     src/downloader.cpp
@@ -87,10 +107,11 @@ target_include_directories(terllama_core PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${THIRD_PARTY_DIR}
 )
-target_compile_options(terllama_core PRIVATE -O3)
+target_compile_options(terllama_core PRIVATE -O3 -ffast-math)
 target_link_libraries(terllama_core PRIVATE
     OpenMP::OpenMP_CXX
     pthread
+    dl
 )
 if(CURL_FOUND)
     target_link_libraries(terllama_core PRIVATE CURL::libcurl)
@@ -102,6 +123,7 @@ add_executable(terllama
     $<TARGET_OBJECTS:terllama_core>
     $<TARGET_OBJECTS:terllama_kernel_scalar>
     $<TARGET_OBJECTS:terllama_kernel_avx2>
+    $<TARGET_OBJECTS:terllama_kernel_mote>
     $<TARGET_OBJECTS:terllama_dispatcher>
 )
 if(ARCH_ARM64)
@@ -114,9 +136,19 @@ target_include_directories(terllama PRIVATE
 target_link_libraries(terllama PRIVATE
     OpenMP::OpenMP_CXX
     pthread
+    dl
 )
 if(CURL_FOUND)
     target_link_libraries(terllama PRIVATE CURL::libcurl)
+endif()
+
+# Post-build: copy GigaToken .so next to the binary so dlopen finds it
+if(EXISTS ${GIGATOKEN_LIB})
+    add_custom_command(TARGET terllama POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${GIGATOKEN_LIB} ${CMAKE_BINARY_DIR}/libgigatoken_rs.so
+        COMMENT "Copying libgigatoken_rs.so → ${CMAKE_BINARY_DIR}/"
+    )
 endif()
 
 # ─── Benchmark binary ─────────────────────────────────────────────────────
@@ -126,6 +158,7 @@ if(BUILD_BENCHMARK)
         src/core/logger.cpp
         $<TARGET_OBJECTS:terllama_kernel_scalar>
         $<TARGET_OBJECTS:terllama_kernel_avx2>
+        $<TARGET_OBJECTS:terllama_kernel_mote>
         $<TARGET_OBJECTS:terllama_dispatcher>
     )
     if(ARCH_ARM64)
@@ -138,6 +171,7 @@ if(BUILD_BENCHMARK)
     target_link_libraries(terllama-bench PRIVATE
         OpenMP::OpenMP_CXX
         pthread
+        dl
     )
     if(CURL_FOUND)
         target_link_libraries(terllama-bench PRIVATE CURL::libcurl)
@@ -157,6 +191,13 @@ if(BUILD_BENCHMARK)
 endif()
 install(DIRECTORY web/ DESTINATION share/terllama/web)
 
+# Install GigaToken shared library alongside the binary
+if(EXISTS ${GIGATOKEN_LIB})
+    install(FILES ${GIGATOKEN_LIB} DESTINATION bin
+        PERMISSIONS OWNER_READ OWNER_WRITE GROUP_READ WORLD_READ)
+    message(STATUS "GigaToken .so: will install to bin/")
+endif()
+
 # ─── Build summary ────────────────────────────────────────────────────────
 message(STATUS "╔══════════════════════════════════════════╗")
 message(STATUS "║        Terllama Build Configuration      ║")
@@ -167,6 +208,7 @@ message(STATUS "║  Arch:          ${CMAKE_SYSTEM_PROCESSOR}")
 message(STATUS "║  LTO/IPO:       ${lto_supported}")
 message(STATUS "║  OpenMP:        ${OpenMP_CXX_FOUND}")
 message(STATUS "║  libcurl:       ${CURL_FOUND}")
+message(STATUS "║  GigaToken:     ${GIGATOKEN_FOUND}")
 message(STATUS "║  Build tests:   ${BUILD_TESTING}")
 message(STATUS "║  Benchmark:     ${BUILD_BENCHMARK}")
 message(STATUS "╚══════════════════════════════════════════╝")

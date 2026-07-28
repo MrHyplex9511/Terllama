@@ -114,6 +114,9 @@ int main(int argc, char** argv) {
     }
 
     if (cmd == "bench" || cmd == "benchmark") {
+        if (argc > 2 && std::string(argv[2]) == "tokenizer") {
+            return cmd_bench_tokenizer(argc, argv);
+        }
         return cmd_bench();
     }
 

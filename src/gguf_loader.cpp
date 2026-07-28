@@ -292,14 +292,18 @@ static bool convert_q2_0_to_layer(const GGUFFile& gguf,
                                    LayerData& layer) {
     if (ti.dims.size() < 2) return false;
 
-    uint64_t out_features = ti.dims[0];  // rows
-    uint64_t in_features  = ti.dims[1];  // cols
+    // GGUF stores dimensions in GGML order (column-major reversed).
+    // For [out_features, in_features] weight matrix:
+    //   dims[0] = in_features  (innermost = columns)
+    //   dims[1] = out_features (outermost = rows)
+    uint64_t out_features = ti.dims[1];  // rows
+    uint64_t in_features  = ti.dims[0];  // cols
 
     layer.out_features = (int32_t)out_features;
     layer.in_features  = (int32_t)in_features;
     layer.has_i2s      = true;
-    layer.num_terms    = 0;  // not using bitplane terms for I2_S path
-    layer.i2s_qk       = (int32_t)Q2_0_BLOCK_SIZE;
+    layer.num_terms    = 0;
+    layer.i2s_qk       = (int32_t)Q2_0_BLOCK_SIZE;  // always 128
 
     int qk = (int)Q2_0_BLOCK_SIZE;
     int n_blocks = (int)((in_features + qk - 1) / qk);
@@ -309,22 +313,34 @@ static bool convert_q2_0_to_layer(const GGUFFile& gguf,
 
     const uint8_t* data_ptr = gguf.file_data.data() + (size_t)ti.offset;
 
-    for (uint64_t row = 0; row < out_features; row++) {
-        for (int b = 0; b < n_blocks; b++) {
-            int block_idx = (int)(row * n_blocks + b);
-            int block_start = b * qk;
-            // int block_end = std::min(block_start + qk, (int)in_features);
+    if (ti.type == 36) {
+        // Native I2_S format: 32 bytes packed codes per 128-element block, NO scale.
+        // BitNet uses sub-layer normalization for scaling, not per-block scale.
+        // Read 32 bytes codes; set scale = 1.0f.
+        for (uint64_t row = 0; row < out_features; row++) {
+            for (int b = 0; b < n_blocks; b++) {
+                int block_idx = (int)(row * n_blocks + b);
+                const uint8_t* block = data_ptr + (row * n_blocks + b) * 32;
+                auto& i2s = layer.i2s_blocks[block_idx];
+                i2s.packed.assign(block, block + codes_per_block);  // 32 bytes codes
+                i2s.scale = 1.0f;
+            }
+        }
+    } else {
+        // Q2_0 format: [2 bytes FP16 scale][32 bytes codes] = 34 bytes/block
+        for (uint64_t row = 0; row < out_features; row++) {
+            for (int b = 0; b < n_blocks; b++) {
+                int block_idx = (int)(row * n_blocks + b);
+                const uint8_t* q2_block = data_ptr + (row * n_blocks + b) * Q2_0_BLOCK_BYTES;
 
-            // Q2_0 block: 2 bytes FP16 scale + 32 bytes codes
-            const uint8_t* q2_block = data_ptr + (row * n_blocks + b) * Q2_0_BLOCK_BYTES;
+                uint8_t codes[32];
+                float scale;
+                decode_q2_0_block(q2_block, codes, &scale);
 
-            uint8_t codes[32];
-            float scale;
-            decode_q2_0_block(q2_block, codes, &scale);
-
-            auto& i2s = layer.i2s_blocks[block_idx];
-            i2s.packed.assign(codes, codes + codes_per_block);
-            i2s.scale = scale;
+                auto& i2s = layer.i2s_blocks[block_idx];
+                i2s.packed.assign(codes, codes + codes_per_block);
+                i2s.scale = scale;
+            }
         }
     }
 
@@ -440,10 +456,11 @@ bool load_gguf_model(const std::string& path,
     }
 
     // ── Determine vocab_size from embedding tensor ───────────────────────
+    // GGUF dims: [hidden_size, vocab_size]; we want the outer dim (vocab_size)
     int32_t vocab_size = 0;
     auto* embed_tensor = find_tensor(gguf.tensors, "token_embd.weight");
     if (embed_tensor && embed_tensor->dims.size() >= 2) {
-        vocab_size = (int32_t)embed_tensor->dims[0];
+        vocab_size = (int32_t)embed_tensor->dims[1];
     } else {
         Logger::error("GGUF: token_embd.weight not found");
         return false;
@@ -460,6 +477,7 @@ bool load_gguf_model(const std::string& path,
     cfg.rope_theta             = rope_freq_base;
     cfg.max_position_embeddings = (int32_t)context_length;
     cfg.head_dim               = (int32_t)(embedding_length / head_count);
+    cfg.eos_token_id           = (int32_t)gguf.eos_token_id;
 
     // ── Extract embedding ────────────────────────────────────────────────
     if (!extract_f32_tensor(gguf, *embed_tensor, embedding)) {
@@ -507,6 +525,22 @@ bool load_gguf_model(const std::string& path,
             extract_f32_tensor(gguf, *pa_norm, layer_norms[i].post_attention_layernorm);
         } else {
             layer_norms[i].post_attention_layernorm.resize(cfg.hidden_size, 1.0f);
+        }
+
+        // BitNet sub-layer norm (scale attention output before residual)
+        auto* attn_sn = find_tensor(gguf.tensors, "blk." + layer_str + ".attn_sub_norm.weight");
+        if (attn_sn) {
+            extract_f32_tensor(gguf, *attn_sn, layer_norms[i].attn_sub_norm);
+        } else {
+            layer_norms[i].attn_sub_norm.resize(cfg.hidden_size, 1.0f);
+        }
+
+        // BitNet sub-layer norm (scale FFN output before residual)
+        auto* ffn_sn = find_tensor(gguf.tensors, "blk." + layer_str + ".ffn_sub_norm.weight");
+        if (ffn_sn) {
+            extract_f32_tensor(gguf, *ffn_sn, layer_norms[i].ffn_sub_norm);
+        } else {
+            layer_norms[i].ffn_sub_norm.resize(cfg.hidden_size, 1.0f);
         }
 
         // 7 quantized linear layers per transformer block
@@ -566,9 +600,10 @@ bool load_gguf_model(const std::string& path,
         lm_ld.name = "lm_head";
         if (lm_head_tensor->type == GGML_TYPE_F32 || lm_head_tensor->type == GGML_TYPE_F16) {
             // Unquantized lm_head
+            // GGUF dims: [in_features, out_features]
             lm_ld.has_raw_weights = true;
-            lm_ld.out_features = (int32_t)lm_head_tensor->dims[0];
-            lm_ld.in_features  = (int32_t)lm_head_tensor->dims[1];
+            lm_ld.out_features = (int32_t)lm_head_tensor->dims[1];
+            lm_ld.in_features  = (int32_t)lm_head_tensor->dims[0];
             extract_f32_tensor(gguf, *lm_head_tensor, lm_ld.raw_weights);
         } else {
             // Quantized lm_head
@@ -577,7 +612,7 @@ bool load_gguf_model(const std::string& path,
         layers.push_back(std::move(lm_ld));
     }
 
-    Logger::info("  GGUF model loaded: {}, {} layers, {} linear layers", arch, cfg.num_hidden_layers, layers.size());
+    Logger::info("  GGUF model loaded: arch=%s layers=%d linear=%d", arch.c_str(), cfg.num_hidden_layers, (int)layers.size());
 
     return true;
 }

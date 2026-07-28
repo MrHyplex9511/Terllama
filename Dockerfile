@@ -14,10 +14,20 @@
 # ─── Build stage ──────────────────────────────────────────────────────────
 FROM alpine:3.19 AS builder
 
+# C++ build deps
 RUN apk add --no-cache build-base curl-dev linux-headers
+
+# Rust + Python-dev for GigaToken (pyo3 needs libpython)
+RUN apk add --no-cache python3-dev rust cargo
+# Remove Python-exclusive pyo3 output from the Rust build
+ENV PYO3_PRINT_CONFIG=0
 
 WORKDIR /src
 COPY . .
+
+# Build GigaToken C API library (uses PYO3 + Python dev)
+RUN cargo build --release -p gigatoken && \
+    cp target/release/libgigatoken_rs.so /usr/local/lib/
 
 # Static link: all .cpp in src/ except benchmark
 # Runtime dispatch via weak symbols in dispatcher
@@ -30,8 +40,11 @@ RUN g++ -std=c++17 -O3 -fopenmp -I. -Ithird_party \
 # ─── Runtime stage ────────────────────────────────────────────────────────
 FROM alpine:3.19
 
-# Runtime deps: OpenMP, libcurl, Python3 (for tokenizer helpers)
+# Runtime deps: OpenMP, libcurl, Python3 (for tokenizer helpers fallback)
 RUN apk add --no-cache libgomp libcurl python3 py3-pip
+
+# GigaToken C API library — dlopen'd by terllama at runtime
+COPY --from=builder /usr/local/lib/libgigatoken_rs.so /usr/local/lib/
 
 COPY --from=builder /terllama /usr/local/bin/terllama
 COPY web /usr/local/share/terllama/web

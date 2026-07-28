@@ -18,6 +18,7 @@ struct ModelConfig {
     float rms_norm_eps, rope_theta;
     int32_t max_position_embeddings;
     int32_t head_dim; // derived
+    int32_t eos_token_id = 0; // default 0 for backward compat
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -37,6 +38,45 @@ struct alignas(64) BitplaneTerm {
     std::vector<uint32_t> combined;  // upper 16=nz, lower 16=neg
 };
 
+// TQ1.0 packed weight block: 120 elements → 24 bytes Base-3 encoded (5 trits/byte)
+// ~1.58 bits/weight, 27% smaller than I2_S (4 trits/byte, 2 bits/weight)
+struct TQ1Block {
+    std::vector<uint8_t> packed;  // Base-3 encoded (5 trits/byte)
+    float scale{0.0f};            // per-block scale
+};
+
+// ─── TQ1.0 pack/unpack utilities (Base-3 encoding, 5 trits/byte) ─────────────
+inline int tq1_encode_5_trits(const int8_t trits[5]) {
+    // Map -1→0, 0→1, +1→2, then encode in Base-3
+    int val = 0;
+    for (int i = 4; i >= 0; i--) {
+        val = val * 3 + (trits[i] + 1);  // -1→0, 0→1, +1→2
+    }
+    return val;  // 0..242, fits in uint8_t
+}
+
+inline void tq1_decode_byte(uint8_t byte, int8_t trits[5]) {
+    // Decode Base-3 byte into 5 ternary values
+    int val = byte;
+    for (int i = 0; i < 5; i++) {
+        int digit = val % 3;
+        trits[i] = (int8_t)(digit - 1);  // 0→-1, 1→0, 2→+1
+        val /= 3;
+    }
+}
+
+// Decode a TQ1 block (120 elements → 24 bytes) into ternary int8 array
+inline void tq1_decode_block(const uint8_t* packed, int8_t* ternary, int n) {
+    int n_bytes = (n + 4) / 5;  // ceil(n/5)
+    for (int i = 0; i < n_bytes; i++) {
+        int8_t trits[5];
+        tq1_decode_byte(packed[i], trits);
+        for (int j = 0; j < 5 && i * 5 + j < n; j++) {
+            ternary[i * 5 + j] = trits[j];
+        }
+    }
+}
+
 // I2_S packed weight block: 128 elements → 32 bytes codes + 4 bytes scale
 struct I2SBlock {
     std::vector<uint8_t> packed;  // packed I2_S codes (4 values/byte)
@@ -48,6 +88,11 @@ struct alignas(64) LayerData {
     int32_t out_features{0}, in_features{0};
     int32_t num_terms{0};
     std::vector<BitplaneTerm> terms;
+
+    // TQ1.0 storage (most compact: ~1.58 bits/weight)
+    bool has_tq1{false};
+    std::vector<TQ1Block> tq1_blocks;
+    int tq1_qk{120};  // 120 elements per block → 24 bytes packed
 
     // I2_S direct storage (optional, for new kernel path)
     bool has_i2s{false};

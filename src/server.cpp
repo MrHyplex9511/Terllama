@@ -21,6 +21,8 @@
 
 #include "server/handlers.h"
 #include "kernel_decl.h"
+#include "core/sandwich_scheduler.h"
+#include "core/packrat_reconfig.h"
 #include <json.hpp>
 
 #include <iostream>
@@ -100,6 +102,17 @@ bool init_server(const std::string& model_dir) {
             g_model.cfg.max_position_embeddings,
             g_model.cfg.head_dim,
             g_model.cfg.rope_theta);
+
+        // ─── Packrat: auto-tune thread config ───────────────────────────
+        {
+            PackratTuner tuner;
+            auto pk_cfg = tuner.tune(g_model.cfg.hidden_size,
+                                     g_model.cfg.intermediate_size);
+            // Store optimal config as environment for Sandwich to pick up
+            setenv("TERLLAMA_PREFILL_THREADS", std::to_string(pk_cfg.prefill_threads).c_str(), 1);
+            setenv("TERLLAMA_DECODE_THREADS",  std::to_string(pk_cfg.decode_threads).c_str(), 1);
+            setenv("TERLLAMA_PIN_THREADS",     pk_cfg.pin_threads ? "1" : "0", 1);
+        }
 
         g_model.loaded = true;
         Logger::info("Server initialized.");

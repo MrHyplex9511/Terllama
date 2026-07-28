@@ -8,14 +8,16 @@ Design goals:
 - **CPU-first** — no GPU required. Runs on x86-64 (Haswell+) and ARM64 (Apple Silicon).
 - **Multi-ISA** — scalar fallback through AVX-512, with runtime dispatch.
 - **Compact** — model weights shrink to ~25% of FP32 size via I2_S ternary packing.
-- **Minimal dependencies** — C++17, OpenMP, make, Python 3 (transformers) for tokenizer.
+- **Minimal dependencies** — C++17, OpenMP, make, Python 3 (tokenizer fallback), Rust (GigaToken rebuild).
 
 ### Source Layout
 
 ```
 src/                    C++ inference engine + server + downloader
 src/core/               Core inference ops (RMS norm, attention, MLP, RoPE, KV cache)
+src/core/gigatoken_wrapper.h/.cpp  GigaToken C API dlopen/dlsym wrapper
 src/cli/                CLI command handlers
+src/cli/commands.h/.cpp CLI dispatch — tokenizer commands, tokenize_with_helper()
 src/server/             Server handler implementations
 src/kernel_dispatch.h   CPU detection + 6 ISA kernel variants
 src/kernel_avx2.cpp     Standalone AVX2 kernel compilation unit
@@ -30,8 +32,8 @@ src/server.cpp          OpenAI-compatible HTTP server
 src/downloader.cpp      HuggingFace model downloader
 src/main.cpp            CLI entry point + command dispatch
 web/                    Web UI (served by server)
-scripts/                Python model export + tokenizer helpers
-third_party/            cpp-httplib (single header)
+scripts/                Python model export + tokenizer helpers (fallback)
+third_party/            cpp-httplib (single header), gigatoken/ (Rust tokenizer)
 ```
 
 ## Ternary Quantization (1.58-bit)
@@ -214,7 +216,47 @@ At load time, `load_gguf_model()` in `gguf_loader.h`:
 
 ### Tokenizer
 
-Two helper scripts handle tokenization:
+Terllama uses **[GigaToken](https://github.com/marcelroed/gigatoken)** — a SIMD-optimized Rust tokenizer — for in-process tokenization, falling back to Python subprocess only when the `.so` is unavailable.
+
+#### GigaToken (primary path)
+
+GigaToken is a drop-in Rust reimplementation of HuggingFace tokenizers achieving ~1000× throughput (GB/s vs MB/s). Terllama loads it via `dlopen`/`dlsym` at runtime — no Rust toolchain needed after build.
+
+Files:
+
+- `third_party/gigatoken/` — GigaToken Rust crate source
+- `src/core/gigatoken_wrapper.h/.cpp` — C++ wrapper loading `libgigatoken_rs.so`
+- `build/libgigatoken_rs.so` — pre-built C API shared library
+
+Supported tokenizer types:
+
+| Type | Loader | Models |
+|------|--------|--------|
+| GPT-2 BPE (ByteLevel) | `tokenizer.json` via GigaToken | SmolLM2, GPT-2, Llama 3, Qwen 2/2.5/3, DeepSeek, Phi, Mistral |
+| SentencePiece | `.model` via GGUF metadata | Llama 1/2, Gemma 1/2/3 |
+
+The C API (`third_party/gigatoken/include/gigatoken.h`) exposes:
+
+| Function | Purpose |
+|----------|---------|
+| `gt_init` | Initialize logging / global state |
+| `gt_tokenizer_load_hf` | Load from model directory or `tokenizer.json` |
+| `gt_encode` | Encode text → token IDs |
+| `gt_decode` | Decode token IDs → text |
+| `gt_tokenizer_vocab_size` | Get vocabulary size |
+| `gt_tokenizer_info` | Get metadata (bos/eos/pad IDs) |
+| `gt_shutdown` | Cleanup |
+
+`tokenize_with_helper()` in `commands.cpp` tries GigaToken first, then falls back to Python subprocess:
+
+```
+1. dlopen libgigatoken_rs.so (once)
+2. gt_tokenizer_load_hf(model_dir)  → loads tokenizer.json
+3. gt_encode(text)                  → token IDs
+4. On failure → system("python3 scripts/tokenize_helper.py ...")
+```
+
+#### Python fallback
 
 - `scripts/tokenize_helper.py` — encodes prompt text → token IDs (via HuggingFace AutoTokenizer)
 - `scripts/decode_helper.py` — decodes token IDs → text (via HuggingFace AutoTokenizer)

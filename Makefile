@@ -11,7 +11,7 @@
 
 CXX         := g++
 CXXFLAGS    := -std=c++17 -O3 -fopenmp -flto -Wall -Wextra -Wno-unknown-pragmas -Wno-address
-LDFLAGS     := -lm -fopenmp -lpthread -flto
+LDFLAGS     := -lm -fopenmp -lpthread -ldl -flto
 
 SRC_DIR     := src
 BUILD_DIR   := build
@@ -42,6 +42,7 @@ MAIN_OBJS := $(BUILD_DIR)/main.o \
              $(BUILD_DIR)/inference.o \
              $(BUILD_DIR)/logger.o \
              $(BUILD_DIR)/tokenizer.o \
+             $(BUILD_DIR)/gigatoken_wrapper.o \
              $(BUILD_DIR)/mote_builder.o
 
 .PHONY: all build-terllama build-bench clean help
@@ -120,13 +121,29 @@ $(BUILD_DIR)/logger.o: $(SRC_DIR)/core/logger.cpp | $(BUILD_DIR)
 $(BUILD_DIR)/tokenizer.o: $(SRC_DIR)/core/tokenizer.cpp $(SRC_DIR)/core/tokenizer.h | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -I$(SRC_DIR) -c $< -o $@
 
+# GigaToken C API shared library (Rust)
+GIGATOKEN_SO := $(THIRD_PARTY)/gigatoken/target/release/libgigatoken_rs.so
+
+.PHONY: gigatoken
+gigatoken: $(GIGATOKEN_SO)
+
+$(GIGATOKEN_SO):
+	cargo build --release -p gigatoken
+
+# GigaToken C++ wrapper
+$(BUILD_DIR)/gigatoken_wrapper.o: $(SRC_DIR)/core/gigatoken_wrapper.cpp $(SRC_DIR)/core/gigatoken_wrapper.h | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) -I$(SRC_DIR) -c $< -o $@
+
 # Benchmark
 $(BUILD_DIR)/benchmark.o: $(SRC_DIR)/benchmark.cpp | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 # Main binary (CLI + server + downloader + kernels)
-$(TARGET): $(MAIN_OBJS) $(KERNEL_OBJS)
+$(TARGET): $(GIGATOKEN_SO) $(MAIN_OBJS) $(KERNEL_OBJS)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
+	# Copy GigaToken .so next to binary
+	cp $(GIGATOKEN_SO) ./libgigatoken_rs.so
+	@echo "  -> Copied libgigatoken_rs.so"
 
 # Benchmark binary
 $(BENCH): $(BUILD_DIR)/benchmark.o $(BUILD_DIR)/dispatcher.o $(BUILD_DIR)/logger.o $(KERNEL_OBJS)
@@ -145,4 +162,5 @@ help:
 	@echo "  make all            Build everything"
 	@echo "  make terllama       Main binary (CLI + server + downloader)"
 	@echo "  make bench          Benchmark binary"
+	@echo "  make gigatoken      Build GigaToken .so only"
 	@echo "  make clean"

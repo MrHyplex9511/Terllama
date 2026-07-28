@@ -6,8 +6,9 @@
  * for model_forward persistent buffers.
  */
 #include "inference.h"
-#include "loader.h"   // find_layer_index
+#include "loader.h"           // find_layer_index
 #include "core/logger.h"
+#include "core/sandwich_scheduler.h"
 
 // ─── File-scope thread_local buffers for model_forward ────────────────────
 static thread_local std::vector<float> tls_x;
@@ -255,13 +256,18 @@ void transformer_block(float* x, int seq_pos, int layer_idx,
     int idx_v = find_layer_index(layers, layer_name("self_attn.v_proj"));
     int idx_o = find_layer_index(layers, layer_name("self_attn.o_proj"));
 
-    // Attention with residual
+    // Attention with residual (BitNet: apply attn_sub_norm before residual)
     std::vector<float> residual(x, x + HS);
     rms_norm(x, norms.input_layernorm.data(), HS, cfg.rms_norm_eps);
     attention(x, seq_pos, cfg,
               layers[idx_q], layers[idx_k], layers[idx_v], layers[idx_o],
               rope, kv_cache, layer_idx);
-    for (int i = 0; i < HS; i++) x[i] += residual[i];
+    if (!norms.attn_sub_norm.empty()) {
+        for (int i = 0; i < HS; i++)
+            x[i] = residual[i] + norms.attn_sub_norm[i] * x[i];
+    } else {
+        for (int i = 0; i < HS; i++) x[i] += residual[i];
+    }
 
     // MLP with residual — check for MoTE first
     std::copy(x, x + HS, residual.begin());
@@ -278,7 +284,13 @@ void transformer_block(float* x, int seq_pos, int layer_idx,
         mlp_forward(x, layers[idx_g], layers[idx_u], layers[idx_d], IS);
     }
 
-    for (int i = 0; i < HS; i++) x[i] += residual[i];
+    // BitNet: apply ffn_sub_norm before residual
+    if (!norms.ffn_sub_norm.empty()) {
+        for (int i = 0; i < HS; i++)
+            x[i] = residual[i] + norms.ffn_sub_norm[i] * x[i];
+    } else {
+        for (int i = 0; i < HS; i++) x[i] += residual[i];
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -311,11 +323,28 @@ float* model_forward(int token, int seq_pos,
     // Final RMSNorm
     rms_norm(tls_x.data(), final_norm.data(), cfg.hidden_size, cfg.rms_norm_eps);
 
-    // LM head (ternary)
-    int idx_lmhead = find_layer_index(layers, "lm_head");
-    if (tls_logits.size() != (size_t)cfg.vocab_size)
-        tls_logits.resize(cfg.vocab_size);
-    ternary_linear_dispatch(layers[idx_lmhead], tls_x.data(), tls_logits.data());
+    // LM head — try ternary layer first, fall back to tied embeddings (no output.weight)
+    int idx_lmhead = -1;
+    for (int i = 0; i < (int)layers.size(); i++)
+        if (layers[i].name == "lm_head") { idx_lmhead = i; break; }
+    if (idx_lmhead >= 0) {
+        if (tls_logits.size() != (size_t)cfg.vocab_size)
+            tls_logits.resize(cfg.vocab_size);
+        ternary_linear_dispatch(layers[idx_lmhead], tls_x.data(), tls_logits.data());
+    } else {
+        // Tied embeddings: lm_head = embedding matrix (F16 from token_embd.weight)
+        // Compute logits = embedding @ hidden_state for each vocab item (linear scan)
+        if (tls_logits.size() != (size_t)cfg.vocab_size)
+            tls_logits.resize(cfg.vocab_size);
+        const float* x_data = tls_x.data();
+        for (int v = 0; v < cfg.vocab_size; v++) {
+            const float* emb_row = &embedding[(size_t)v * cfg.hidden_size];
+            float dot = 0.0f;
+            for (int j = 0; j < cfg.hidden_size; j++)
+                dot += emb_row[j] * x_data[j];
+            tls_logits[v] = dot;
+        }
+    }
 
     return tls_logits.data();
 }
@@ -377,11 +406,19 @@ bool generate_stream(const std::vector<int>& prompt_tokens,
     KVCache kv_cache(cfg.max_position_embeddings, cfg.num_hidden_layers,
                      cfg.num_key_value_heads, cfg.head_dim, cfg.hidden_size);
 
-    // Prefill
+    // ─── Sandwich scheduler: phase-aware config ─────────────────────────
+    SandwichScheduler scheduler;
+
+    // Prefill phase (compute-bound) → more threads, compact pinning
+    scheduler.apply(GenPhase::PREFILL);
+
     for (int pos = 0; pos < (int)prompt_tokens.size(); pos++) {
         model_forward(prompt_tokens[pos], pos, cfg, embedding,
                       layers, final_norm, layer_norms, rope, kv_cache, mote_layers);
     }
+
+    // Decode phase (memory-bound) → fewer threads, spread pinning
+    scheduler.apply(GenPhase::DECODE);
 
     // Autoregressive
     std::vector<int> output_tokens;
@@ -409,7 +446,7 @@ bool generate_stream(const std::vector<int>& prompt_tokens,
             return false;
         }
 
-        if (next_token == 0) break;
+        if (next_token == cfg.eos_token_id) break;
     }
     Logger::info("generate_stream: completed %zu output tokens", output_tokens.size());
     return true;
@@ -435,15 +472,20 @@ std::pair<std::vector<int>, double> generate(
     KVCache kv_cache(cfg.max_position_embeddings, cfg.num_hidden_layers,
                      cfg.num_key_value_heads, cfg.head_dim, cfg.hidden_size);
 
+    // ─── Sandwich scheduler: phase-aware config ─────────────────────────
+    SandwichScheduler scheduler;
+
+    // Prefill phase (compute-bound) → more threads, compact pinning
+    scheduler.apply(GenPhase::PREFILL);
     auto t_start = std::chrono::high_resolution_clock::now();
 
-    // Prefill
     for (int pos = 0; pos < (int)prompt_tokens.size(); pos++) {
         model_forward(prompt_tokens[pos], pos, cfg, embedding,
                       layers, final_norm, layer_norms, rope, kv_cache, mote_layers);
     }
 
-    // Autoregressive
+    // Decode phase (memory-bound) → fewer threads, spread pinning
+    scheduler.apply(GenPhase::DECODE);
     std::vector<int> output_tokens;
     int next_token = prompt_tokens.back();
     for (int i = 0; i < max_tokens; i++) {
@@ -463,7 +505,7 @@ std::pair<std::vector<int>, double> generate(
                                             recent, 1.15f);
 
         output_tokens.push_back(next_token);
-        if (next_token == 0) break;
+        if (next_token == cfg.eos_token_id) break;
     }
 
     auto t_end = std::chrono::high_resolution_clock::now();

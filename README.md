@@ -61,6 +61,7 @@ curl -X POST http://localhost:8375/v1/chat/completions \
 | 🦙 **GGUF direct loading** | Load GGUF v3 models (Q2_0) without Python export |
 | 🐳 **Docker support** | Single-command containerized deployment |
 | 📊 **Built-in benchmark** | Per-kernel correctness validation + speed measurement |
+| ⚡ **GigaToken tokenizer** | In-process Rust tokenizer via dlopen — ~1000× faster than Python subprocess |
 
 ## Quality-vs-Size (Mistral-7B)
 
@@ -238,7 +239,7 @@ make bench    # benchmark only
 
 Build detects available ISA extensions (AVX2+FMA, NEON) and compiles matching kernels. Skips missing ISAs. Falls back to scalar on x86_64 without AVX2.
 
-**Dependencies:** C++17 compiler, OpenMP, make, Python 3 (transformers) for tokenizer. Cpp-httplib ships in `third_party/`.
+**Dependencies:** C++17 compiler, OpenMP, make, Rust (for GigaToken rebuild), Python 3 (for tokenizer fallback). Cpp-httplib and GigaToken ship in `third_party/`.
 
 ### Docker
 
@@ -253,7 +254,7 @@ docker run -p 8375:8375 -v ~/.terllama:/root/.terllama terllama
 src/           C++ inference engine + server + downloader
 web/           Web UI (served by server)
 scripts/       Model export + tokenization helpers
-third_party/   cpp-httplib (single header)
+third_party/   cpp-httplib (single header), gigatoken/ (Rust tokenizer)
 ```
 
 ## Further Reading
@@ -261,6 +262,7 @@ third_party/   cpp-httplib (single header)
 | Document | Description |
 |----------|-------------|
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | Ternary quantization, kernel dispatch, I2_S format, inference pipeline |
+| [BENCHMARKS.md](docs/BENCHMARKS.md) | Tokenizer throughput benchmarks |
 | [CONVERSION.md](docs/CONVERSION.md) | Model export guide — I2_S, ALS, GGUF, troubleshooting |
 | [API_REFERENCE.md](docs/API_REFERENCE.md) | Full API server reference |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | How to contribute |

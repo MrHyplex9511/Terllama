@@ -1,8 +1,9 @@
 """Read token IDs from /tmp/ternary_decode_in.txt. Write text to /tmp/ternary_decode_out.txt."""
-import sys
+import os, sys
 from transformers import AutoTokenizer
 
-t = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolLM2-135M")
+model_name = os.environ.get("TERLLAMA_HF_MODEL", "HuggingFaceTB/SmolLM2-135M")
+t = AutoTokenizer.from_pretrained(model_name)
 with open("/tmp/ternary_decode_in.txt") as f:
     ids = [int(x) for x in f.read().split()]
 txt = t.decode(ids)

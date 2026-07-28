@@ -39,6 +39,11 @@ void ternary_mul_avx2_i2s(const uint8_t* const* i2s_block_data,
                           const float* const* i2s_block_scales,
                           int out_f, int in_f, int n_blocks,
                           const float* input, float* output);
+void ternary_mul_avx512_i2s_fairyfuse(
+    const uint8_t* const* i2s_block_data,
+    const float* const* i2s_block_scales,
+    int out_f, int in_f, int n_blocks,
+    const float* input, float* output);
 void ternary_mul_scalar_i2s(const uint8_t* const* i2s_block_data,
                             const float* const* i2s_block_scales,
                             int out_f, int in_f, int n_blocks,

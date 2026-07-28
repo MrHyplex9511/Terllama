@@ -30,6 +30,7 @@
 #include <sys/wait.h>
 
 #include "core/tokenizer.h"
+#include "core/gigatoken_wrapper.h"
 
 extern char **environ;
 
@@ -96,7 +97,7 @@ static int run_python_script(const std::string& script_path) {
     int ret = posix_spawnp(&pid, python.c_str(), nullptr, nullptr,
                            const_cast<char* const*>(argv), environ);
     if (ret != 0) {
-        Logger::error("Failed to spawn python3 for {}", script_path);
+        Logger::error(("Failed to spawn python3 for " + script_path).c_str());
         return -1;
     }
 
@@ -111,8 +112,51 @@ static int run_python_script(const std::string& script_path) {
 // TOKENIZER (Python helper for encode only; native C++ decode)
 // ═══════════════════════════════════════════════════════════════════════════
 
+// Try GigaToken encode first; fall back to Python subprocess.
+// model_dir should contain tokenizer.json for GigaToken to load.
 static std::vector<int> tokenize_with_helper(const std::string& prompt,
-                                              const std::string& helper_dir) {
+                                              const std::string& helper_dir,
+                                              const std::string& model_dir = "") {
+    // ── Try GigaToken (fast Rust) ─────────────────────────────────────
+    if (!model_dir.empty()) {
+        static GigaTokenWrapper gt;
+        static bool gt_tried = false;
+        static bool gt_ok = false;
+        if (!gt_tried) {
+            gt_tried = true;
+            // Search for .so next to binary, then CWD, then third_party
+            char exe_buf[4096];
+            ssize_t exe_len = readlink("/proc/self/exe", exe_buf, sizeof(exe_buf) - 1);
+            std::string exe_dir;
+            if (exe_len > 0) {
+                exe_buf[exe_len] = '\0';
+                exe_dir = std::string(exe_buf);
+                auto p = exe_dir.rfind('/');
+                if (p != std::string::npos) exe_dir = exe_dir.substr(0, p);
+            }
+            std::string so_paths = ".:./bin";
+            if (!exe_dir.empty()) so_paths = exe_dir + ":" + so_paths;
+            gt_ok = gt.load(so_paths);
+            if (gt_ok) {
+                gt_ok = gt.load_tokenizer(model_dir);
+                if (gt_ok) {
+                    Logger::info(("GigaToken: loaded tokenizer from " + model_dir).c_str());
+                } else {
+                    Logger::info(("GigaToken: no tokenizer.json in " + model_dir + ", fallback to Python").c_str());
+                }
+            } else {
+                Logger::info("GigaToken: .so not found, using Python subprocess");
+            }
+        }
+        if (gt_ok && gt.has_tokenizer()) {
+            auto ids = gt.encode(prompt);
+            if (!ids.empty()) {
+                return std::vector<int>(ids.begin(), ids.end());
+            }
+        }
+    }
+
+    // ── Fallback: Python subprocess ───────────────────────────────────
     std::string prompt_file = "/tmp/ternary_prompt.txt";
     std::string token_file = "/tmp/ternary_tokens.txt";
     {
@@ -363,7 +407,7 @@ static int cmd_chat_simple(const std::string& model_id,
     auto rope = build_rope_cache(cfg.max_position_embeddings, cfg.head_dim, cfg.rope_theta);
 
     Logger::info("Prompt: {}", prompt_text);
-    auto prompt_tokens = tokenize_with_helper(prompt_text, helper_dir);
+    auto prompt_tokens = tokenize_with_helper(prompt_text, helper_dir, model_dir);
 
     if (prompt_tokens.empty()) {
         Logger::error("Tokenization failed");
@@ -448,7 +492,7 @@ int cmd_chat(int argc, char** argv) {
             Logger::info("You: ");
             if (!std::getline(std::cin, line) || line.empty()) break;
 
-            auto tokens = tokenize_with_helper(line, helper_dir);
+            auto tokens = tokenize_with_helper(line, helper_dir, model_dir);
             if (tokens.empty()) continue;
 
             auto [out_tokens, ms] = generate(
@@ -590,7 +634,7 @@ int cmd_legacy(const std::string& prompt, int max_tokens, float temperature) {
     auto rope = build_rope_cache(cfg.max_position_embeddings, cfg.head_dim, cfg.rope_theta);
 
     Logger::info("Tokenizing prompt...");
-    auto prompt_tokens = tokenize_with_helper(prompt, helper_dir);
+    auto prompt_tokens = tokenize_with_helper(prompt, helper_dir, model_dir);
 
     Logger::info("=== Generating ===");
     auto [output_tokens, total_ms] = generate(
@@ -649,7 +693,7 @@ int cmd_bench() {
 
     // Fixed benchmark prompt
     std::string bench_prompt = "The future of AI is";
-    auto prompt_tokens = tokenize_with_helper(bench_prompt, get_helper_dir());
+    auto prompt_tokens = tokenize_with_helper(bench_prompt, get_helper_dir(), model_dir);
 
     // Warmup run
     Logger::info("Warmup...");
@@ -744,6 +788,305 @@ static bool has_any_model() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// SUBCOMMAND: bench tokenizer
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Generate a repeatable test string of ~N bytes for benchmarking.
+static std::string make_bench_text(size_t target_bytes) {
+    const char* words[] = {
+        "The ", "quick ", "brown ", "fox ", "jumps ", "over ", "the ", "lazy ", "dog. ",
+        "Hello ", "world! ", "This ", "is ", "a ", "test ", "of ", "the ", "tokenizer. ",
+        "Artificial ", "intelligence ", "and ", "machine ", "learning ", "are ", "transforming ",
+        "every ", "industry. ", "Neural ", "networks ", "process ", "vast ", "amounts ",
+        "of ", "textual ", "data. ", "Transformers ", "are ", "the ", "backbone ",
+        "of ", "modern ", "NLP. ", "Tokenization ", "is ", "the ", "first ", "step. ",
+        "高性能 ", "AI ", "模型 ", "需要 ", "高效的 ", "分词器。",
+        "Émoticônes ", "et ", "caractères ", "spéciaux: ", "é ", "ü ", "ñ ", "ç. ",
+        "数字 ", "123 ", "456 ", "7890 ", "和 ", "符号 ", "!@#$% ", "^&*() ",
+    };
+    const int n = sizeof(words) / sizeof(words[0]);
+    std::string result;
+    result.reserve(target_bytes + 256);
+    for (int i = 0; result.size() < target_bytes; i++) {
+        result += words[i % n];
+    }
+    return result;
+}
+
+// Benchmark tokenizer throughput: GigaToken (Rust) vs Python subprocess.
+int cmd_bench_tokenizer(int argc, char** argv) {
+    std::string model_dir;
+    std::string bench_text;
+
+    // Parse: terllama bench tokenizer <model> [--text "..."]
+    for (int i = 3; i < argc; i++) {
+        std::string arg = argv[i];
+        if (arg == "--text" && i + 1 < argc) {
+            bench_text = argv[++i];
+        } else if (model_dir.empty()) {
+            model_dir = arg;
+        }
+    }
+
+    // Resolve model directory
+    if (model_dir.empty()) {
+        model_dir = std::getenv("TERLLAMA_MODEL_DIR")
+            ? std::string(std::getenv("TERLLAMA_MODEL_DIR"))
+            : models_dir();
+        // If models_dir doesn't contain a model, scan for first one
+        std::string first = model_dir;
+        DIR* dir = opendir(first.c_str());
+        if (dir) {
+            struct dirent* entry;
+            bool found_model = false;
+            while ((entry = readdir(dir)) && !found_model) {
+                if (entry->d_type == DT_DIR && entry->d_name[0] != '.') {
+                    model_dir = first + "/" + entry->d_name;
+                    found_model = true;
+                }
+            }
+            closedir(dir);
+        }
+    }
+
+    struct stat st;
+    if (stat(model_dir.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) {
+        Logger::error(("Model directory not found: " + model_dir).c_str());
+        Logger::error(("Usage: " + std::string(argv[0]) + " bench tokenizer <model> [--text \"...\"]").c_str());
+        return 1;
+    }
+
+    // Generate benchmark text if not provided
+    if (bench_text.empty()) {
+        bench_text = make_bench_text(1024 * 1024);  // ~1 MB
+    }
+
+    size_t text_bytes = bench_text.size();
+    Logger::info("═══════════════════════════════════════════");
+    Logger::info("   Tokenizer Benchmark");
+    Logger::info(("   Model: " + model_dir).c_str());
+    {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "   Text:  %zu bytes (%.1f MB)",
+                 text_bytes, (double)text_bytes / (1024.0 * 1024.0));
+        Logger::info(buf);
+    }
+    Logger::info("═══════════════════════════════════════════");
+
+    // ── 1. GigaToken ────────────────────────────────────────
+    Logger::info("");
+    Logger::info("── GigaToken (Rust) ──");
+
+    // Hoisted stats for comparison section
+    double gt_avg_sec = 0;
+    double gt_mb_per_sec = 0;
+    double gt_mtok_per_sec = 0;
+    std::vector<int> gt_token_counts;
+    bool gt_has_data = false;
+
+    GigaTokenWrapper gt;
+    auto t0 = std::chrono::high_resolution_clock::now();
+    bool gt_loaded = gt.load(".:./bin");
+    if (!gt_loaded) {
+        Logger::info(("  Library load: FAILED (" + gt.error() + ")").c_str());
+        Logger::info("  (Use Python fallback only)");
+    } else {
+        bool tok_loaded = gt.load_tokenizer(model_dir);
+        if (!tok_loaded) {
+            Logger::info(("  Tokenizer load: FAILED (" + gt.error() + ")").c_str());
+        } else {
+            char buf[128];
+            snprintf(buf, sizeof(buf), "  Tokenizer:  loaded (vocab_size=%d)", gt.vocab_size());
+            Logger::info(buf);
+            auto t1 = std::chrono::high_resolution_clock::now();
+
+            // Warmup
+            auto warmup = gt.encode("Warmup sentence for cache effects.");
+            (void)warmup;
+
+            // Benchmark: 5 runs
+            const int NUM_RUNS = 5;
+            double total_sec = 0;
+            size_t total_tokens = 0;
+            for (int r = 0; r < NUM_RUNS; r++) {
+                auto start = std::chrono::high_resolution_clock::now();
+                auto ids = gt.encode(bench_text);
+                auto end = std::chrono::high_resolution_clock::now();
+                double sec = std::chrono::duration<double>(end - start).count();
+                total_sec += sec;
+                total_tokens += ids.size();
+                gt_token_counts.push_back((int)ids.size());
+            }
+
+            gt_avg_sec = total_sec / NUM_RUNS;
+            double avg_tokens = (double)total_tokens / NUM_RUNS;
+            gt_mb_per_sec = (double)text_bytes / gt_avg_sec / (1024.0 * 1024.0);
+            gt_mtok_per_sec = avg_tokens / gt_avg_sec / 1e6;
+            gt_has_data = true;
+
+            {
+                char buf[256];
+                snprintf(buf, sizeof(buf), "  Runs:       %d (avg of %d)", NUM_RUNS, NUM_RUNS);
+                Logger::info(buf);
+            }
+            {
+                char buf[128];
+                snprintf(buf, sizeof(buf), "  Time:       %.4fs avg", gt_avg_sec);
+                Logger::info(buf);
+            }
+            {
+                char buf[128];
+                snprintf(buf, sizeof(buf), "  Throughput: %.2f MB/s (%.2f GB/s)",
+                         gt_mb_per_sec, gt_mb_per_sec / 1024.0);
+                Logger::info(buf);
+            }
+            {
+                char buf[128];
+                snprintf(buf, sizeof(buf), "  Tokens:     %.0f avg (%.2f Mtok/s)",
+                         avg_tokens, gt_mtok_per_sec);
+                Logger::info(buf);
+            }
+            {
+                int c0 = gt_token_counts.size() > 0 ? gt_token_counts[0] : 0;
+                int c1 = gt_token_counts.size() > 1 ? gt_token_counts[1] : 0;
+                int c2 = gt_token_counts.size() > 2 ? gt_token_counts[2] : 0;
+                char buf[128];
+                snprintf(buf, sizeof(buf), "  Token IDs:  %d %d %d", c0, c1, c2);
+                Logger::info(buf);
+            }
+        }
+    }
+
+    // ── 2. Python subprocess ────────────────────────────────
+    Logger::info("");
+    Logger::info("── Legacy (Python subprocess) ──");
+
+    // Write text to temp file (same paths as tokenize_helper.py)
+    std::string prompt_file = "/tmp/ternary_prompt.txt";
+    std::string token_file = "/tmp/ternary_tokens.txt";
+    {
+        std::ofstream pf(prompt_file);
+        pf << bench_text;
+    }
+    std::string helper_dir = get_helper_dir();
+
+    // Warmup
+    {
+        std::ofstream pf(prompt_file);
+        pf << "Warmup sentence";
+    }
+    run_python_script(helper_dir + "/tokenize_helper.py");
+
+    // Write real text
+    {
+        std::ofstream pf(prompt_file);
+        pf << bench_text;
+    }
+
+    const int NUM_PY_RUNS = 3;  // Python is slow, fewer runs
+    double py_total_sec = 0;
+    size_t py_total_tokens = 0;
+    std::vector<int> py_token_counts;
+    for (int r = 0; r < NUM_PY_RUNS; r++) {
+        auto start = std::chrono::high_resolution_clock::now();
+        int ret = run_python_script(helper_dir + "/tokenize_helper.py");
+        auto end = std::chrono::high_resolution_clock::now();
+        if (ret != 0) {
+            char buf[128];
+            snprintf(buf, sizeof(buf), "  Python tokenization failed (exit=%d)", ret);
+            Logger::error(buf);
+            break;
+        }
+        double sec = std::chrono::duration<double>(end - start).count();
+        py_total_sec += sec;
+
+        std::vector<int> tokens;
+        std::ifstream tf(token_file);
+        int tid;
+        while (tf >> tid) tokens.push_back(tid);
+        py_total_tokens += tokens.size();
+        py_token_counts.push_back((int)tokens.size());
+    }
+
+    if (!py_token_counts.empty()) {
+        double py_avg_sec = py_total_sec / NUM_PY_RUNS;
+        double py_avg_tokens = (double)py_total_tokens / NUM_PY_RUNS;
+        double py_mb_per_sec = (double)text_bytes / py_avg_sec / (1024.0 * 1024.0);
+        double py_mtok_per_sec = py_avg_tokens / py_avg_sec / 1e6;
+
+        {
+            char buf[256];
+            snprintf(buf, sizeof(buf), "  Runs:       %d (avg of %d)", NUM_PY_RUNS, NUM_PY_RUNS);
+            Logger::info(buf);
+        }
+        {
+            char buf[128];
+            snprintf(buf, sizeof(buf), "  Time:       %.4fs avg", py_avg_sec);
+            Logger::info(buf);
+        }
+        {
+            char buf[128];
+            snprintf(buf, sizeof(buf), "  Throughput: %.2f MB/s (%.4f GB/s)",
+                     py_mb_per_sec, py_mb_per_sec / 1024.0);
+            Logger::info(buf);
+        }
+        {
+            char buf[128];
+            snprintf(buf, sizeof(buf), "  Tokens:     %.0f avg (%.2f Mtok/s)",
+                     py_avg_tokens, py_mtok_per_sec);
+            Logger::info(buf);
+        }
+
+        // ── Comparison ──────────────────────────────────────
+        Logger::info("");
+        Logger::info("═══════════════════════════════════════════");
+        Logger::info("   Comparison");
+        Logger::info("");
+
+        if (gt_has_data && gt_token_counts.size() > 0) {
+            double speedup = py_avg_sec / gt_avg_sec;
+            {
+                char buf[128];
+                snprintf(buf, sizeof(buf), "   Speedup:        %.1fx", speedup);
+                Logger::info(buf);
+            }
+
+            // Token count validation
+            int gt_n = gt_token_counts[0];
+            int py_n = py_token_counts[0];
+            if (gt_n == py_n) {
+                char buf[128];
+                snprintf(buf, sizeof(buf), "   Token match:    Both = %d", gt_n);
+                Logger::info(buf);
+            } else {
+                double pct = 100.0 * std::abs(gt_n - py_n) / std::max(gt_n, py_n);
+                char buf[128];
+                snprintf(buf, sizeof(buf), "   Token match:    Giga=%d vs Py=%d  (diff %.2f%%)",
+                         gt_n, py_n, pct);
+                Logger::info(buf);
+            }
+        }
+
+        Logger::info("");
+        if (gt_has_data) {
+            char buf[128];
+            snprintf(buf, sizeof(buf), "   GigaToken:      %.1f MB/s  (%.1f Mtok/s)",
+                     gt_mb_per_sec, gt_mtok_per_sec);
+            Logger::info(buf);
+        }
+        {
+            char buf[128];
+            snprintf(buf, sizeof(buf), "   Legacy (Py):    %.1f MB/s  (%.1f Mtok/s)",
+                     py_mb_per_sec, py_mtok_per_sec);
+            Logger::info(buf);
+        }
+        Logger::info("═══════════════════════════════════════════");
+    }
+
+    return 0;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // USAGE
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -776,6 +1119,7 @@ void print_usage(const char* prog) {
     Logger::error("  {} chat --model <m> [--prompt p]   CLI chat", prog);
     Logger::error("  {} mote-build <input> <output> --experts K --topk k  Convert dense → MoTE", prog);
     Logger::error("  {} mote-list <path>                List MoTE layers", prog);
+    Logger::error(("  " + std::string(prog) + " bench tokenizer <model> [--text \"...\"]  Benchmark tokenizer").c_str());
     Logger::error("");
     Logger::error("Environment:");
     Logger::error("  TERLLAMA_MODEL_DIR   model file directory");
