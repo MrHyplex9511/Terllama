@@ -75,16 +75,23 @@ pub fn check_python_version(python: &PathBuf) -> Result<(u32, u32), String> {
 
 /// Get the directory where conversion scripts are bundled
 pub fn get_scripts_dir(app_handle: &tauri::AppHandle) -> Result<PathBuf, String> {
-    // In development, scripts are in src-tauri/resources/scripts/
-    // In production, they're bundled in the AppImage/deb resources
+    // In production, scripts are bundled in the AppImage/deb/rpm resources.
+    // Tauri v2 places bundled resources under <resource_dir>/resources/scripts
+    // (verified in .deb layout: /usr/lib/Terllama/resources/scripts/*.py).
     let resource_dir = app_handle
         .path()
         .resource_dir()
         .map_err(|e| format!("Failed to get resource dir: {}", e))?;
 
-    let scripts_dir = resource_dir.join("scripts");
-    if scripts_dir.exists() {
-        return Ok(scripts_dir);
+    // Try the Tauri v2 bundle layout first, then the older direct layout.
+    let bundled_paths = [
+        resource_dir.join("resources").join("scripts"),
+        resource_dir.join("scripts"),
+    ];
+    for scripts_dir in bundled_paths {
+        if scripts_dir.exists() {
+            return Ok(scripts_dir);
+        }
     }
 
     // Fallback: try the repo scripts directory (development)

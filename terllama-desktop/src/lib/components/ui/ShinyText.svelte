@@ -9,35 +9,18 @@
   } = $props();
 </script>
 
-{#if disabled}
-  <span class={className}>{text}</span>
-{:else}
-  <span
-    class={className}
-    style="--shimmer-color: {shimmerColor}; --base-color: {baseColor}; --speed: {speed}s;"
-  >{text}</span>
-{/if}
+<!--
+  Intentionally rendered as solid colored text (no background-clip: text + 
+  -webkit-text-fill-color: transparent trick). That technique renders the
+  text fully invisible in the WebKitGTK webview used by Tauri on Linux
+  (model names in the library were reported missing). Solid color keeps the
+  text visible on every platform. Props are kept for API compatibility.
+-->
+<span class={className} style="--base-color: {baseColor};">{text}</span>
 
 <style>
   span {
     display: inline-block;
-    background: linear-gradient(
-      90deg,
-      var(--base-color) 0%,
-      var(--base-color) 40%,
-      var(--shimmer-color) 50%,
-      var(--base-color) 60%,
-      var(--base-color) 100%
-    );
-    background-size: 200% 100%;
-    background-clip: text;
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
-    animation: shimmer var(--speed) linear infinite;
-  }
-
-  @keyframes shimmer {
-    0% { background-position: 200% 0; }
-    100% { background-position: -200% 0; }
+    color: var(--base-color);
   }
 </style>
