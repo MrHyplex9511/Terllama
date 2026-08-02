@@ -2,49 +2,77 @@ name: Desktop Release
 on:
   push:
     tags: ['desktop-v*']
+
+permissions:
+  contents: write
+
 jobs:
   build:
     strategy:
       matrix:
         include:
           - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            ext: AppImage
+            artifact: linux-x86_64
           - os: macos-latest
-            target: x86_64-apple-darwin
-            ext: dmg
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            ext: dmg
+            artifact: macos-x86_64
           - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            ext: msi
+            artifact: windows-x86_64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
+
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
+          cache: npm
+          cache-dependency-path: terllama-desktop/package-lock.json
+
       - uses: dtolnay/rust-toolchain@stable
+
       - name: Install deps (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libxdo-dev \
+            libssl-dev \
+            rpm
+
       - name: Build
         run: |
           cd terllama-desktop
-          pnpm install
-          pnpm tauri build
+          npm ci
+          npm run tauri build
+
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: terllama-desktop-${{ matrix.target }}
-          path: terllama-desktop/src-tauri/target/release/bundle/*
+          name: terllama-desktop-${{ matrix.artifact }}
+          if-no-files-found: error
+          path: |
+            terllama-desktop/src-tauri/target/release/bundle/**/*.deb
+            terllama-desktop/src-tauri/target/release/bundle/**/*.rpm
+            terllama-desktop/src-tauri/target/release/bundle/**/*.AppImage
+            terllama-desktop/src-tauri/target/release/bundle/**/*.msi
+            terllama-desktop/src-tauri/target/release/bundle/**/*.exe
+            terllama-desktop/src-tauri/target/release/bundle/**/*.dmg
+
   publish:
     needs: [build]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
       - uses: softprops/action-gh-release@v2
         with:
-          files: terllama-desktop/**/bundle/**
+          files: artifacts/**/*
           generate_release_notes: true
