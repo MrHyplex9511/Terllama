@@ -2,7 +2,7 @@
   import { onMount } from 'svelte';
   import { animate, createTimeline, stagger, createDrawable, createSpring } from 'animejs';
 
-  let { onEnter }: { onEnter?: () => void } = $props();
+  let { onEnter }: { onEnter?: (target: string) => void } = $props();
 
   // ── Refs ─────────────────────────────────────────────────────────────
   let root: HTMLElement | undefined = $state();
@@ -75,6 +75,12 @@
   }
 
   onMount(() => {
+    // ── Keyboard: Enter continues (matches the hint) ──────────────────
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Enter') handleEnter('/library');
+    };
+    window.addEventListener('keydown', onKey);
+
     // ── Ambient orbs: slow drifting glow ─────────────────────────────
     animate(orbA!, {
       x: ['-8%', '8%', '-8%'],
@@ -185,6 +191,8 @@
         animate(btn, { scale: 1, translateY: 0, ease: springY, duration: 300 });
       });
     });
+
+    return () => window.removeEventListener('keydown', onKey);
   });
 
 </script>

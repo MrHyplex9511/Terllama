@@ -16,7 +16,14 @@
   const models = getModelsState();
   const chat = getChatState();
 
+  let { initialRoute = 'library' }: { initialRoute?: string } = $props();
   let currentRoute = $state('library');
+
+  // Sync the initial route when the welcome screen passes a target
+  // (prop is set after Layout mounts, so it must be reactive, not captured).
+  $effect(() => {
+    if (initialRoute) currentRoute = initialRoute;
+  });
   let showOnboarding = $state(false);
   let updateInfo = $state<{ latest: string; current: string; url: string } | null>(null);
 

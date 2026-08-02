@@ -4,11 +4,13 @@
 
   let entered = $state(false);
   let fadeApp = $state(false);
+  let initialRoute = $state('library');
 </script>
 
 {#if !entered}
   <Welcome
-    onEnter={() => {
+    onEnter={(target) => {
+      initialRoute = (target ?? 'library').replace(/^\//, '');
       fadeApp = true;
       // wait for the fade-in before showing layout
       setTimeout(() => {
@@ -19,7 +21,7 @@
 {/if}
 
 <div class="app-shell" class:show={entered && fadeApp}>
-  <Layout />
+  <Layout initialRoute={initialRoute} />
 </div>
 
 <style>
