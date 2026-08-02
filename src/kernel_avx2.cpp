@@ -8,7 +8,9 @@
  *   ternary_mul_avx2_i2s()   I2_S direct path + INT8 quant + activation-parallel tiling
  */
 #include "kernel_decl.h"
+#if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
+#endif
 #include <cmath>
 #include <algorithm>
 #include <cstring>
@@ -17,6 +19,7 @@
 // ═══════════════════════════════════════════════════════════════════════════
 // BITPLANE KERNEL - bitplane combined[] format (backward compat)
 // ═══════════════════════════════════════════════════════════════════════════
+#if defined(__x86_64__) || defined(_M_X64)
 void ternary_mul_avx2(const uint32_t* const* term_data, const int* alpha_exps,
                       int n_active, int out_f, int in_f,
                       const float* input, float* output) {
@@ -120,6 +123,7 @@ void ternary_mul_avx2(const uint32_t* const* term_data, const int* alpha_exps,
         output[i] = result;
     }
 }
+#endif // __x86_64__ || _M_X64
 
 // ═══════════════════════════════════════════════════════════════════════════
 // INT8 ACTIVATION QUANTIZATION
