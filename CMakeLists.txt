@@ -113,8 +113,9 @@ target_link_libraries(terllama_core PRIVATE
     dl
 )
 if(OpenMP_CXX_FOUND)
+    # OpenMP::OpenMP_CXX already carries the correct per-compiler flags
+    # (-fopenmp for GCC/Clang, -Xclang -fopenmp for AppleClang).
     target_link_libraries(terllama_core PRIVATE OpenMP::OpenMP_CXX)
-    target_compile_options(terllama_core PRIVATE -fopenmp)
 endif()
 if(CURL_FOUND)
     target_link_libraries(terllama_core PRIVATE CURL::libcurl)
