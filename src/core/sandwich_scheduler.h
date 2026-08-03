@@ -20,7 +20,9 @@
 #include <cstdlib>
 #include <sched.h>
 #include <unistd.h>
+#ifdef _OPENMP
 #include <omp.h>
+#endif
 #include "core/logger.h"
 
 // ─── Phase enum ────────────────────────────────────────────────────────
@@ -93,16 +95,21 @@ public:
 
     // ─── Pin calling thread to a specific core ──────────────────────────
     static void pin_self(int core_id) {
+#ifdef __linux__
         cpu_set_t cset;
         CPU_ZERO(&cset);
         CPU_SET(core_id, &cset);
         if (sched_setaffinity(0, sizeof(cset), &cset) != 0) {
             Logger::warn("Failed to pin thread to core %d", core_id);
         }
+#else
+        (void)core_id;  // thread pinning is Linux-only
+#endif
     }
 
     // ─── Pin worker threads across cores ────────────────────────────────
     static void pin_worker_threads(int n_threads, int start, int stride) {
+#ifdef _OPENMP
         #pragma omp parallel
         {
             int tid = omp_get_thread_num();
@@ -111,6 +118,9 @@ public:
                 pin_self(core);
             }
         }
+#else
+        (void)n_threads; (void)start; (void)stride;
+#endif
     }
 
     // ─── Setters ────────────────────────────────────────────────────────

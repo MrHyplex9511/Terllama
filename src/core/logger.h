@@ -72,68 +72,65 @@ private:
         return fmt && std::string(fmt).find("{}") != std::string::npos;
     }
 
+    // True if all args are safe to pass through printf-style varargs
+    // (arithmetic, pointers, enums). std::string etc. are NOT — they must
+    // go through fmt_str instead (Clang errors on non-trivial varargs).
+    template<typename... Args>
+    static inline constexpr bool varargs_safe =
+        ((std::is_arithmetic_v<Args> || std::is_pointer_v<Args> ||
+          std::is_enum_v<Args>) && ...);
+
+    // Emit one log line. Chooses fmt-style substitution when the format has
+    // {} placeholders; otherwise falls back to printf only when it is safe
+    // to do so at compile time (all args are varargs-safe types).
+    template<typename... Args>
+    static inline void emit(const char* prefix, const char* fmt, Args... args) {
+        if (has_placeholder(fmt)) {
+            fputs(prefix, stderr);
+            fputs(fmt_str(fmt, args...).c_str(), stderr);
+            fputc('\n', stderr);
+        } else if constexpr (varargs_safe<Args...>) {
+            fputs(prefix, stderr);
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-security"
+            fprintf(stderr, fmt, args...);
+#pragma GCC diagnostic pop
+            fputc('\n', stderr);
+        } else {
+            // Non-trivial args but no {} placeholders — avoid printf varargs
+            // entirely; stringify args and append them.
+            fputs(prefix, stderr);
+            fputs(fmt_str(fmt, args...).c_str(), stderr);
+            fputc('\n', stderr);
+        }
+    }
+
 public:
     template<typename... Args>
     static void debug(const char* fmt, Args... args) {
         if (DEBUG < level) return;
         std::lock_guard<std::mutex> lock(mutex);
-        fprintf(stderr, "[DEBUG] ");
-        if (has_placeholder(fmt)) {
-            fputs(fmt_str(fmt, args...).c_str(), stderr);
-        } else {
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wformat-security"
-            fprintf(stderr, fmt, args...);
-#pragma GCC diagnostic pop
-        }
-        fprintf(stderr, "\n");
+        emit("[DEBUG] ", fmt, args...);
     }
 
     template<typename... Args>
     static void info(const char* fmt, Args... args) {
         if (INFO < level) return;
         std::lock_guard<std::mutex> lock(mutex);
-        fprintf(stderr, "[INFO]  ");
-        if (has_placeholder(fmt)) {
-            fputs(fmt_str(fmt, args...).c_str(), stderr);
-        } else {
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wformat-security"
-            fprintf(stderr, fmt, args...);
-#pragma GCC diagnostic pop
-        }
-        fprintf(stderr, "\n");
+        emit("[INFO]  ", fmt, args...);
     }
 
     template<typename... Args>
     static void warn(const char* fmt, Args... args) {
         if (WARN < level) return;
         std::lock_guard<std::mutex> lock(mutex);
-        fprintf(stderr, "[WARN]  ");
-        if (has_placeholder(fmt)) {
-            fputs(fmt_str(fmt, args...).c_str(), stderr);
-        } else {
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wformat-security"
-            fprintf(stderr, fmt, args...);
-#pragma GCC diagnostic pop
-        }
-        fprintf(stderr, "\n");
+        emit("[WARN]  ", fmt, args...);
     }
 
     template<typename... Args>
     static void error(const char* fmt, Args... args) {
         if (ERROR < level) return;
         std::lock_guard<std::mutex> lock(mutex);
-        fprintf(stderr, "[ERROR] ");
-        if (has_placeholder(fmt)) {
-            fputs(fmt_str(fmt, args...).c_str(), stderr);
-        } else {
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wformat-security"
-            fprintf(stderr, fmt, args...);
-#pragma GCC diagnostic pop
-        }
-        fprintf(stderr, "\n");
+        emit("[ERROR] ", fmt, args...);
     }
 };

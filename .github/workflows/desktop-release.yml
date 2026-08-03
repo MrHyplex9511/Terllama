@@ -61,6 +61,9 @@ jobs:
       - name: Build engine (macOS)
         if: runner.os == 'macOS'
         run: |
+          # libomp is keg-only: point CMake at it so OpenMP is enabled.
+          export CPPFLAGS="-I$(brew --prefix libomp)/include"
+          export LDFLAGS="-L$(brew --prefix libomp)/lib"
           cmake -B build-release -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_BENCHMARK=OFF -DBUILD_TESTING=OFF
           cmake --build build-release -j2 --target terllama
