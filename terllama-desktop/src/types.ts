@@ -6,20 +6,26 @@ export interface RegistryModel {
   description: string;
   context: number;
   size_mb: number;
-  quants: QuantOptions;
+  formats: Formats;
 }
 
-export interface QuantOptions {
-  ternary: QuantInfo;
-  q4_k_m: QuantInfo;
-  q8_0: QuantInfo;
+export interface Formats {
+  fp: FormatInfo;
+  q4: FormatInfo;
+  ternary: FormatInfo;
 }
 
-export interface QuantInfo {
+export interface FormatInfo {
   available: boolean;
   size_mb: number;
   filename: string;
+  files: string[];
+  hf_repo: string;
+  needs_conversion: boolean;
+  note: string;
 }
+
+export type DownloadFormat = 'fp' | 'q4' | 'ternary';
 
 export interface DownloadedModel {
   id: string;

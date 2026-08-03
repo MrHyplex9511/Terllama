@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { RegistryModel } from '../../types';
+  import type { RegistryModel, DownloadFormat } from '../../types';
   import ShinyText from './ui/ShinyText.svelte';
 
   let {
@@ -10,7 +10,7 @@
   }: {
     model: RegistryModel;
     isDownloaded?: boolean;
-    onDownload?: (modelId: string, quant: string) => void;
+    onDownload?: (modelId: string, format: DownloadFormat) => void;
     onLoad?: (modelId: string) => void;
   } = $props();
 
@@ -22,7 +22,6 @@
   function handleDownload() {
     onDownload?.(model.id, 'ternary');
   }
-
   function handleLoad() {
     onLoad?.(model.id);
   }

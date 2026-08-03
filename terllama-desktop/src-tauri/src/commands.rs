@@ -53,10 +53,11 @@ fn parse_progress_pct(line: &str) -> Option<u64> {
 }
 
 #[tauri::command]
+/// Download a model in one of three formats: "fp", "q4", or "ternary".
 pub async fn download_model(
     app: tauri::AppHandle,
     model_id: String,
-    quant: String,
+    format: String,
 ) -> Result<(), String> {
     // Determine HF repo from registry
     let registry = download::fetch_registry().await?;
@@ -69,9 +70,59 @@ pub async fn download_model(
     let out_dir = download::get_models_dir().join(&model_id);
     std::fs::create_dir_all(&out_dir).map_err(|e| format!("Failed to create dir: {}", e))?;
 
-    // For GGUF-format models: download raw GGUF file directly from HF (no Python conversion)
-    if model.format == "gguf" || quant != "ternary" {
-        return download_gguf_direct(&app, &model, &quant, &out_dir).await;
+    match format.as_str() {
+        // Original weights (safetensors) — direct multi-file download.
+        "fp" => {
+            let info = &model.formats.fp;
+            if !info.available {
+                return Err(format!("FP download unavailable: {}", info.note));
+            }
+            return download_files_direct(
+                &app,
+                &model.id,
+                if info.hf_repo.is_empty() { &model.hf_repo } else { &info.hf_repo },
+                if info.files.is_empty() { vec![info.filename.clone()] } else { info.files.clone() },
+                info.size_mb,
+                &out_dir,
+            ).await;
+        }
+        // GGUF Q4_K_M — direct single-file download.
+        "q4" => {
+            let info = &model.formats.q4;
+            if !info.available {
+                return Err(format!("Q4 download unavailable: {}", info.note));
+            }
+            let repo = if info.hf_repo.is_empty() { &model.hf_repo } else { &info.hf_repo };
+            return download_files_direct(
+                &app,
+                &model.id,
+                repo,
+                vec![info.filename.clone()],
+                info.size_mb,
+                &out_dir,
+            ).await;
+        }
+        // Ternary — convert locally from FP weights unless pre-made weights exist.
+        "ternary" => {
+            let info = &model.formats.ternary;
+            if !info.available {
+                return Err(format!("Ternary unavailable: {}", info.note));
+            }
+            if !info.needs_conversion {
+                // Pre-made ternary weights: direct download.
+                let repo = if info.hf_repo.is_empty() { &model.hf_repo } else { &info.hf_repo };
+                return download_files_direct(
+                    &app,
+                    &model.id,
+                    repo,
+                    vec![info.filename.clone()],
+                    info.size_mb,
+                    &out_dir,
+                ).await;
+            }
+            // Conversion path (fall through to the python export flow below).
+        }
+        _ => return Err(format!("Unknown download format: {}", format)),
     }
 
     // Ternary format (als/i2s): run C++ binary with Python export script
@@ -229,118 +280,154 @@ pub async fn download_model(
     }
 }
 
-/// Download a GGUF file directly from HuggingFace (no Python conversion needed)
-async fn download_gguf_direct(
+/// Download one or more files directly from HuggingFace (no Python conversion).
+/// Emits `download-progress` events per file. `total_size_mb` is a fallback for
+/// progress when the server doesn't send a Content-Length.
+async fn download_files_direct(
     app: &tauri::AppHandle,
-    model: &download::RegistryModel,
-    quant: &str,
+    model_id: &str,
+    hf_repo: &str,
+    filenames: Vec<String>,
+    total_size_mb: u64,
     out_dir: &std::path::Path,
 ) -> Result<(), String> {
-    // Determine filename from quant option
-    let info = match quant {
-        "q4_k_m" => &model.quants.q4_k_m,
-        "q8_0" => &model.quants.q8_0,
-        _ => &model.quants.ternary,  // ternary on a GGUF model = Q2_0 GGUF
-    };
-
-    let filename = &info.filename;
-    let total_size = info.size_mb * 1024 * 1024;
-
-    // Construct HF download URL
-    let url = format!(
-        "https://huggingface.co/{}/resolve/main/{}",
-        model.hf_repo, filename
-    );
-
-    let _ = app.emit("download-progress", download::DownloadProgressEvent {
-        model_id: model.id.clone(),
-        file: filename.clone(),
-        downloaded: 0,
-        total: total_size,
-        speed: 0.0,
-    });
-
+    let fallback_total = total_size_mb * 1024 * 1024;
     let client = reqwest::Client::builder()
         .user_agent("Terllama-Desktop/1.0.0")
         .build()
         .map_err(|e| format!("Failed to create client: {}", e))?;
 
-    let resp = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| format!("Failed to download {}: {}", url, e))?;
-
-    if !resp.status().is_success() {
-        return Err(format!(
-            "HTTP {} — file not found at {}",
-            resp.status(),
-            url
-        ));
-    }
-
-    let total = resp.content_length().unwrap_or(total_size as u64);
-    let file_path = out_dir.join(filename);
-
-    let mut file = tokio::fs::File::create(&file_path)
-        .await
-        .map_err(|e| format!("Failed to create file: {}", e))?;
-
-    let mut stream = resp.bytes_stream();
-    let mut downloaded: u64 = 0;
-    let start = std::time::Instant::now();
-
-    use futures_util::StreamExt;
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| format!("Download error: {}", e))?;
-        downloaded += chunk.len() as u64;
-
-        tokio::io::AsyncWriteExt::write_all(&mut file, &chunk)
-            .await
-            .map_err(|e| format!("Write error: {}", e))?;
-
-        let elapsed = start.elapsed().as_secs_f64();
-        let speed = if elapsed > 0.0 { downloaded as f64 / elapsed } else { 0.0 };
-
-        let pct = if total > 0 {
-            (downloaded as f64 / total as f64 * 100.0) as u64
-        } else {
-            0
-        };
+    for filename in &filenames {
+        let url = format!(
+            "https://huggingface.co/{}/resolve/main/{}",
+            hf_repo, filename
+        );
 
         let _ = app.emit("download-progress", download::DownloadProgressEvent {
-            model_id: model.id.clone(),
+            model_id: model_id.to_string(),
             file: filename.clone(),
-            downloaded: pct.min(99),
-            total: total_size,
-            speed,
+            downloaded: 0,
+            total: fallback_total,
+            speed: 0.0,
+        });
+
+        let resp = client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| format!("Failed to download {}: {}", url, e))?;
+
+        if !resp.status().is_success() {
+            return Err(format!(
+                "HTTP {} — file not found at {}",
+                resp.status(),
+                url
+            ));
+        }
+
+        let total = resp.content_length().unwrap_or(fallback_total);
+        let file_path = out_dir.join(filename);
+
+        let mut file = tokio::fs::File::create(&file_path)
+            .await
+            .map_err(|e| format!("Failed to create file: {}", e))?;
+
+        let mut stream = resp.bytes_stream();
+        let mut downloaded: u64 = 0;
+        let start = std::time::Instant::now();
+
+        use futures_util::StreamExt;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| format!("Download error: {}", e))?;
+            downloaded += chunk.len() as u64;
+
+            tokio::io::AsyncWriteExt::write_all(&mut file, &chunk)
+                .await
+                .map_err(|e| format!("Write error: {}", e))?;
+
+            let elapsed = start.elapsed().as_secs_f64();
+            let speed = if elapsed > 0.0 { downloaded as f64 / elapsed } else { 0.0 };
+
+            let pct = if total > 0 {
+                (downloaded as f64 / total as f64 * 100.0) as u64
+            } else {
+                0
+            };
+
+            let _ = app.emit("download-progress", download::DownloadProgressEvent {
+                model_id: model_id.to_string(),
+                file: filename.clone(),
+                downloaded: pct.min(99),
+                total: fallback_total,
+                speed,
+            });
+        }
+
+        let _ = app.emit("download-progress", download::DownloadProgressEvent {
+            model_id: model_id.to_string(),
+            file: filename.clone(),
+            downloaded: 100,
+            total: fallback_total,
+            speed: 0.0,
         });
     }
-
-    let _ = app.emit("download-progress", download::DownloadProgressEvent {
-        model_id: model.id.clone(),
-        file: filename.clone(),
-        downloaded: 100,
-        total: total_size,
-        speed: 0.0,
-    });
 
     Ok(())
 }
 
 #[tauri::command]
 pub async fn list_downloaded_models() -> Result<Vec<download::DownloadedModel>, String> {
-    download::list_downloaded_models()
+    let mut models = download::list_downloaded_models()?;
+
+    // Map legacy slug-named dirs (e.g. "HuggingFaceTB-SmolLM2-135M" from the old
+    // "/" → "-" naming) back to their registry id so they show as installed.
+    if let Ok(registry) = download::fetch_registry().await {
+        let mut slug_to_id: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for m in &registry.models {
+            slug_to_id.insert(m.hf_repo.replace('/', "-"), m.id.clone());
+            slug_to_id.insert(m.id.clone(), m.id.clone());
+        }
+        for model in models.iter_mut() {
+            if let Some(real_id) = slug_to_id.get(&model.id) {
+                model.id = real_id.clone();
+            }
+        }
+    }
+
+    // De-duplicate: if both a slug dir and a proper dir exist, prefer the proper dir.
+    let mut seen: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    models.retain(|m| {
+        if seen.contains_key(&m.id) {
+            return false;
+        }
+        seen.insert(m.id.clone(), true);
+        true
+    });
+
+    Ok(models)
 }
 
 #[tauri::command]
 pub async fn delete_model(model_id: String) -> Result<(), String> {
-    let path = download::get_models_dir().join(&model_id);
+    let models_dir = download::get_models_dir();
+    let path = models_dir.join(&model_id);
     if path.exists() {
-        std::fs::remove_dir_all(&path).map_err(|e| format!("Failed to delete: {}", e))
-    } else {
-        Err(format!("Model {} not found", model_id))
+        return std::fs::remove_dir_all(&path).map_err(|e| format!("Failed to delete: {}", e));
     }
+    // Legacy slug-named dir (e.g. "HuggingFaceTB-SmolLM2-135M") — find it via registry.
+    if let Ok(registry) = download::fetch_registry().await {
+        for m in &registry.models {
+            if m.id == model_id {
+                let slug_path = models_dir.join(m.hf_repo.replace('/', "-"));
+                if slug_path.exists() {
+                    return std::fs::remove_dir_all(&slug_path)
+                        .map_err(|e| format!("Failed to delete: {}", e));
+                }
+            }
+        }
+    }
+    Err(format!("Model {} not found", model_id))
 }
 
 #[tauri::command]

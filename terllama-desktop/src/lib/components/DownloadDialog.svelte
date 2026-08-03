@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { RegistryModel, DownloadProgress } from '../../types';
+  import type { RegistryModel, DownloadProgress, DownloadFormat } from '../../types';
   import { invoke } from '@tauri-apps/api/core';
   import { listen } from '@tauri-apps/api/event';
 
@@ -15,7 +15,8 @@
     onLoad?: (modelId: string) => void;
   } = $props();
 
-  let selectedQuant = $state('ternary');
+  let selectedFormat = $state<DownloadFormat>('ternary');
+  let showConvertConfirm = $state(false);
   let isDownloading = $state(false);
   let progress = $state<DownloadProgress | null>(null);
   let completed = $state(false);
@@ -46,14 +47,33 @@
     return mb + ' MB';
   }
 
+  // Rough RAM / time estimate for FP32 → ternary conversion.
+  // Based on the FP source size: conversion needs ~2.5x the model in RAM
+  // (torch + weights + workspace) and runs at ~1 GB / 5 min on a typical CPU.
+  function convertWarnings() {
+    if (!model) return { ram: '', time: '' };
+    const fpMb = model.formats?.fp?.size_mb || model.size_mb;
+    const ramGb = Math.ceil((fpMb * 2.5) / 1024);
+    const timeMin = Math.max(2, Math.ceil((fpMb / 1024) * 5));
+    return {
+      ram: `${ramGb}+ GB free RAM`,
+      time: timeMin >= 60 ? `~${(timeMin / 60).toFixed(1)} hours` : `~${timeMin} minutes`,
+    };
+  }
+
   async function handleDownload() {
     if (!model) return;
+    if (selectedFormat === 'ternary' && model.formats.ternary.needs_conversion && !showConvertConfirm) {
+      showConvertConfirm = true;
+      return;
+    }
+    showConvertConfirm = false;
     isDownloading = true;
     completed = false;
     progress = null;
     errorMessage = null;
     try {
-      await invoke('download_model', { modelId: model.id, quant: selectedQuant });
+      await invoke('download_model', { modelId: model.id, format: selectedFormat });
     } catch (e) {
       errorMessage = typeof e === 'string' ? e : e?.message || 'Download failed — check console for details';
       console.error('Download failed:', e);
@@ -67,6 +87,7 @@
     progress = null;
     isDownloading = false;
     errorMessage = null;
+    showConvertConfirm = false;
     onClose?.();
   }
 
@@ -99,56 +120,89 @@
 
       <p class="desc">{model.description}</p>
 
-      <!-- Quant selector -->
+      <!-- Format selector -->
       <div class="quant-section">
-        <span class="section-label">Select Quantization</span>
+        <span class="section-label">Select Format</span>
         <div class="quant-grid">
           <button
             class="quant-card"
-            class:selected={selectedQuant === 'ternary'}
-            onclick={() => (selectedQuant = 'ternary')}
+            class:selected={selectedFormat === 'fp'}
+            disabled={!model.formats.fp.available}
+            onclick={() => { selectedFormat = 'fp'; showConvertConfirm = false; }}
+          >
+            <div class="quant-name">Normal FP</div>
+            <div class="quant-info">
+              <span>Size: {formatSize(model.formats.fp.size_mb)}</span>
+              <span>Original weights</span>
+            </div>
+            {#if !model.formats.fp.available}
+              <div class="quant-badge coming-soon">Unavailable</div>
+            {/if}
+          </button>
+
+          <button
+            class="quant-card"
+            class:selected={selectedFormat === 'q4'}
+            disabled={!model.formats.q4.available}
+            onclick={() => { selectedFormat = 'q4'; showConvertConfirm = false; }}
+          >
+            <div class="quant-name">Q4 (GGUF Q4_K_M)</div>
+            <div class="quant-info">
+              <span>Size: {formatSize(model.formats.q4.size_mb)}</span>
+              <span>4-bit quantized</span>
+            </div>
+            {#if !model.formats.q4.available}
+              <div class="quant-badge coming-soon">Unavailable</div>
+            {/if}
+          </button>
+
+          <button
+            class="quant-card"
+            class:selected={selectedFormat === 'ternary'}
+            disabled={!model.formats.ternary.available}
+            onclick={() => { selectedFormat = 'ternary'; showConvertConfirm = false; }}
           >
             <div class="quant-name">Ternary (1.58-bit)</div>
             <div class="quant-info">
-              <span>Size: {formatSize(model.quants.ternary.size_mb)}</span>
-              <span>Fast CPU inference</span>
+              <span>Size: {formatSize(model.formats.ternary.size_mb)}</span>
+              <span>{model.formats.ternary.needs_conversion ? 'Convert from FP' : 'Pre-made weights'}</span>
             </div>
-            <div class="quant-badge ternary">Recommended</div>
-          </button>
-
-          <button
-            class="quant-card"
-            class:selected={selectedQuant === 'q4_k_m'}
-            disabled={!model.quants.q4_k_m.available}
-            onclick={() => (selectedQuant = 'q4_k_m')}
-          >
-            <div class="quant-name">GGUF Q4_K_M</div>
-            <div class="quant-info">
-              <span>Size: {formatSize(model.quants.q4_k_m.size_mb)}</span>
-              <span>Balanced quality</span>
-            </div>
-            {#if !model.quants.q4_k_m.available}
-              <div class="quant-badge coming-soon">Coming Soon</div>
-            {/if}
-          </button>
-
-          <button
-            class="quant-card"
-            class:selected={selectedQuant === 'q8_0'}
-            disabled={!model.quants.q8_0.available}
-            onclick={() => (selectedQuant = 'q8_0')}
-          >
-            <div class="quant-name">GGUF Q8_0</div>
-            <div class="quant-info">
-              <span>Size: {formatSize(model.quants.q8_0.size_mb)}</span>
-              <span>High quality</span>
-            </div>
-            {#if !model.quants.q8_0.available}
-              <div class="quant-badge coming-soon">Coming Soon</div>
+            {#if model.formats.ternary.needs_conversion}
+              <div class="quant-badge ternary">Convert</div>
+            {:else}
+              <div class="quant-badge ternary">Recommended</div>
             {/if}
           </button>
         </div>
+
+        {#if selectedFormat && model.formats[selectedFormat].note}
+          <p class="format-note">{model.formats[selectedFormat].note}</p>
+        {/if}
       </div>
+
+      <!-- Convert warning banner (FP32 → ternary) -->
+      {#if selectedFormat === 'ternary' && model.formats.ternary.needs_conversion && !isDownloading && !completed}
+        <div class="convert-warning">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" />
+            <line x1="12" y1="9" x2="12" y2="13" /><line x1="12" y1="17" x2="12.01" y2="17" />
+          </svg>
+          <div>
+            <strong>This model has no pre-made ternary weights.</strong>
+            <span>Terllama will download the FP weights and convert them locally on your CPU.</span>
+            <span class="warn-stats">Estimated: {convertWarnings().ram} RAM &middot; {convertWarnings().time} conversion time</span>
+          </div>
+        </div>
+        {#if showConvertConfirm}
+          <div class="convert-confirm">
+            <span>This will take a while and uses significant RAM. Continue?</span>
+            <div class="confirm-actions">
+              <button class="btn primary confirm-yes" onclick={handleDownload}>Yes, download &amp; convert</button>
+              <button class="btn secondary" onclick={() => (showConvertConfirm = false)}>Go back</button>
+            </div>
+          </div>
+        {/if}
+      {/if}
 
       <!-- Error message -->
       {#if errorMessage}
@@ -186,7 +240,11 @@
           </button>
         {:else}
           <button class="btn primary" onclick={handleDownload} disabled={isDownloading}>
-            {isDownloading ? 'Downloading...' : 'Download'}
+            {#if selectedFormat === 'ternary' && model.formats.ternary.needs_conversion && !showConvertConfirm}
+              {isDownloading ? 'Converting...' : 'Download & Convert'}
+            {:else}
+              {isDownloading ? 'Downloading...' : 'Download'}
+            {/if}
           </button>
         {/if}
         <button class="btn secondary" onclick={handleClose} disabled={isDownloading && !completed}>
@@ -351,6 +409,76 @@
   .quant-badge.coming-soon {
     background: hsla(var(--warning), 0.2);
     color: hsl(var(--warning));
+  }
+
+  .format-note {
+    margin: 10px 2px 0;
+    font-size: 12px;
+    color: hsl(var(--content-muted));
+    line-height: 1.5;
+  }
+
+  .convert-warning {
+    display: flex;
+    gap: 10px;
+    padding: 12px 14px;
+    margin-bottom: 14px;
+    background: hsla(38, 90%, 50%, 0.12);
+    border: 1px solid hsla(38, 90%, 50%, 0.35);
+    border-radius: var(--radius-sm);
+    color: hsl(38, 90%, 75%);
+    font-size: 12px;
+    line-height: 1.5;
+  }
+
+  .convert-warning svg {
+    flex-shrink: 0;
+    margin-top: 1px;
+  }
+
+  .convert-warning strong {
+    display: block;
+    font-size: 13px;
+    margin-bottom: 2px;
+  }
+
+  .convert-warning span {
+    display: block;
+  }
+
+  .convert-warning .warn-stats {
+    margin-top: 6px;
+    font-weight: 600;
+    color: hsl(38, 90%, 85%);
+  }
+
+  .convert-confirm {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 12px 14px;
+    margin-bottom: 14px;
+    background: hsla(0, 70%, 50%, 0.1);
+    border: 1px solid hsla(0, 70%, 50%, 0.3);
+    border-radius: var(--radius-sm);
+    color: hsl(0, 70%, 75%);
+    font-size: 13px;
+    line-height: 1.5;
+  }
+
+  .confirm-actions {
+    display: flex;
+    gap: 8px;
+  }
+
+  .confirm-actions .btn {
+    flex: 0 1 auto;
+    padding: 8px 14px;
+    font-size: 13px;
+  }
+
+  .confirm-actions .confirm-yes {
+    background: linear-gradient(135deg, hsl(0, 70%, 55%), hsl(0, 70%, 45%));
   }
 
   .error-section {
