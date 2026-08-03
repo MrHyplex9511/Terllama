@@ -15,8 +15,6 @@ jobs:
             artifact: linux-x86_64
           - os: macos-latest
             artifact: macos-x86_64
-          - os: windows-latest
-            artifact: windows-x86_64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -40,7 +38,34 @@ jobs:
             patchelf \
             libxdo-dev \
             libssl-dev \
-            rpm
+            rpm \
+            cmake \
+            libcurl4-openssl-dev
+
+      - name: Install deps (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install cmake libomp
+
+      # The C++ engine is Unix-only (Linux + macOS). Build it and place it
+      # where the Tauri bundle will pick it up as a resource.
+      - name: Build engine (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cmake -B build-release -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_BENCHMARK=OFF -DBUILD_TESTING=OFF
+          cmake --build build-release -j2 --target terllama
+          mkdir -p terllama-desktop/src-tauri/resources/bin
+          cp build-release/terllama terllama-desktop/src-tauri/resources/bin/terllama
+
+      - name: Build engine (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          cmake -B build-release -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_BENCHMARK=OFF -DBUILD_TESTING=OFF
+          cmake --build build-release -j2 --target terllama
+          mkdir -p terllama-desktop/src-tauri/resources/bin
+          cp build-release/terllama terllama-desktop/src-tauri/resources/bin/terllama
 
       - name: Build
         run: |

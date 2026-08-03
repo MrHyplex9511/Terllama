@@ -85,8 +85,9 @@ fn main() {
                                 let port = config::Settings::load().port;
                                 let model_id = "default".to_string();
                                 let state_clone = state.server.clone();
+                                let resource_dir = app.path().resource_dir().ok();
                                 tauri::async_runtime::spawn(async move {
-                                    let _ = state_clone.start(model_id, port).await;
+                                    let _ = state_clone.start(model_id, port, resource_dir.as_deref()).await;
                                 });
                             }
                         }
@@ -114,8 +115,9 @@ fn main() {
                     let port = settings.port;
                     let model_id = "default".to_string();
                     let state_clone = state.server.clone();
+                    let resource_dir = app.path().resource_dir().ok();
                     tauri::async_runtime::spawn(async move {
-                        let _ = state_clone.start(model_id, port).await;
+                        let _ = state_clone.start(model_id, port, resource_dir.as_deref()).await;
                     });
                 }
             }

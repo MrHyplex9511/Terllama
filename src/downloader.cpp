@@ -63,6 +63,7 @@ int downloader_main(int argc, char** argv) {
 
     std::string hf_repo;
     std::string format = "i2s";
+    std::string outdir_override;  // optional --outdir <path>
 
     for (int i = 2; i < argc; i++) {
         std::string arg = argv[i];
@@ -76,6 +77,12 @@ int downloader_main(int argc, char** argv) {
                 Logger::error("Error: unknown format '{}'", format);
                 return 1;
             }
+        } else if (arg == "--outdir" || arg == "-o") {
+            if (i + 1 >= argc) {
+                Logger::error("Error: --outdir requires an argument");
+                return 1;
+            }
+            outdir_override = argv[++i];
         } else if (hf_repo.empty()) {
             hf_repo = arg;
         } else {
@@ -111,8 +118,11 @@ int downloader_main(int argc, char** argv) {
     }
 
     std::string model_slug = slugify(hf_repo);
-    std::string out_dir = std::string(getenv("HOME") ? getenv("HOME") : "/root")
-                        + "/.terllama/models/" + model_slug;
+    std::string out_dir = outdir_override;
+    if (out_dir.empty()) {
+        out_dir = std::string(getenv("HOME") ? getenv("HOME") : "/root")
+                + "/.terllama/models/" + model_slug;
+    }
 
     Logger::info("Downloading {} from HuggingFace...", hf_repo);
     Logger::info("Converting to {} format...", format);

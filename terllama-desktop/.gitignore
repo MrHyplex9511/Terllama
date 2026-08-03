@@ -9,3 +9,4 @@ webkit2gtk-dev/
 *.deb
 *.log
 .DS_Store
+resources/bin/

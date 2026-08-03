@@ -64,8 +64,14 @@ bool init_server(const std::string& model_dir) {
     if (g_model.loaded) return true;
 
     g_model.model_dir  = model_dir;
-    // Resolve scripts/ relative to this binary (co-located in repo)
+    // Resolve scripts/ relative to this binary (co-located in repo).
+    // Prefer TERLLAMA_SCRIPT_DIR (set by desktop app) so bundled/macOS
+    // installs find the Python helpers without /proc/self/exe.
     g_model.helper_dir = []{
+        const char* env_scripts = std::getenv("TERLLAMA_SCRIPT_DIR");
+        if (env_scripts && env_scripts[0]) {
+            return std::string(env_scripts);
+        }
         char buf[PATH_MAX];
         ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf)-1);
         if (len != -1) { buf[len]='\0'; return std::string(dirname(buf))+"/scripts"; }

@@ -9,6 +9,7 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tauri::Emitter;
+use tauri::Manager;
 use tauri::State;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -74,7 +75,11 @@ pub async fn download_model(
     }
 
     // Ternary format (als/i2s): run C++ binary with Python export script
-    let binary = crate::server::find_terllama_binary()?;
+    let resource_dir = app
+        .path()
+        .resource_dir()
+        .ok();
+    let binary = crate::server::find_terllama_binary(resource_dir.as_deref())?;
 
     // Resolve scripts directory (Tauri resource dir for bundled, or dev path)
     let scripts_dir = match crate::convert::get_scripts_dir(&app) {
@@ -91,6 +96,8 @@ pub async fn download_model(
         .arg(&model.hf_repo)
         .arg("--fmt")
         .arg(&model.format)
+        .arg("--outdir")
+        .arg(&out_dir)
         .env("TERLLAMA_SCRIPT_DIR", scripts_dir.to_string_lossy().to_string())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -338,11 +345,13 @@ pub async fn delete_model(model_id: String) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn start_server(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     model_id: String,
     port: u16,
 ) -> Result<(), String> {
-    state.server.start(model_id, port).await
+    let resource_dir = app.path().resource_dir().ok();
+    state.server.start(model_id, port, resource_dir.as_deref()).await
 }
 
 #[tauri::command]
