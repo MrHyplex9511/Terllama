@@ -46,6 +46,8 @@ docs/*.html
 build-asan/
 build-ci/
 build-release/
+build-clang/
+build-noomp/
 libgigatoken_rs.so
 third_party/gigatoken/
 .test-tmp/
