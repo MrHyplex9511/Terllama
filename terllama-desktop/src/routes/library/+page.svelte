@@ -9,6 +9,7 @@
 
   const models = getModelsState();
 
+  let tab = $state<'browse' | 'installed'>('browse');
   let selectedModel = $state<RegistryModel | null>(null);
   let showDialog = $state(false);
   let error = $state<string | null>(null);
@@ -20,16 +21,27 @@
   async function loadData() {
     models.setLoading(true);
     error = null;
-    try {
-      const reg = await invoke<{ models: RegistryModel[] }>('fetch_registry');
-      models.setRegistry(reg.models);
-      const downloaded = await invoke<DownloadedModel[]>('list_downloaded_models');
-      models.setDownloadedModels(downloaded);
-    } catch (e) {
-      error = String(e);
-    } finally {
-      models.setLoading(false);
-    }
+    // The registry always comes from GitHub — there is no offline fallback.
+    // If the fetch fails (offline), the Browse tab shows an error while the
+    // Installed tab (local disk) still works.
+    const regPromise = (async () => {
+      try {
+        const reg = await invoke<{ models: RegistryModel[] }>('fetch_registry');
+        models.setRegistry(reg.models);
+      } catch (e) {
+        error = String(e);
+      }
+    })();
+    const instPromise = (async () => {
+      try {
+        const downloaded = await invoke<DownloadedModel[]>('list_downloaded_models');
+        models.setDownloadedModels(downloaded);
+      } catch {
+        // Non-fatal — Installed tab simply stays empty.
+      }
+    })();
+    await Promise.all([regPromise, instPromise]);
+    models.setLoading(false);
   }
 
   $effect(() => {
@@ -114,7 +126,9 @@
       class="page-title"
     />
     <div class="header-actions">
-      <span class="model-count">{filteredModels.length} models</span>
+      <span class="model-count">
+        {#if tab === 'browse'}{filteredModels.length} models{:else}{models.downloadedModels.length} installed{/if}
+      </span>
       <button class="refresh-btn" onclick={loadData} disabled={models.loading}>
         <svg
           width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
@@ -130,6 +144,19 @@
     </div>
   </div>
 
+  <!-- Tab switcher: Browse (GitHub registry) / Installed (local disk) -->
+  <div class="tabs">
+    <button class="tab-btn" class:active={tab === 'browse'} onclick={() => (tab = 'browse')}>
+      Browse
+      <span class="tab-count">{models.registry.length}</span>
+    </button>
+    <button class="tab-btn" class:active={tab === 'installed'} onclick={() => (tab = 'installed')}>
+      Installed
+      <span class="tab-count">{models.downloadedModels.length}</span>
+    </button>
+  </div>
+
+  {#if tab === 'browse'}
   <!-- Search bar -->
   <div class="search-bar">
     <svg class="search-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -234,6 +261,51 @@
       </div>
     </FadeContent>
   {/if}
+  {:else}
+    {#if models.downloadedModels.length === 0}
+      <div class="empty-state">
+        <span>No models installed yet.</span>
+        <button class="empty-clear" onclick={() => (tab = 'browse')}>Browse models</button>
+      </div>
+    {:else}
+      <FadeContent duration={0.4} stagger={0.03}>
+        <div class="model-list">
+          {#each models.downloadedModels as dm}
+            {@const busy = isBusy(dm.id)}
+            <div class="model-row">
+              <div class="row-info">
+                <div class="row-title">
+                  <span class="row-name">{dm.id}</span>
+                  <span class="installed-badge">Installed</span>
+                </div>
+                <div class="row-sub">
+                  <span class="row-id">{dm.path}</span>
+                  <span class="row-tags">
+                    <span class="tag">{dm.quant}</span>
+                    <span class="tag">{formatSize(dm.size_mb)}</span>
+                  </span>
+                </div>
+              </div>
+              <div class="row-actions">
+                {#if busy}
+                  <button class="action-btn busy-btn" disabled title="Model is being downloaded/converted — loading is locked">
+                    {models.isConverting ? 'Converting…' : 'Downloading…'}
+                  </button>
+                {:else}
+                  <button class="action-btn load-btn" onclick={() => handleLoad(dm.id)}>
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                      <polyline points="20 6 9 17 4 12" />
+                    </svg>
+                    Load
+                  </button>
+                {/if}
+              </div>
+            </div>
+          {/each}
+        </div>
+      </FadeContent>
+    {/if}
+  {/if}
 </div>
 
 <DownloadDialog
@@ -304,6 +376,56 @@
 
   @keyframes spin {
     to { transform: rotate(360deg); }
+  }
+
+  /* ── Tab switcher ── */
+  .tabs {
+    display: flex;
+    gap: 4px;
+    margin-bottom: 16px;
+    padding: 4px;
+    background: hsla(var(--surface-tertiary), 0.5);
+    border-radius: var(--radius);
+    width: fit-content;
+  }
+
+  .tab-btn {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 18px;
+    border: none;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: hsl(var(--content-muted));
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+
+  .tab-btn:hover {
+    color: hsl(var(--content));
+  }
+
+  .tab-btn.active {
+    background: linear-gradient(135deg, hsl(var(--brand)), hsl(var(--brand-hover)));
+    color: #fff;
+    box-shadow: 0 0 12px hsla(var(--brand), 0.25);
+  }
+
+  .tab-count {
+    font-size: 11px;
+    font-weight: 700;
+    padding: 1px 7px;
+    border-radius: 10px;
+    background: hsla(var(--surface-secondary), 0.9);
+    color: hsl(var(--content-muted));
+  }
+
+  .tab-btn.active .tab-count {
+    background: hsla(0, 0%, 100%, 0.2);
+    color: #fff;
   }
 
   /* ── Search bar ── */

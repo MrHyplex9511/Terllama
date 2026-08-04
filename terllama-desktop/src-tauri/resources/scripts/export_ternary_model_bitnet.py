@@ -345,9 +345,15 @@ def main():
                         help='Output directory (default: ~/.terllama/models/<slug>)')
     parser.add_argument('--terms', type=int, default=12,
                         help='Number of ALS terms (default: 12)')
+    parser.add_argument('--format', default='als', choices=['als', 'gguf'],
+                        help="Requested format (informational only - ALS is the current "
+                             "export format and is always produced).")
     parser.add_argument('--rotate', type=int, default=0,
                         help='RoPE theta (-1: max positional, 0: no change, N: specific value)')
     args = parser.parse_args()
+
+    # Early marker so the app can show a progress indicator immediately.
+    print('[PROGRESS] 0%', flush=True)
 
     model_slug = args.model.replace('/', '-')
     out_dir = args.outdir or str(Path.home() / '.terllama' / 'models' / model_slug)

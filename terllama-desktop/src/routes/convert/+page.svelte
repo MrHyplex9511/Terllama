@@ -5,7 +5,7 @@
   import FadeContent from '../../lib/components/ui/FadeContent.svelte';
 
   let modelName = $state('HuggingFaceTB/SmolLM2-135M');
-  let format = $state('i2s');
+  let format = $state('als');
   let terms = $state(12);
 
   let pythonStatus = $state<string>('');
@@ -126,10 +126,9 @@
       <div class="field">
         <label for="format">Format</label>
         <select id="format" bind:value={format} disabled={isConverting}>
-          <option value="i2s">I2_S (BitNet, faster)</option>
           <option value="als">ALS (higher quality, slower)</option>
         </select>
-        <p class="hint">{format === 'i2s' ? 'Mean-block ternary, 2 bits/param' : 'Multi-term rank-1 ternary decomposition'}</p>
+        <p class="hint">Multi-term rank-1 ternary decomposition</p>
       </div>
 
       {#if format === 'als'}

@@ -95,7 +95,6 @@ fn contains_model_files(path: &std::path::Path) -> bool {
         if lower.ends_with(".gguf")
             || lower.ends_with(".safetensors")
             || lower.ends_with(".bin")
-            || lower.ends_with(".i2s")
             || lower.ends_with(".als")
             || lower.contains("model_extra")
             || lower.contains("model_decomposed")
@@ -149,11 +148,10 @@ fn detect_quant(path: &std::path::Path) -> String {
                 saw_fp_gguf = true;
             }
         }
-        // Ternary native markers: model_extra.bin / model_decomposed_*.bin / model_tq1.bin / .i2s / .als
+        // Ternary native markers: model_extra.bin / model_decomposed_*.bin / model_tq1.bin / .als
         if lower.contains("model_extra")
             || lower.contains("model_decomposed")
             || lower.contains("model_tq1")
-            || lower.ends_with(".i2s")
             || lower.ends_with(".als")
         {
             return "ternary".to_string();

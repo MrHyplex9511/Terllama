@@ -46,13 +46,13 @@ static std::string slugify(const std::string& repo) {
 }
 
 static void print_usage(const char* prog) {
-    Logger::error("Usage: {} pull <hf_repo> [--format i2s|als]", prog);
+    Logger::error("Usage: {} pull <hf_repo> [--format als|gguf]", prog);
     Logger::error("");
     Logger::error("Download a model from HuggingFace and convert to Terllama format.");
     Logger::error("");
     Logger::error("Arguments:");
     Logger::error("  <hf_repo>    HuggingFace repo (e.g. HuggingFaceTB/SmolLM2-135M)");
-    Logger::error("  --format     'i2s' (default) or 'als'");
+    Logger::error("  --format     'als' (default) or 'gguf'");
     Logger::error("");
     Logger::error("Models stored in ~/.terllama/models/<repo-name>/");
     Logger::error("Tracked in ~/.terllama/models.json");
@@ -62,7 +62,7 @@ int downloader_main(int argc, char** argv) {
     if (argc < 3) { print_usage(argv[0]); return 1; }
 
     std::string hf_repo;
-    std::string format = "i2s";
+    std::string format = "als";
     std::string outdir_override;  // optional --outdir <path>
 
     for (int i = 2; i < argc; i++) {
@@ -73,8 +73,8 @@ int downloader_main(int argc, char** argv) {
                 return 1;
             }
             format = argv[++i];
-            if (format != "i2s" && format != "als" && format != "gguf") {
-                Logger::error("Error: unknown format '{}'", format);
+            if (format != "als" && format != "gguf") {
+                Logger::error("Error: unknown format '{}' (i2s is deprecated; use 'als')", format);
                 return 1;
             }
         } else if (arg == "--outdir" || arg == "-o") {

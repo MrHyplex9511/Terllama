@@ -125,7 +125,7 @@ pub async fn download_model(
         _ => return Err(format!("Unknown download format: {}", format)),
     }
 
-    // Ternary format (als/i2s): run C++ binary with Python export script
+    // Ternary format (als): run C++ binary with Python export script
     let resource_dir = app
         .path()
         .resource_dir()
@@ -170,8 +170,10 @@ pub async fn download_model(
         while let Ok(Some(line)) = lines.next_line().await {
             if let Some(pct) = parse_progress_pct(&line) {
                 let pct = pct.min(99);
-                if pct > lp_so.load(Ordering::Relaxed) {
-                    lp_so.store(pct, Ordering::Relaxed);
+                // Emit on the first event (>=) so a leading "[PROGRESS] 0%" shows
+                // the indicator immediately; store pct+1 to suppress same-value spam.
+                if pct >= lp_so.load(Ordering::Relaxed) {
+                    lp_so.store(pct + 1, Ordering::Relaxed);
                     let _ = app_so.emit(
                         "download-progress",
                         download::DownloadProgressEvent {
@@ -206,8 +208,8 @@ pub async fn download_model(
             }
             if let Some(pct) = parse_progress_pct(&line) {
                 let pct = pct.min(99);
-                if pct > lp_se.load(Ordering::Relaxed) {
-                    lp_se.store(pct, Ordering::Relaxed);
+                if pct >= lp_se.load(Ordering::Relaxed) {
+                    lp_se.store(pct + 1, Ordering::Relaxed);
                     let _ = app_se.emit(
                         "download-progress",
                         download::DownloadProgressEvent {

@@ -38,7 +38,7 @@
       "id": "smolLM2",
       "name": "SmolLM2-135M",
       "hf_repo": "HuggingFaceTB/SmolLM2-135M",
-      "format": "i2s",
+      "format": "als",
       "size_mb": 54,
       "context": 2048,
       "description": "135M parameter model — fastest possible inference on CPU",

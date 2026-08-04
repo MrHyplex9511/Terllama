@@ -71,7 +71,7 @@
             <span class="mode-title">Ternary (CPU)</span>
             <span class="mode-badge">Active</span>
           </div>
-          <p class="mode-desc">1.58-bit ternary precision. Fast CPU inference using Terllama's native engine. Supports Q2_0 GGUF and native i2s/als formats.</p>
+          <p class="mode-desc">1.58-bit ternary precision. Fast CPU inference using Terllama's native engine. Supports Q2_0 GGUF and native ALS format.</p>
           <ul class="mode-features">
             <li>✓ Low RAM usage</li>
             <li>✓ Fast CPU inference</li>

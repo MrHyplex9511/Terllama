@@ -17,7 +17,7 @@ pub struct ConvertProgress {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConvertConfig {
     pub model: String,        // HF model name or local path
-    pub format: String,       // "i2s" or "als"
+    pub format: String,       // "als" (i2s is legacy and has been removed)
     pub terms: u32,           // ALS terms (default 12)
     pub out_dir: String,      // output directory
 }
