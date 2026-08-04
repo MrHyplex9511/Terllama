@@ -202,7 +202,13 @@ def export_als_blocks(out_dir, model_name, num_terms=12):
     print(f"\n[ALS decomposition ({num_terms} terms per layer, per-block scales)...]\n")
     t0 = time.time()
 
-    for name, W in get_model_layers(model_hf, model_hf.config):
+    all_layers = get_model_layers(model_hf, model_hf.config)
+    total_layers = len(all_layers)
+    done_count = 0
+
+    for name, W in all_layers:
+        done_count += 1
+        print(f"[PROGRESS] {100.0 * done_count / total_layers:.0f}%")
         out_f, in_f = W.shape
         fp32_bytes = out_f * in_f * 4
 

@@ -3,17 +3,15 @@
   import { invoke } from '@tauri-apps/api/core';
   import { listen } from '@tauri-apps/api/event';
 
-  let {
-    model,
-    show = false,
-    onClose,
-    onLoad,
-  }: {
+  let { model, show = false, onClose, onLoad }: {
     model: RegistryModel | null;
     show?: boolean;
     onClose?: () => void;
     onLoad?: (modelId: string) => void;
   } = $props();
+
+  import { getModelsState } from '../stores/models.svelte';
+  const models = getModelsState();
 
   let selectedFormat = $state<DownloadFormat>('ternary');
   let showConvertConfirm = $state(false);
@@ -93,6 +91,10 @@
 
   function handleLoad() {
     if (!model) return;
+    if (models.isConverting) {
+      errorMessage = 'A model conversion is running — wait for it to finish before loading.';
+      return;
+    }
     onLoad?.(model.id);
     handleClose();
   }

@@ -2,6 +2,8 @@
   import { getSettingsState } from '../lib/stores/settings.svelte';
   import { getModelsState } from '../lib/stores/models.svelte';
   import { getChatState } from '../lib/stores/chat.svelte';
+  import { listen } from '@tauri-apps/api/event';
+  import type { DownloadProgress, ConvertProgress } from '../types';
   import Sidebar from '../lib/components/Sidebar.svelte';
   import Onboarding from '../lib/components/Onboarding.svelte';
   import LibraryPage from './library/+page.svelte';
@@ -38,6 +40,29 @@
   $effect(() => {
     settings.loadSettings();
     chat.loadSessions();
+
+    // Global download / conversion progress → store (drives sidebar progress icons).
+    const unlistenDownload = listen<DownloadProgress>('download-progress', (event) => {
+      const p = event.payload;
+      models.setDownloadProgress(p);
+      const finished = p.downloaded >= p.total;
+      models.setIsDownloading(!finished);
+      if (finished) {
+        models.refreshDownloaded();
+      }
+    });
+    const unlistenConvert = listen<ConvertProgress>('convert-progress', (event) => {
+      const p = event.payload;
+      models.setConvertProgress(p);
+      models.setIsConverting(!p.done);
+      if (p.done) {
+        models.refreshDownloaded();
+      }
+    });
+    return () => {
+      unlistenDownload.then((fn) => fn());
+      unlistenConvert.then((fn) => fn());
+    };
 
     // Check if first launch
     const onboarded = localStorage.getItem('terllama-onboarded');

@@ -42,6 +42,14 @@ export interface DownloadProgress {
   speed: number;
 }
 
+export interface ConvertProgress {
+  model: string;
+  pct: number;
+  line: string;
+  done: boolean;
+  error: string | null;
+}
+
 export interface Message {
   role: 'user' | 'assistant' | 'system';
   content: string;

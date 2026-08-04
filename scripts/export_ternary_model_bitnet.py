@@ -270,7 +270,22 @@ def export_als_blocks(out_dir, model_name, num_terms=12):
     print(f"\n[ALS decomposition ({num_terms} terms per layer, per-block scales)...]\n")
     t0 = time.time()
 
-    for name, W in get_model_layers(model_hf, model_hf.config):
+    all_layers = get_model_layers(model_hf, model_hf.config)
+
+    # Count Qwen3 Q/K RMSNorm pseudo-layers for accurate progress reporting.
+    n_qk_norm_total = 0
+    if hasattr(model_hf, 'model') and hasattr(model_hf.model, 'layers'):
+        first_attn = model_hf.model.layers[0].self_attn
+        for norm_attr in ('q_norm', 'k_norm'):
+            if hasattr(first_attn, norm_attr):
+                n_qk_norm_total += len(model_hf.model.layers)
+
+    total_layers = len(all_layers) + n_qk_norm_total
+    done_count = 0
+
+    for name, W in all_layers:
+        done_count += 1
+        print(f"[PROGRESS] {100.0 * done_count / total_layers:.0f}%")
         out_f, in_f = W.shape
         fp32_bytes = out_f * in_f * 4
 
@@ -319,6 +334,8 @@ def export_als_blocks(out_dir, model_name, num_terms=12):
             for li in range(len(model_hf.model.layers)):
                 w = getattr(model_hf.model.layers[li].self_attn, norm_attr).weight.data
                 raw_data = w.flatten().to(dtype=DTYPE).numpy().tobytes()
+                done_count += 1
+                print(f"[PROGRESS] {100.0 * done_count / total_layers:.0f}%")
                 q_layers.append({
                     'name': f'model.layers.{li}.self_attn.{norm_attr}',
                     'out_features': w.shape[0], 'in_features': w.shape[0],

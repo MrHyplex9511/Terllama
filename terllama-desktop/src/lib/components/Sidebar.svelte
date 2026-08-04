@@ -1,9 +1,11 @@
 <script lang="ts">
   import { getChatState } from '../stores/chat.svelte';
+  import { getModelsState } from '../stores/models.svelte';
 
   let { currentRoute = $bindable('library') } = $props();
 
   const chat = getChatState();
+  const models = getModelsState();
 
   const navItems = [
     { id: 'chat', label: 'Chat', icon: 'chat' },
@@ -11,6 +13,50 @@
     { id: 'convert', label: 'Convert', icon: 'convert' },
     { id: 'settings', label: 'Settings', icon: 'settings' },
   ];
+
+  // ── Progress helpers ────────────────────────────────────────────────
+  const RING_R = 13;
+  const RING_C = 2 * Math.PI * RING_R;
+
+  function ringOffset(pct: number): number {
+    const p = Math.max(0, Math.min(100, pct || 0));
+    return RING_C * (1 - p / 100);
+  }
+
+  function downloadPct(): number {
+    const p = models.downloadProgress;
+    if (!p || p.total === 0) return 0;
+    return Math.min(100, Math.round((p.downloaded / p.total) * 100));
+  }
+
+  function formatMb(v: number): string {
+    if (v >= 1024) return (v / 1024).toFixed(1) + ' GB';
+    return Math.round(v) + ' MB';
+  }
+
+  function formatSpeed(bps: number): string {
+    if (!bps || bps <= 0) return '—';
+    return (bps / 1e6).toFixed(1) + ' MB/s';
+  }
+
+  function formatElapsed(sec: number): string {
+    const m = Math.floor(sec / 60);
+    const s = sec % 60;
+    return `${m}:${s.toString().padStart(2, '0')}`;
+  }
+
+  // Tick elapsed time while a conversion is running.
+  let elapsed = $state(0);
+  let tickId: ReturnType<typeof setInterval> | null = null;
+  $effect(() => {
+    if (models.isConverting) {
+      elapsed = 0;
+      tickId = setInterval(() => (elapsed += 1), 1000);
+    } else if (tickId) {
+      clearInterval(tickId);
+      tickId = null;
+    }
+  });
 </script>
 
 <aside class="sidebar">
@@ -53,6 +99,64 @@
         {/if}
       </button>
     {/each}
+
+    <!-- Download progress (icon with circular ring, real %/speed on hover) -->
+    {#if models.isDownloading && models.downloadProgress}
+      <div class="progress-item" role="status" aria-label="Downloading {models.downloadProgress.model_id}">
+        <div class="ring-wrap">
+          <svg width="34" height="34" viewBox="0 0 34 34" class="ring">
+            <circle class="ring-track" cx="17" cy="17" r={RING_R} />
+            <circle
+              class="ring-fill"
+              cx="17" cy="17" r={RING_R}
+              stroke-dasharray={RING_C}
+              stroke-dashoffset={ringOffset(downloadPct())}
+            />
+          </svg>
+          <svg class="ring-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4" />
+            <polyline points="7 10 12 15 17 10" />
+            <line x1="12" y1="15" x2="12" y2="3" />
+          </svg>
+        </div>
+        <div class="tooltip">
+          <span class="tooltip-title">Downloading</span>
+          <span class="tooltip-model">{models.downloadProgress.model_id}</span>
+          <span class="tooltip-stats">
+            {downloadPct()}% · {formatMb(models.downloadProgress.downloaded)} / {formatMb(models.downloadProgress.total)} · {formatSpeed(models.downloadProgress.speed)}
+          </span>
+        </div>
+      </div>
+    {/if}
+
+    <!-- Conversion progress (icon with circular ring, real %/elapsed on hover) -->
+    {#if models.isConverting}
+      <div class="progress-item" role="status" aria-label="Converting {models.convertProgress?.model}">
+        <div class="ring-wrap">
+          <svg width="34" height="34" viewBox="0 0 34 34" class="ring">
+            <circle class="ring-track" cx="17" cy="17" r={RING_R} />
+            <circle
+              class="ring-fill"
+              cx="17" cy="17" r={RING_R}
+              stroke-dasharray={RING_C}
+              stroke-dashoffset={ringOffset(models.convertProgress?.pct || 0)}
+            />
+          </svg>
+          <svg class="ring-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="23 4 23 10 17 10" />
+            <polyline points="1 20 1 14 7 14" />
+            <path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15" />
+          </svg>
+        </div>
+        <div class="tooltip">
+          <span class="tooltip-title">Converting</span>
+          <span class="tooltip-model">{models.convertProgress?.model || 'model'}</span>
+          <span class="tooltip-stats">
+            {models.convertProgress?.pct || 0}% · elapsed {formatElapsed(elapsed)}
+          </span>
+        </div>
+      </div>
+    {/if}
   </nav>
 
   <!-- Divider -->
@@ -150,6 +254,100 @@
     background: hsla(var(--brand), 0.15);
     color: hsl(var(--brand-hover));
     box-shadow: 0 0 12px hsla(var(--brand), 0.15);
+  }
+
+  /* ── Progress icon with circular ring + hover tooltip ── */
+  .progress-item {
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 40px;
+    height: 44px;
+    margin-top: 4px;
+    cursor: default;
+  }
+
+  .ring-wrap {
+    position: relative;
+    width: 34px;
+    height: 34px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .ring {
+    position: absolute;
+    inset: 0;
+    transform: rotate(-90deg);
+  }
+
+  .ring-track {
+    fill: none;
+    stroke: hsla(var(--surface-tertiary), 0.9);
+    stroke-width: 3;
+  }
+
+  .ring-fill {
+    fill: none;
+    stroke: hsl(var(--brand));
+    stroke-width: 3;
+    stroke-linecap: round;
+    transition: stroke-dashoffset 0.3s ease;
+    filter: drop-shadow(0 0 4px hsla(var(--brand), 0.5));
+  }
+
+  .ring-icon {
+    color: hsl(var(--brand-hover));
+  }
+
+  .tooltip {
+    position: absolute;
+    left: 48px;
+    top: 50%;
+    transform: translateY(-50%);
+    min-width: 210px;
+    max-width: 260px;
+    padding: 10px 12px;
+    background: hsl(var(--surface));
+    border: 1px solid hsla(var(--border), 0.7);
+    border-radius: 8px;
+    box-shadow: var(--shadow);
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.15s ease;
+    z-index: 50;
+  }
+
+  .progress-item:hover .tooltip {
+    opacity: 1;
+  }
+
+  .tooltip-title {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: hsl(var(--brand-hover));
+  }
+
+  .tooltip-model {
+    font-size: 12px;
+    font-weight: 600;
+    color: hsl(var(--content));
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .tooltip-stats {
+    font-size: 11px;
+    font-family: 'JetBrains Mono', monospace;
+    color: hsl(var(--content-muted));
   }
 
   .divider {

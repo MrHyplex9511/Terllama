@@ -160,29 +160,6 @@ pub async fn download_model(
 
     let last_pct = Arc::new(AtomicU64::new(0));
 
-    // Fallback timer — emits at 25%/50%/75% if the subprocess doesn't report progress
-    let mid_fb = model_id.clone();
-    let app_fb = app.clone();
-    let lp_fb = last_pct.clone();
-    let fb_handle = tokio::spawn(async move {
-        for (pct, delay) in [(25u64, 3u64), (50, 8), (75, 15)] {
-            tokio::time::sleep(tokio::time::Duration::from_secs(delay)).await;
-            if lp_fb.load(Ordering::Relaxed) < pct {
-                lp_fb.store(pct, Ordering::Relaxed);
-                let _ = app_fb.emit(
-                    "download-progress",
-                    download::DownloadProgressEvent {
-                        model_id: mid_fb.clone(),
-                        file: "model.bin".to_string(),
-                        downloaded: pct,
-                        total: 100,
-                        speed: 0.0,
-                    },
-                );
-            }
-        }
-    });
-
     // Stream stdout lines for progress
     let mid_so = model_id.clone();
     let app_so = app.clone();
@@ -249,10 +226,9 @@ pub async fn download_model(
     // Wait for subprocess to finish
     let status = child.wait().await.map_err(|e| format!("Process error: {}", e))?;
 
-    // Drain streamers, cancel fallback timer
+    // Drain streamers
     let _ = so_handle.await;
     let _ = se_handle.await;
-    fb_handle.abort();
 
     if status.success() {
         // Emit final 100 % event
@@ -437,6 +413,13 @@ pub async fn start_server(
     model_id: String,
     port: u16,
 ) -> Result<(), String> {
+    // Refuse to load a model while a conversion is running — the weights are
+    // being rewritten under the model dir and loading would race with it.
+    if crate::convert::is_converting() {
+        return Err(
+            "Cannot load a model while a conversion is in progress. Wait for it to finish.".to_string(),
+        );
+    }
     let resource_dir = app.path().resource_dir().ok();
     state.server.start(model_id, port, resource_dir.as_deref()).await
 }
@@ -596,7 +579,7 @@ pub async fn check_convert_deps() -> Result<bool, String> {
 
 #[tauri::command]
 pub async fn check_update() -> Result<UpdateInfo, String> {
-    let current_version = "1.0.0";
+    let current_version = env!("CARGO_PKG_VERSION");
     let client = Client::builder()
         .user_agent("Terllama-Desktop/1.0.0")
         .build()
