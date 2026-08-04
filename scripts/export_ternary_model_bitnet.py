@@ -1,11 +1,22 @@
 """
-Export HF model -> I2_S or ALS binary for Terllama C++ inference.
+Export HF model -> ALS per-block binary for Terllama C++ inference.
 
-I2_S (--format i2s): BitNet mean-scale, 4 vals/byte + per-block scales.
-ALS  (--format als): Alternating Least Squares, multi-term ternary, 2 bits/elem.
+ALS (only format): greedy element-wise ternary decomposition with iterative
+refinement (each term = full ternary matrix with a power-of-2 scale, refined
+by re-solving one term against the residual of all others), then per-block
+float32 scales (128-wide blocks, 2 bits/elem) fitted by least squares.
+
+This matches utils/phase4_ppl.py (the algorithm that produced the README
+benchmarks: SmolLM2 PPL 15.89 -> 16.84 @ 8/10/12/15 terms, FFN 4.92% err).
+NOTE: the old rank-1 outer-product ALS was mathematically rank-limited
+(SVD rank-12 floor ~60% err on dense weights) and could never reach those
+numbers; it is replaced by this element-wise variant.
+
+Output: model_decomposed.bin (magic 0xDEADBEEF)
+  Layer types: 0=TQ1 legacy, 1=RAW_FP32, 2=multi-term block container.
 
 Usage:
-  python scripts/export_ternary_model_bitnet.py --model HuggingFaceTB/SmolLM2-135M --format als
+  python scripts/export_ternary_model_bitnet.py --model HuggingFaceTB/SmolLM2-135M --terms 12
 """
 import argparse, torch, math, time, struct, json, os, sys
 from pathlib import Path
@@ -43,151 +54,207 @@ def get_model_layers(model_hf, cfg):
     return layers
 
 # ═══════════════════════════════════════════════════════════════════════════
-# I2_S: mean-block quantization, 4 vals/byte
+# ALS: greedy element-wise ternary decomposition + iterative refinement
+# (ported from utils/phase4_ppl.py — the algorithm behind the README numbers)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def quantize_weights_mean_block(weight, block_size=128):
-    w = weight.float()
-    out_f, in_f = w.shape
-    pad = (block_size - in_f % block_size) % block_size
-    if pad > 0:
-        w = torch.nn.functional.pad(w, (0, pad))
-    n_blocks = w.shape[1] // block_size
-    codes = torch.zeros(out_f, w.shape[1], dtype=torch.int8)
-    scales = torch.zeros(out_f, n_blocks, dtype=torch.float32)
-    for i in range(out_f):
-        for b in range(n_blocks):
-            block = w[i, b*block_size:(b+1)*block_size]
-            s = 1.0 / block.abs().mean().clamp(min=1e-5)
-            codes[i, b*block_size:(b+1)*block_size] = \
-                (block * s).round().clamp(-1, 1).to(torch.int8)
-            scales[i, b] = s
-    if pad > 0:
-        codes = codes[:, :in_f]
-    return codes, scales
+def _greedy_terms(W, num_terms):
+    """Greedy element-wise ternary decomposition.
 
-def pack_i2s_with_scales(codes, scales, qk=128):
-    """Pack ternary codes into I2_S: 4 vals/byte + per-block float32 scale."""
-    out_f, in_f = codes.shape
-    n_blocks = scales.shape[1]
-    codes_per_block = qk // 4
-    buf = bytearray()
-    for row in range(out_f):
-        row_codes = codes[row].tolist()
-        for b in range(n_blocks):
-            block_start = b * qk
-            block_end = min(block_start + qk, in_f)
-            byte_buf = bytearray(codes_per_block)
-            for j in range(0, qk, 4):
-                byte_val = 0
-                for k in range(4):
-                    idx = block_start + j + k
-                    if idx < in_f:
-                        val = row_codes[idx] + 1  # -1→0, 0→1, 1→2
-                    else:
-                        val = 0
-                    byte_val |= (val & 0x03) << (6 - k * 2)
-                byte_buf[j // 4] = byte_val
-            buf.extend(byte_buf)
-            buf.extend(struct.pack('<f', scales[row, b].item()))
-    return bytes(buf)
-
-# ═══════════════════════════════════════════════════════════════════════════
-# ALS: multi-term rank-1 ternary decomposition
-# ═══════════════════════════════════════════════════════════════════════════
-
-def als_decompose(W, num_terms=12, max_iter=10):
+    Each term: scale a = 2^k (power of two), ternary matrix T = clamp(round(R/a), -1, 1).
+    No rank constraint — every element of the residual is rounded independently,
+    so the decomposition is NOT limited by the singular-value spectrum.
+    Returns list of (a, T) with a float scale, T int8 ternary (out_f, in_f).
     """
-    Decompose W into sum of rank-1 ternary terms via ALS.
-
-    Each term: alpha * outer(u, v) where u, v in {-1, 0, +1}.
-    Returns list of (alpha, T) where T is ternary matrix flattened row-major.
-    """
-    out_f, in_f = W.shape
-    residual = W.float().clone()
-    terms = []
-
-    for t in range(num_terms):
-        # Power iteration for dominant singular triplet
-        v = torch.randn(in_f)
-        u = torch.randn(out_f)
-        for _ in range(5):
-            v = residual.T @ u
-            v = v / (v.norm() + 1e-10)
-            u = residual @ v
-            u = u / (u.norm() + 1e-10)
-        s = (u @ (residual @ v)).abs().item()
-
-        # Round to ternary via alternating optimization
-        u_tern = torch.sign(u).to(torch.int8)
-        v_tern = torch.sign(v).to(torch.int8)
-
-        for _ in range(max_iter):
-            # Fix v, optimize u: ternary rounding of residual @ v
-            proj_u = residual @ v_tern.float()
-            u_new = torch.where(proj_u.abs() > 1e-6, torch.sign(proj_u).to(torch.int8), torch.tensor(0, dtype=torch.int8))
-            # Fix u, optimize v
-            proj_v = residual.T @ u_new.float()
-            v_new = torch.where(proj_v.abs() > 1e-6, torch.sign(proj_v).to(torch.int8), torch.tensor(0, dtype=torch.int8))
-            if torch.equal(u_new, u_tern) and torch.equal(v_new, v_tern):
-                break
-            u_tern, v_tern = u_new, v_new
-
-        # Build outer product
-        outer = torch.outer(u_tern.float(), v_tern.float())  # (out_f, in_f)
-
-        # Optimal alpha: least-squares scale
-        mask = outer != 0
-        if mask.sum() > 0:
-            alpha = (residual[mask] * outer[mask]).sum() / (outer[mask] ** 2).sum()
-        else:
-            alpha = 0.0
-
-        # Build full ternary matrix (stored packed per term)
-        T = torch.zeros(out_f * in_f, dtype=torch.int8)
-        if alpha != 0:
-            outer_tern = torch.sign(outer).to(torch.int8)
-            T = outer_tern.flatten()
-
-        terms.append((alpha, T))
-        residual -= alpha * outer
-
+    R, terms = W.float().clone(), []
+    for _ in range(num_terms):
+        r_max = R.abs().max().item()
+        if r_max < 1e-8:
+            terms.append((0.0, torch.zeros_like(R, dtype=torch.int8)))
+            continue
+        # Search power-of-2 scale a = 2^k around the residual magnitude
+        lo = int(math.floor(math.log2(max(r_max / 3, 1e-10))))
+        hi = int(math.ceil(math.log2(max(r_max * 1.5, 1e-10)))) + 2
+        best_k, best_e = None, float('inf')
+        for k in range(lo, hi):
+            a = 2.0 ** k
+            Tc = torch.clamp(torch.round(R / a), -1.0, 1.0)
+            e = torch.norm(R - a * Tc).item()
+            if e < best_e:
+                best_e, best_k = e, k
+        a = 2.0 ** best_k
+        T = torch.clamp(torch.round(R / a), -1.0, 1.0).to(torch.int8)
+        R -= a * T.float()
+        terms.append((float(a), T))
     return terms
 
-def pack_als_ternary(alpha, tv_tensor):
+def als_decompose(W, num_terms=12, max_iter=5, qk=128):
     """
-    Vectorized ALS packing. PyTorch ops, no Python loops.
+    Decompose W into num_terms element-wise ternary terms, then refine.
 
-    Maps: +1→bits 10(2), -1→bits 11(3), 0→bits 00(0).
-    Packs 4 values/byte MSB-first.
+    Phase 1 (init): greedy power-of-2 ternary rounding (see _greedy_terms).
+    Phase 2 (refine): for each term, rebuild the residual R = W - sum_{j!=i} a_j*T_j
+        and re-solve term i against R (best power-of-2 scale + ternary rounding).
+        Repeating this coordinate descent drives each term toward its optimal
+        element-wise ternary fit.
+
+    Returns:
+        terms: list of (scales, T) where scales = list of per-block float32
+               (n_blocks = ceil(in_f/qk), fitted by least squares per block),
+               T = ternary matrix (out_f, in_f) int8 (row-major, row=out feature)
+        errs:  per-term cumulative relative errors (err after each term)
     """
-    # Map ternary -> 2-bit codes
+    out_f, in_f = W.shape
+    W = W.float()
+    w_norm = torch.norm(W).item()
+    n_blocks = (in_f + qk - 1) // qk
+
+    terms = _greedy_terms(W, num_terms)
+    for _ in range(max_iter):
+        for i in range(num_terms):
+            # Residual excluding term i
+            R = W.clone()
+            for j in range(num_terms):
+                if j != i and terms[j][0] != 0.0:
+                    R -= terms[j][0] * terms[j][1].float()
+            r_max = R.abs().max().item()
+            if r_max < 1e-8:
+                terms[i] = (0.0, torch.zeros_like(terms[i][1]))
+                continue
+            lo = int(math.floor(math.log2(max(r_max / 3, 1e-10))))
+            hi = int(math.ceil(math.log2(max(r_max * 1.5, 1e-10)))) + 2
+            best_k, best_e = None, float('inf')
+            for k in range(lo, hi):
+                a = 2.0 ** k
+                Tc = torch.clamp(torch.round(R / a), -1.0, 1.0)
+                e = torch.norm(R - a * Tc).item()
+                if e < best_e:
+                    best_e, best_k = e, k
+            a = 2.0 ** best_k
+            terms[i] = (float(a), torch.clamp(torch.round(R / a), -1.0, 1.0).to(torch.int8))
+
+    # Joint per-block least-squares scales: for each block, solve
+    #   min || W_block - sum_i s_bi * T_bi ||^2
+    # over ALL term scales s_bi simultaneously (normal equations, NxN per block).
+    # This keeps the refined joint optimum (global-alpha error ~5%) and can only
+    # improve it; a sequential forward pass would NOT — terms are only meaningful
+    # together, not one-at-a-time.
+    N = num_terms
+    flat_T = [t[1].float() for t in terms]  # (out_f, in_f) each
+    out_terms = []
+    errs = []
+    residual = W.clone()
+    for b in range(n_blocks):
+        start = b * qk
+        end = min(start + qk, in_f)
+        Wb = W[:, start:end]                        # (out_f, bw)
+        # Build A = (out_f*bw, N), column i = flattened ternary block i
+        cols = [Tb[:, start:end].reshape(-1) for Tb in flat_T]
+        A = torch.stack(cols, dim=1)                # (out_f*bw, N)
+        if A.numel() == 0:
+            scales_b = [0.0] * N
+        else:
+            # Solve NxN normal equations in float64 with an adaptive ridge.
+            # (For sparse ternary patterns AtA can be ill-conditioned up to
+            # 1e34; SVD-based lstsq on the full tall matrix silently returns
+            # a zero solution for very large layers, e.g. lm_head 49152 rows,
+            # so we go through the tiny normal system instead.)
+            A64 = A.double()
+            AtA = A64.t() @ A64
+            Atw = A64.t() @ Wb.reshape(-1).double()
+            ridge = 1e-10 * torch.diag(AtA).max().item()
+            try:
+                s_b = torch.linalg.solve(AtA + ridge * torch.eye(N, dtype=torch.float64), Atw)
+            except Exception:
+                s_b = torch.linalg.lstsq(A64, Wb.reshape(-1).double(), driver='gelsd').solution
+            scales_b = [float(x) for x in s_b]
+        out_terms.append(scales_b)
+
+    # Transpose out_terms: (per-block lists) -> (per-term lists of n_blocks scales)
+    per_term_scales = []
+    for i in range(N):
+        per_term_scales.append([out_terms[b][i] for b in range(n_blocks)])
+
+    # Rebuild residual with the joint-scaled terms for the error chain
+    residual = W.clone()
+    errs = []
+    for i in range(N):
+        Ti = flat_T[i]
+        for b in range(n_blocks):
+            start = b * qk
+            end = min(start + qk, in_f)
+            sb = per_term_scales[i][b]
+            if sb != 0.0:
+                residual[:, start:end] -= sb * Ti[:, start:end]
+        errs.append(torch.norm(residual).item() / w_norm * 100 if w_norm > 0 else 0.0)
+
+    out_terms = list(zip(per_term_scales, [t[1] for t in terms]))
+    return out_terms, errs
+
+def pack_als_block_terms(terms_with_scales, qk=128):
+    """Pack a list of (scales, T) ALS terms into the layer_type=2 container.
+
+    Layout: [num_terms:u32][term0_len:u32][term0_data]...[termN_len:u32][termN_data]
+
+    Each term_data is the I2_S per-row block layout:
+      per row: [block0: 32 code bytes + 4 scale bytes] x n_blocks,
+      n_blocks = ceil(in_f/128). Codes are 2-bit/weight, 4 vals/byte MSB-first,
+      mapping {-1,0,+1} -> {0,1,2} (legacy I2S, matches all C++ decoders).
+    """
+    buf = bytearray(struct.pack('<I', len(terms_with_scales)))
+    for scales, tv in terms_with_scales:
+        blob = pack_als_block(tv, scales, qk)
+        buf.extend(struct.pack('<I', len(blob)))
+        buf.extend(blob)
+    return bytes(buf)
+
+def pack_als_block(tv_tensor, scales, qk=128):
+    """Pack one ALS term (ternary matrix + per-block scales) into the per-row block blob.
+
+    Per row: for each qk-wide block: qk/4 code bytes (2-bit, MSB-first) + 4 scale bytes.
+    Encoding matches the C++ decoders (all four kernels use legacy I2S mapping):
+        {-1, 0, +1} -> {0, 1, 2}; code 3 is never emitted.
+    Tail blocks are zero-padded with code 1 (ternary 0).
+    """
+    out_f, in_f = tv_tensor.shape
+    n_blocks = len(scales)
+    codes_per_block = qk // 4
+
+    # Vectorized ternary -> 2-bit code mapping (-1->0, 0->1, +1->2)
     tv = tv_tensor.to(torch.int8)
-    codes = torch.zeros(tv.numel(), dtype=torch.uint8, device=tv.device)
+    codes = torch.ones_like(tv, dtype=torch.uint8)  # default 0 -> code 1
+    codes.masked_fill_(tv == -1, 0)
     codes.masked_fill_(tv == 1, 2)
-    codes.masked_fill_(tv == -1, 3)
 
-    # Pad to multiple of 4
-    n = codes.shape[0]
-    pad = (4 - n % 4) % 4
-    if pad:
-        codes = torch.nn.functional.pad(codes, (0, pad))
+    buf = bytearray()
+    for row in range(out_f):
+        for b in range(n_blocks):
+            start = b * qk
+            end = min(start + qk, in_f)
+            block = codes[row, start:end]
+            if end - start < qk:
+                # Pad with code 1 (ternary 0) — never 0 which means -1.
+                block = torch.nn.functional.pad(block, (0, qk - (end - start)), value=1)
+            # Pack 4 vals per byte MSB-first: [a,b,c,d] -> (a<<6)|(b<<4)|(c<<2)|d
+            c4 = block.reshape(-1, 4)
+            packed = (c4[:, 0] << 6) | (c4[:, 1] << 4) | (c4[:, 2] << 2) | c4[:, 3]
+            buf.extend(packed.cpu().numpy().tobytes())
+            buf.extend(struct.pack('<f', float(scales[b])))
+    return bytes(buf)
 
-    # Pack 4 vals per byte: [a,b,c,d] -> (a<<6)|(b<<4)|(c<<2)|d
-    c4 = codes.reshape(-1, 4)
-    packed = (c4[:, 0] << 6) | (c4[:, 1] << 4) | (c4[:, 2] << 2) | c4[:, 3]
+def export_als_blocks(out_dir, model_name, num_terms=12):
+    """ALS export: greedy element-wise ternary decomposition + refinement, per-block scales.
 
-    return struct.pack('<f', alpha) + packed.cpu().numpy().tobytes()
-
-def export_als(out_dir, model_name, num_terms=12):
-    """ALS export: multi-term rank-1 ternary decomposition."""
+    Writes model_decomposed.bin (magic 0xDEADBEEF). Layer types:
+      0 = TQ1 legacy (unused, backward compat), 1 = RAW_FP32, 2 = multi-term block container.
+    """
     from transformers import AutoModelForCausalLM
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     model_bin = out_dir / 'model_decomposed.bin'
 
     print("=" * 70)
-    print(f"EXPORT: {model_name} -> ALS format ({num_terms} terms)")
+    print(f"EXPORT: {model_name} -> ALS per-block format ({num_terms} terms)")
     print(f"Output: {out_dir}")
     print("=" * 70)
 
@@ -200,7 +267,7 @@ def export_als(out_dir, model_name, num_terms=12):
     n_quantized = 0
     n_skipped = 0
 
-    print(f"\n[ALS decomposition ({num_terms} terms per layer)...]\n")
+    print(f"\n[ALS decomposition ({num_terms} terms per layer, per-block scales)...]\n")
     t0 = time.time()
 
     for name, W in get_model_layers(model_hf, model_hf.config):
@@ -211,45 +278,59 @@ def export_als(out_dir, model_name, num_terms=12):
             raw_data = W.flatten().numpy().tobytes()
             q_layers.append({
                 'name': name, 'out_features': out_f, 'in_features': in_f,
-                'data': raw_data, 'err': -1.0, 'is_raw': True,
+                'layer_type': 1, 'data': raw_data, 'err': -1.0,
             })
             print(f"  - {name:50s} RAW FP32 ({len(raw_data)/1e6:.1f} MB)")
             n_skipped += 1
             continue
 
         t1 = time.time()
-        terms = als_decompose(W, num_terms=num_terms)
+        terms, errs = als_decompose(W, num_terms=num_terms)
 
-        # Pack each term: alpha + 2-bit ternary data (vectorized)
-        packed_terms = []
-        for alpha, tv in terms:
-            packed_terms.append(pack_als_ternary(alpha, tv))
-
-        # Reconstruct for error (vectorized)
-        W_hat = torch.zeros(out_f, in_f)
-        for alpha, tv in terms:
-            if alpha != 0:
-                W_hat += alpha * tv.reshape(out_f, in_f).float()
-
-        err = torch.norm(W - W_hat).item() / torch.norm(W).item() * 100
+        # Pack into layer_type=2 multi-term container blob
+        blob = pack_als_block_terms(terms, 128)
+        err = errs[-1]
         t2 = time.time()
-        als_size = sum(len(p) for p in packed_terms)
         total_fp32 += fp32_bytes
-        total_als += als_size
+        total_als += len(blob)
 
         q_layers.append({
             'name': name, 'out_features': out_f, 'in_features': in_f,
-            'data': packed_terms, 'err': err, 'is_raw': False,
+            'layer_type': 2, 'data': blob, 'err': err,
         })
-        ratio = fp32_bytes / als_size
+        ratio = fp32_bytes / len(blob)
         status = 'OK' if err < 20 else '??'
+        err_chain = ' -> '.join(f'{e:.1f}' for e in errs)
         print(f"  {status} {name:48s} [{out_f:5d},{in_f:5d}] "
-              f"err={err:5.2f}%  comp={ratio:5.1f}x  {t2-t1:.2f}s")
+              f"err={err_chain}%  comp={ratio:5.1f}x  {t2-t1:.2f}s")
         n_quantized += 1
+
+    # ── Qwen3-style per-head Q/K RMSNorm (Qwen3RMSNorm, not nn.Linear) ──
+    # The main loop only walks nn.Linear modules, so q_norm/k_norm (weight
+    # shape [head_dim], shared across heads) are invisible there. Export them
+    # as RAW_FP32 pseudo-layers so the loader/inference can apply them.
+    # Names mirror the transformer_block lookup: model.layers.<N>.self_attn.q_norm.
+    n_qk_norm = 0
+    if hasattr(model_hf, 'model') and hasattr(model_hf.model, 'layers'):
+        first_attn = model_hf.model.layers[0].self_attn
+        for norm_attr in ('q_norm', 'k_norm'):
+            if not hasattr(first_attn, norm_attr):
+                continue
+            for li in range(len(model_hf.model.layers)):
+                w = getattr(model_hf.model.layers[li].self_attn, norm_attr).weight.data
+                raw_data = w.flatten().to(dtype=DTYPE).numpy().tobytes()
+                q_layers.append({
+                    'name': f'model.layers.{li}.self_attn.{norm_attr}',
+                    'out_features': w.shape[0], 'in_features': w.shape[0],
+                    'layer_type': 1, 'data': raw_data, 'err': -1.0,
+                })
+                n_qk_norm += 1
+        if n_qk_norm:
+            print(f"  - Exported {n_qk_norm} Qwen3 Q/K RMSNorm weights as RAW FP32")
 
     t_quant = time.time() - t0
 
-    # Write ALS binary
+    # Write ALS binary: magic 0xDEADBEEF, then per-layer name/type/data
     print(f"\n[Writing {model_bin}...]")
     with open(model_bin, 'wb') as f:
         f.write(struct.pack('<I', 0xDEADBEEF))  # ALS magic
@@ -259,20 +340,15 @@ def export_als(out_dir, model_name, num_terms=12):
             f.write(struct.pack('<I', len(name_bytes)))
             f.write(name_bytes)
             f.write(struct.pack('<II', layer['out_features'], layer['in_features']))
-            if layer.get('is_raw', False):
-                f.write(struct.pack('<I', 0))  # num_terms=0 signals raw FP32
-                f.write(struct.pack('<I', len(layer['data'])))  # data_len
-                f.write(layer['data'])
-            else:
-                f.write(struct.pack('<I', len(layer['data'])))  # num_terms
-                for term_data in layer['data']:
-                    f.write(term_data)
+            f.write(struct.pack('<B', layer['layer_type']))
+            f.write(struct.pack('<I', len(layer['data'])))
+            f.write(layer['data'])
 
     file_size = os.path.getsize(model_bin)
-    total_raw = sum(len(l['data']) for l in q_layers if l.get('is_raw', False))
+    total_raw = sum(len(l['data']) for l in q_layers if l['layer_type'] == 1)
 
     print("\n" + "=" * 70)
-    print(f"COMPRESSION METRICS (ALS {num_terms} terms)")
+    print(f"COMPRESSION METRICS (ALS per-block {num_terms} terms)")
     print("=" * 70)
     print(f"  ALS quantized layers:       {n_quantized}")
     print(f"  Raw FP32 layers:            {n_skipped}")
@@ -282,104 +358,6 @@ def export_als(out_dir, model_name, num_terms=12):
     if total_fp32 > 0:
         print(f"  Compression ratio vs FP32:  {total_fp32 / total_comp:.1f}x")
     print(f"  ALS time:                   {t_quant:.1f}s")
-    print(f"\nDone! Model saved to {model_bin}")
-    return 0
-
-
-def export_i2s(out_dir, model_name):
-    """I2_S export: mean-block ternary quantization."""
-    from transformers import AutoModelForCausalLM
-    out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    model_bin = out_dir / 'model_decomposed_i2s.bin'
-
-    print("=" * 70)
-    print(f"EXPORT: {model_name} -> I2_S BitNet format")
-    print(f"Output: {out_dir}")
-    print("=" * 70)
-
-    print(f"\nDownloading {model_name} from HuggingFace...")
-    model_hf = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=DTYPE).eval()
-
-    q_layers = []
-    total_fp32 = 0
-    total_i2s = 0
-    n_quantized = 0
-    n_skipped = 0
-
-    print("\n[Quantizing layers (BitNet style)...]\n")
-    t0 = time.time()
-
-    for name, W in get_model_layers(model_hf, model_hf.config):
-        if not should_quantize(name):
-            out_f, in_f = W.shape
-            raw_data = W.flatten().numpy().tobytes()
-            q_layers.append({
-                'name': name, 'out_features': out_f, 'in_features': in_f,
-                'data': raw_data, 'err': -1.0, 'is_raw': True,
-            })
-            print(f"  - {name:50s} RAW FP32 ({len(raw_data)/1e6:.1f} MB)")
-            n_skipped += 1
-            continue
-
-        out_f, in_f = W.shape
-        fp32_bytes = out_f * in_f * 4
-
-        t1 = time.time()
-        codes, scales = quantize_weights_mean_block(W, 128)
-        t2 = time.time()
-
-        i2s_data = pack_i2s_with_scales(codes, scales, 128)
-
-        W_hat = codes.float() / (1.0 / W.float().abs().mean().clamp(min=1e-5))
-        err = torch.norm(W - W_hat).item() / torch.norm(W).item() * 100
-
-        total_fp32 += fp32_bytes
-        total_i2s += len(i2s_data)
-
-        q_layers.append({
-            'name': name, 'out_features': out_f, 'in_features': in_f,
-            'data': i2s_data, 'err': err, 'is_raw': False,
-        })
-        ratio = fp32_bytes / len(i2s_data)
-        status = 'OK' if err < 20 else '??'
-        print(f"  {status} {name:48s} [{out_f:5d},{in_f:5d}] "
-              f"err={err:5.2f}%  comp={ratio:5.1f}x  {t2-t1:.2f}s")
-        n_quantized += 1
-
-    t_quant = time.time() - t0
-
-    print(f"\n[Writing {model_bin}...]")
-    with open(model_bin, 'wb') as f:
-        f.write(struct.pack('<I', 0x5F533249))  # magic: I2S_
-        f.write(struct.pack('<I', len(q_layers)))
-        for layer in q_layers:
-            name_bytes = layer['name'].encode('utf-8')
-            f.write(struct.pack('<I', len(name_bytes)))
-            f.write(name_bytes)
-            f.write(struct.pack('<II', layer['out_features'], layer['in_features']))
-            layer_type = 1 if layer.get('is_raw', False) else 0
-            f.write(struct.pack('<B', layer_type))
-            f.write(struct.pack('<I', len(layer['data'])))
-            f.write(layer['data'])
-
-    file_size = os.path.getsize(model_bin)
-    total_raw = sum(len(l['data']) for l in q_layers if l.get('is_raw', False))
-
-    print("\n" + "=" * 70)
-    print("COMPRESSION METRICS (BitNet I2_S)")
-    print("=" * 70)
-    print(f"  I2_S quantized layers:       {n_quantized}")
-    print(f"  Raw FP32 layers:             {n_skipped}")
-    print(f"  Original FP32 (quant only):  {total_fp32 / 1e6:.1f} MB")
-    print(f"  I2_S compressed:             {total_i2s / 1e6:.1f} MB")
-    print(f"  Raw FP32 data:               {total_raw / 1e6:.1f} MB")
-    print(f"  Binary file:                 {file_size / 1e6:.1f} MB")
-    total_comp = total_i2s + total_raw
-    if total_fp32 > 0:
-        print(f"  Compression ratio vs FP32:   {total_fp32 / total_comp:.1f}x")
-        print(f"  Bits per param (I2_S only):  {total_i2s * 8 / (total_fp32 / 4):.2f}")
-    print(f"  Quantization time:           {t_quant:.1f}s")
     print(f"\nDone! Model saved to {model_bin}")
     return 0
 
@@ -445,15 +423,13 @@ def write_extra(out_dir, model_hf):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Export HF model to Terllama binary format')
+    parser = argparse.ArgumentParser(description='Export HF model to Terllama ALS binary format')
     parser.add_argument('--model', default='HuggingFaceTB/SmolLM2-135M',
                         help='HuggingFace model name')
     parser.add_argument('--outdir', default='',
                         help='Output directory (default: ~/.terllama/models/<slug>)')
-    parser.add_argument('--format', choices=['i2s', 'als'], default='i2s',
-                        help='Export format (default: i2s)')
     parser.add_argument('--terms', type=int, default=12,
-                        help='Number of ALS terms (default: 8, only for --format als)')
+                        help='Number of ALS terms (default: 12)')
     parser.add_argument('--rotate', type=int, default=0,
                         help='RoPE theta (-1: max positional, 0: no change, N: specific value)')
     args = parser.parse_args()
@@ -461,10 +437,7 @@ def main():
     model_slug = args.model.replace('/', '-')
     out_dir = args.outdir or str(Path.home() / '.terllama' / 'models' / model_slug)
 
-    if args.format == 'als':
-        ret = export_als(out_dir, args.model, num_terms=args.terms)
-    else:
-        ret = export_i2s(out_dir, args.model)
+    ret = export_als_blocks(out_dir, args.model, num_terms=args.terms)
     if ret != 0:
         return ret
 
@@ -474,6 +447,16 @@ def main():
     m = _M.from_pretrained(args.model, dtype=torch.float32).eval()
     extra_path = write_extra(out_dir, m)
     print(f'  Wrote {extra_path} ({os.path.getsize(extra_path)/1e6:.1f} MB)')
+
+    # Write tokenizer files (tokenizer.json + tokenizer_config.json + extras)
+    # so the C++ loader can find model_dir/tokenizer.json at runtime.
+    print('\n[Writing tokenizer files...]')
+    from transformers import AutoTokenizer
+    tok = AutoTokenizer.from_pretrained(args.model)
+    tok.save_pretrained(out_dir)
+    tok_json = os.path.join(out_dir, 'tokenizer.json')
+    print(f'  Wrote tokenizer -> {out_dir} '
+          f'({"tokenizer.json: %.1f MB" % (os.path.getsize(tok_json)/1e6) if os.path.exists(tok_json) else "no tokenizer.json"})')
     return 0
 
 if __name__ == '__main__':

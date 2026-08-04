@@ -101,7 +101,45 @@ bool init_server(const std::string& model_dir) {
         g_model.layer_norms = loaded.layer_norms;
         g_model.final_norm = loaded.final_norm;
         g_model.layers = loaded.layers;
+        g_model.tokenizer = loaded.tokenizer;
         Logger::info("  Loaded {} layers.", g_model.layers.size());
+        Logger::info("  Tokenizer: {} (valid={}, vocab={})",
+            g_model.tokenizer.valid ? g_model.tokenizer.model_type : "none",
+            g_model.tokenizer.valid ? "yes" : "no",
+            g_model.tokenizer.vocab.size());
+
+        // ─── GigaToken: HF tokenizer.json decode path ────────────────────
+        // Native tokenizer only handles SentencePiece-style ("llama") vocab.
+        // Byte-level BPE models (SmolLM2, etc.) ship a tokenizer.json in the
+        // model dir — load it through GigaToken so decode produces real text
+        // instead of "????".
+        g_model.gigatoken = std::make_shared<GigaTokenWrapper>();
+        {
+            // Search for .so next to binary, then CWD, then third_party
+            char exe_buf[4096];
+            ssize_t exe_len = readlink("/proc/self/exe", exe_buf, sizeof(exe_buf) - 1);
+            std::string exe_dir;
+            if (exe_len > 0) {
+                exe_buf[exe_len] = '\0';
+                exe_dir = std::string(exe_buf);
+                auto p = exe_dir.rfind('/');
+                if (p != std::string::npos) exe_dir = exe_dir.substr(0, p);
+            }
+            std::string so_paths = ".:./bin";
+            if (!exe_dir.empty()) so_paths = exe_dir + ":" + so_paths;
+            if (g_model.gigatoken->load(so_paths)) {
+                if (g_model.gigatoken->load_tokenizer(model_dir)) {
+                    Logger::info("  GigaToken: loaded HF tokenizer from {} (vocab={})",
+                                 (model_dir + "/tokenizer.json"), g_model.gigatoken->vocab_size());
+                } else {
+                    Logger::info("  GigaToken: no tokenizer.json in model dir — using native/Python decode");
+                    g_model.gigatoken.reset();
+                }
+            } else {
+                Logger::info("  GigaToken: .so not found — using native/Python decode");
+                g_model.gigatoken.reset();
+            }
+        }
 
         Logger::info("Building RoPE cache...");
         g_model.rope = build_rope_cache(

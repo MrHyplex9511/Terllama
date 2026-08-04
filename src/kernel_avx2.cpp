@@ -5,7 +5,7 @@
  *
  * Two kernels:
  *   ternary_mul_avx2()       bitplane combined[] format (backward compat)
- *   ternary_mul_avx2_i2s()   I2_S direct path + INT8 quant + activation-parallel tiling
+ *   ternary_mul_avx2_blocks()  block-scaled direct path + INT8 quant + activation-parallel tiling
  */
 #include "kernel_decl.h"
 #if defined(__x86_64__) || defined(_M_X64)
@@ -145,10 +145,10 @@ inline float quantize_activations_to_i8(const float* x, int n, int8_t* x_q) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// I2_S DECODE (AVX2)
+// BLOCK-SCALED TERNARY DECODE (AVX2)
 // ═══════════════════════════════════════════════════════════════════════════
-// 128 I2_S packed weights -> int8 ternary
-inline void decode_i2s_block_avx2(const uint8_t* packed, int8_t* ternary) {
+// 128 packed weights -> int8 ternary
+inline void decode_block_ternary_avx2(const uint8_t* packed, int8_t* ternary) {
     // 32 bytes -> 128 ternary values, 4 per byte
     for (int i = 0; i < 32; i++) {
         uint8_t byte = packed[i];
@@ -160,16 +160,16 @@ inline void decode_i2s_block_avx2(const uint8_t* packed, int8_t* ternary) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// I2_S KERNEL - ACTIVATION-PARALLEL TILING (AVX2)
+// BLOCK-SCALED KERNEL - ACTIVATION-PARALLEL TILING (AVX2)
 // ═══════════════════════════════════════════════════════════════════════════
 // 128 columns per tile. INT8 quantize activations, decode weights to int8,
 // then INT8 dot-product with per-block scale dequant.
 #define COL_BLOCK_SIZE 128
 
-void ternary_mul_avx2_i2s(const uint8_t* const* i2s_block_data,
-                          const float* const* i2s_block_scales,
-                          int out_f, int in_f, int n_blocks,
-                          const float* input, float* output) {
+void ternary_mul_avx2_blocks(const uint8_t* const* const* term_block_data,
+                             const float* const* const* term_block_scales,
+                             int n_terms, int out_f, int in_f, int n_blocks,
+                             const float* input, float* output) {
     // INT8 quantized activation buffer
     int8_t* input_i8 = (int8_t*)alloca(in_f * sizeof(int8_t));
     int8_t* decoded_w = (int8_t*)alloca(COL_BLOCK_SIZE * sizeof(int8_t));
@@ -179,96 +179,116 @@ void ternary_mul_avx2_i2s(const uint8_t* const* i2s_block_data,
 
     #pragma omp parallel for
     for (int row = 0; row < out_f; row++) {
-        const uint8_t* row_data = i2s_block_data[row];
-        const float* row_scales = i2s_block_scales[row];
         float sum = 0.0f;
 
-        for (int b = 0; b < n_blocks; b++) {
-            const uint8_t* packed = row_data + b * (COL_BLOCK_SIZE / 4);
-            float w_scale = row_scales[b];
-            int block_start = b * COL_BLOCK_SIZE;
-            int block_end = std::min(block_start + COL_BLOCK_SIZE, in_f);
-            int block_size = block_end - block_start;
+        for (int t = 0; t < n_terms; t++) {
+            const uint8_t* row_data = term_block_data[t][row];
+            const float* row_scales = term_block_scales[t][row];
 
-            // I2_S decode -> int8
-            decode_i2s_block_avx2(packed, decoded_w);
+            for (int b = 0; b < n_blocks; b++) {
+                const uint8_t* packed = row_data + b * (COL_BLOCK_SIZE / 4);
+                float w_scale = row_scales[b];
+                int block_start = b * COL_BLOCK_SIZE;
+                int block_end = std::min(block_start + COL_BLOCK_SIZE, in_f);
+                int block_size = block_end - block_start;
 
-            // INT8 dot product
-            int32_t dot = 0;
-            for (int j = 0; j < block_size; j++) {
-                dot += (int32_t)input_i8[block_start + j] * (int32_t)decoded_w[j];
+                // Decode codes -> int8
+                decode_block_ternary_avx2(packed, decoded_w);
+
+                // INT8 dot product
+                int32_t dot = 0;
+                for (int j = 0; j < block_size; j++) {
+                    dot += (int32_t)input_i8[block_start + j] * (int32_t)decoded_w[j];
+                }
+                sum += (float)dot * w_scale;
             }
-            sum += (float)dot * w_scale;
         }
         output[row] = sum / act_scale;
     }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// FAIRYFUSE AVX-512 I2_S KERNEL
+// FAIRYFUSE AVX-512 BLOCK-SCALED KERNEL
 // ═══════════════════════════════════════════════════════════════════════════
 // Key insight: process ternary weights directly without INT8 quantization.
-// Decode I2_S codes (0=-1, 1=0, 2=+1) to AVX-512 masks and use
+// Decode 2-bit codes (0=-1, 1=0, 2=+1) to AVX-512 masks and use
 // _mm512_mask_add_ps / _mm512_mask_sub_ps — zero multiplications in loop.
 //
-// 16 input elements processed per AVX-512 iteration.  4 bytes of I2_S packed
+// 16 input elements processed per AVX-512 iteration.  4 bytes of packed
 // data provide 16 ternary codes.  No intermediate int8 decode needed.
 // ~3× fewer memory ops vs old decode+dot approach.
 #if defined(__x86_64__) || defined(_M_X64)
-__attribute__((target("avx512f,avx512dq")))
-void ternary_mul_avx512_i2s_fairyfuse(
-    const uint8_t* const* i2s_block_data,
-    const float* const* i2s_block_scales,
-    int out_f, int in_f, int n_blocks,
+// Reverse the order of the four 2-bit ternary codes within a byte.
+// The pack contract (loader.h, pack_weights.py) is MSB-first:
+//   elem0 at bits 7:6 ... elem3 at bits 1:0.
+// On little-endian, pext pulls bit 0 (elem3) out first, so codes must be
+// reordered to ascending element order before the pext below, otherwise each
+// 4-element group comes out reversed and weights are scrambled.
+static inline uint8_t reverse_2bit_codes(uint8_t x) {
+    return (uint8_t)(((x & 0x03u) << 6) |
+                     ((x & 0x0Cu) << 2) |
+                     ((x & 0x30u) >> 2) |
+                     ((x & 0xC0u) >> 6));
+}
+
+__attribute__((target("avx512f,avx512dq,bmi2")))
+void ternary_mul_avx512_fairyfuse(
+    const uint8_t* const* const* term_block_data,
+    const float* const* const* term_block_scales,
+    int n_terms, int out_f, int in_f, int n_blocks,
     const float* input, float* output) {
 
     #pragma omp parallel for
     for (int row = 0; row < out_f; row++) {
-        const uint8_t* row_data = i2s_block_data[row];
-        const float* row_scales = i2s_block_scales[row];
         __m512 vacc = _mm512_setzero_ps();
 
-        for (int b = 0; b < n_blocks; b++) {
-            const uint8_t* packed = row_data + b * (COL_BLOCK_SIZE / 4);
-            float w_scale = row_scales[b];
-            int block_start = b * COL_BLOCK_SIZE;
-            int block_size = std::min(COL_BLOCK_SIZE, in_f - block_start);
+        for (int t = 0; t < n_terms; t++) {
+            const uint8_t* row_data = term_block_data[t][row];
+            const float* row_scales = term_block_scales[t][row];
 
-            // Accumulate block in FP32, apply w_scale at block end.
-            __m512 bacc = _mm512_setzero_ps();
-            int nb = (block_size + 15) / 16;
+            for (int b = 0; b < n_blocks; b++) {
+                const uint8_t* packed = row_data + b * (COL_BLOCK_SIZE / 4);
+                float w_scale = row_scales[b];
+                int block_start = b * COL_BLOCK_SIZE;
+                int block_size = std::min(COL_BLOCK_SIZE, in_f - block_start);
 
-            for (int j = 0; j < nb; j++) {
-                int base = j * 16;
-                int rem = block_size - base;
-                int chunk = rem > 16 ? 16 : rem;
+                // Accumulate block in FP32, apply w_scale at block end.
+                __m512 bacc = _mm512_setzero_ps();
+                int nb = (block_size + 15) / 16;
 
-                // Load 4 bytes from packed I2_S data
-                uint32_t codes32;
-                std::memcpy(&codes32, &packed[j * 4], 4);
+                for (int j = 0; j < nb; j++) {
+                    int base = j * 16;
+                    int rem = block_size - base;
+                    int chunk = rem > 16 ? 16 : rem;
 
-                // Decode 16 codes into add/sub masks in one go
-                // Codes: 0=-1(bin00), 1=0(bin01), 2=+1(bin10)
-                uint16_t add_mask = 0, sub_mask = 0;
-                for (int bit = 0; bit < chunk; bit++) {
-                    int bi = bit * 2;
-                    int code = (codes32 >> bi) & 0x03;
-                    if (code == 2)      add_mask |= (1 << bit);
-                    else if (code == 0) sub_mask |= (1 << bit);
+                    // Load 4 bytes from packed block data
+                    uint32_t codes32;
+                    std::memcpy(&codes32, &packed[j * 4], 4);
+                    // Reorder each byte to ascending element order
+                    codes32 = (uint32_t)reverse_2bit_codes((uint8_t)(codes32 & 0xFF)) |
+                              ((uint32_t)reverse_2bit_codes((uint8_t)((codes32 >> 8) & 0xFF)) << 8) |
+                              ((uint32_t)reverse_2bit_codes((uint8_t)((codes32 >> 16) & 0xFF)) << 16) |
+                              ((uint32_t)reverse_2bit_codes((uint8_t)((codes32 >> 24) & 0xFF)) << 24);
+
+                    // Decode 16 codes into add/sub masks in one go via BMI2 pext.
+                    uint32_t lo_bits = _pext_u32(codes32, 0x55555555u);
+                    uint32_t hi_bits = _pext_u32(codes32, 0xAAAAAAAAu);
+                    uint16_t add_mask = (uint16_t)(hi_bits & ~lo_bits);
+                    uint16_t sub_mask = (uint16_t)(~(hi_bits | lo_bits) & 0xFFFFu);
+
+                    // Mask the load for the last chunk to avoid reading past end
+                    __mmask16 ld_mask = (chunk == 16) ? (__mmask16)-1
+                                                      : (__mmask16)((1 << chunk) - 1);
+                    __m512 zero = _mm512_setzero_ps();
+                    __m512 vin  = _mm512_mask_loadu_ps(zero, ld_mask, &input[block_start + base]);
+                    __m512 tmp  = _mm512_mask_add_ps(zero, (__mmask16)add_mask, zero, vin);
+                    tmp         = _mm512_mask_sub_ps(tmp,  (__mmask16)sub_mask, zero, vin);
+                    bacc = _mm512_add_ps(bacc, tmp);
                 }
 
-                // Mask the load for the last chunk to avoid reading past end
-                __mmask16 ld_mask = (chunk == 16) ? (__mmask16)-1
-                                                  : (__mmask16)((1 << chunk) - 1);
-                __m512 zero = _mm512_setzero_ps();
-                __m512 vin  = _mm512_mask_loadu_ps(zero, ld_mask, &input[block_start + base]);
-                __m512 tmp  = _mm512_mask_add_ps(zero, (__mmask16)add_mask, zero, vin);
-                tmp         = _mm512_mask_sub_ps(tmp,  (__mmask16)sub_mask, zero, vin);
-                bacc = _mm512_add_ps(bacc, tmp);
+                // Fused multiply-add: vacc += w_scale * bacc
+                vacc = _mm512_fmadd_ps(_mm512_set1_ps(w_scale), bacc, vacc);
             }
-
-            // Fused multiply-add: vacc += w_scale * bacc
-            vacc = _mm512_fmadd_ps(_mm512_set1_ps(w_scale), bacc, vacc);
         }
 
         output[row] = _mm512_reduce_add_ps(vacc);
@@ -277,38 +297,40 @@ void ternary_mul_avx512_i2s_fairyfuse(
 #endif
 
 // ═══════════════════════════════════════════════════════════════════════════
-// SCALAR I2_S KERNEL (for validation)
+// SCALAR BLOCK-SCALED KERNEL (for validation)
 // ═══════════════════════════════════════════════════════════════════════════
-void ternary_mul_scalar_i2s(const uint8_t* const* i2s_block_data,
-                            const float* const* i2s_block_scales,
-                            int out_f, int in_f, int n_blocks,
-                            const float* input, float* output) {
+void ternary_mul_scalar_blocks(const uint8_t* const* const* term_block_data,
+                               const float* const* const* term_block_scales,
+                               int n_terms, int out_f, int in_f, int n_blocks,
+                               const float* input, float* output) {
     #pragma omp parallel for
     for (int row = 0; row < out_f; row++) {
-        const uint8_t* row_data = i2s_block_data[row];
-        const float* row_scales = i2s_block_scales[row];
         float sum = 0.0f;
-        for (int b = 0; b < n_blocks; b++) {
-            const uint8_t* packed = row_data + b * (COL_BLOCK_SIZE / 4);
-            float w_scale = row_scales[b];
-            int block_start = b * COL_BLOCK_SIZE;
-            int block_end = std::min(block_start + COL_BLOCK_SIZE, in_f);
-            int block_size = block_end - block_start;
+        for (int t = 0; t < n_terms; t++) {
+            const uint8_t* row_data = term_block_data[t][row];
+            const float* row_scales = term_block_scales[t][row];
+            for (int b = 0; b < n_blocks; b++) {
+                const uint8_t* packed = row_data + b * (COL_BLOCK_SIZE / 4);
+                float w_scale = row_scales[b];
+                int block_start = b * COL_BLOCK_SIZE;
+                int block_end = std::min(block_start + COL_BLOCK_SIZE, in_f);
+                int block_size = block_end - block_start;
 
-            // Decode I2_S and dot product
-            float block_sum = 0.0f;
-            for (int j = 0; j < block_size; j += 4) {
-                uint8_t byte = packed[j / 4];
-                int8_t t0 = ((byte >> 6) & 0x03) - 1;
-                int8_t t1 = ((byte >> 4) & 0x03) - 1;
-                int8_t t2 = ((byte >> 2) & 0x03) - 1;
-                int8_t t3 = (byte & 0x03) - 1;
-                if (j+0 < block_size) block_sum += input[block_start + j + 0] * t0;
-                if (j+1 < block_size) block_sum += input[block_start + j + 1] * t1;
-                if (j+2 < block_size) block_sum += input[block_start + j + 2] * t2;
-                if (j+3 < block_size) block_sum += input[block_start + j + 3] * t3;
+                // Decode codes and dot product
+                float block_sum = 0.0f;
+                for (int j = 0; j < block_size; j += 4) {
+                    uint8_t byte = packed[j / 4];
+                    int8_t t0 = ((byte >> 6) & 0x03) - 1;
+                    int8_t t1 = ((byte >> 4) & 0x03) - 1;
+                    int8_t t2 = ((byte >> 2) & 0x03) - 1;
+                    int8_t t3 = (byte & 0x03) - 1;
+                    if (j+0 < block_size) block_sum += input[block_start + j + 0] * t0;
+                    if (j+1 < block_size) block_sum += input[block_start + j + 1] * t1;
+                    if (j+2 < block_size) block_sum += input[block_start + j + 2] * t2;
+                    if (j+3 < block_size) block_sum += input[block_start + j + 3] * t3;
+                }
+                sum += block_sum * w_scale;
             }
-            sum += block_sum * w_scale;
         }
         output[row] = sum;
     }

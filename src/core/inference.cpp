@@ -53,7 +53,7 @@ int KVCache::length(int layer) const {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// DISPATCH: I2_S → raw FP32 → standard ternary
+// DISPATCH: block-scaled → raw FP32 → standard ternary
 // ═══════════════════════════════════════════════════════════════════════════
 void ternary_linear_dispatch(const LayerData& layer,
                               const float* input, float* output) {
@@ -68,10 +68,10 @@ void ternary_linear_dispatch(const LayerData& layer,
                 sum += w[j] * input[j];
             output[row] = sum;
         }
-    } else if (layer.has_i2s) {
-        Logger::debug("ternary_linear(i2s) out=%d in=%d",
+    } else if (layer.has_blocks) {
+        Logger::debug("ternary_linear(blocks) out=%d in=%d",
                       layer.out_features, layer.in_features);
-        ternary_linear_i2s(layer, input, output);
+        ternary_linear_blocks(layer, input, output);
     } else {
         Logger::debug("ternary_linear(standard) out=%d in=%d",
                       layer.out_features, layer.in_features);
@@ -142,6 +142,7 @@ void apply_rope(float* q, float* k, int seq_pos,
 void attention(float* x, int seq_pos, const ModelConfig& cfg,
                const LayerData& q_proj, const LayerData& k_proj,
                const LayerData& v_proj, const LayerData& o_proj,
+               const std::vector<float>& q_norm, const std::vector<float>& k_norm,
                const RoPECache& rope, KVCache& kv_cache, int layer_idx) {
     int H = cfg.num_attention_heads;
     int KV = cfg.num_key_value_heads;
@@ -152,10 +153,33 @@ void attention(float* x, int seq_pos, const ModelConfig& cfg,
     Logger::debug("attention layer=%d seq_pos=%d H=%d KV=%d HD=%d",
                   layer_idx, seq_pos, H, KV, HD);
 
-    std::vector<float> q(HS), k(KV * HD), v(KV * HD);
+    // q_proj output width = H * head_dim, which for Qwen3 (2048) is WIDER
+    // than hidden_size (1024) — never size q from HS.
+    std::vector<float> q(H * HD), k(KV * HD), v(KV * HD);
     ternary_linear_dispatch(q_proj, x, q.data());
     ternary_linear_dispatch(k_proj, x, k.data());
     ternary_linear_dispatch(v_proj, x, v.data());
+
+    // Qwen3-style per-head Q/K RMSNorm (weight shape [head_dim], shared
+    // across heads) applied BEFORE RoPE. Skip when absent (SmolLM2 etc.).
+    if (!q_norm.empty() && (int)q_norm.size() == HD) {
+        for (int h = 0; h < H; h++) {
+            float* qh = q.data() + h * HD;
+            float m2 = 0.0f;
+            for (int j = 0; j < HD; j++) m2 += qh[j] * qh[j];
+            float r = 1.0f / std::sqrt(m2 / (float)HD + cfg.rms_norm_eps);
+            for (int j = 0; j < HD; j++) qh[j] *= q_norm[j] * r;
+        }
+    }
+    if (!k_norm.empty() && (int)k_norm.size() == HD) {
+        for (int h = 0; h < KV; h++) {
+            float* kh = k.data() + h * HD;
+            float m2 = 0.0f;
+            for (int j = 0; j < HD; j++) m2 += kh[j] * kh[j];
+            float r = 1.0f / std::sqrt(m2 / (float)HD + cfg.rms_norm_eps);
+            for (int j = 0; j < HD; j++) kh[j] *= k_norm[j] * r;
+        }
+    }
 
     apply_rope(q.data(), k.data(), seq_pos, H, KV, HD, rope);
 
@@ -261,6 +285,7 @@ void transformer_block(float* x, int seq_pos, int layer_idx,
     rms_norm(x, norms.input_layernorm.data(), HS, cfg.rms_norm_eps);
     attention(x, seq_pos, cfg,
               layers[idx_q], layers[idx_k], layers[idx_v], layers[idx_o],
+              norms.q_norm, norms.k_norm,
               rope, kv_cache, layer_idx);
     if (!norms.attn_sub_norm.empty()) {
         for (int i = 0; i < HS; i++)
@@ -406,6 +431,13 @@ float* model_forward(int token, int seq_pos,
         static int dbg_count = 0;
         if (dbg_count++ < 3) {
             printf("[LOGIT] min=%.2f max=%.2f mean=%.2f max_idx=%d\n", min_v, max_v, mean, max_idx);
+        }
+        // TERLLAMA_DUMP_LOGITS: write full logits vector per forward to debug dir
+        const char* dump = getenv("TERLLAMA_DUMP_LOGITS");
+        if (dump && dbg) {
+            fprintf(dbg, "=== FULLLOGITS token=%d seq=%d ===\n", token, seq_pos);
+            for (int i = 0; i < cfg.vocab_size; i++)
+                fprintf(dbg, "%d %.6f\n", i, tls_logits[i]);
         }
     }
 

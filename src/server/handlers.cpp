@@ -145,6 +145,53 @@ std::vector<int> tokenize_with_helper(const std::string& prompt,
     return tokens;
 }
 
+// ── Decode fallback chain ─────────────────────────────────────────────────
+// 1. Native Tokenizer (SentencePiece/"llama" vocab from GGUF or JSON) — fast
+//    C++ path. Byte-level BPE ("gpt2") tokenizers can't be decoded natively;
+//    native decode() returns "?" for those.
+// 2. GigaToken wrapper (loaded from tokenizer.json in the model dir).
+// 3. Python decode helper (last resort; bundled decode_helper.py).
+std::string decode_with_fallback(const Tokenizer& tokenizer,
+                                 const std::shared_ptr<GigaTokenWrapper>& gigatoken,
+                                 const std::vector<int>& token_ids,
+                                 const std::string& helper_dir)
+{
+    // Fast path: native tokenizer (llama style)
+    {
+        std::string native = tokenizer.decode(token_ids);
+        if (!native.empty() && native != "?") return native;
+    }
+
+    // GigaToken path
+    if (gigatoken && gigatoken->has_tokenizer()) {
+        std::vector<uint32_t> ids(token_ids.begin(), token_ids.end());
+        std::string text = gigatoken->decode(ids);
+        if (!text.empty()) return text;
+    }
+
+    // Python decode helper (shared /tmp paths — same mutex as tokenize)
+    std::lock_guard<std::mutex> lock(g_tokenize_mutex);
+    std::string in_file  = "/tmp/ternary_decode_in.txt";
+    std::string out_file = "/tmp/ternary_decode_out.txt";
+    {
+        std::ofstream inf(in_file);
+        if (!inf) { Logger::error("Cannot write decode input file"); return ""; }
+        for (size_t i = 0; i < token_ids.size(); i++) {
+            if (i) inf << ' ';
+            inf << token_ids[i];
+        }
+    }
+    std::string script = helper_dir + "/decode_helper.py";
+    int ret = run_python_script(script);
+    if (ret != 0) { Logger::error("Decode failed"); return ""; }
+
+    std::ifstream outf(out_file);
+    if (!outf) return "";
+    std::string text((std::istreambuf_iterator<char>(outf)),
+                     std::istreambuf_iterator<char>());
+    return text;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // COMPLETION HELPERS
 // ═══════════════════════════════════════════════════════════════════════════
@@ -194,6 +241,7 @@ struct ModelSnap {
     std::vector<NormWeights> layer_norms;
     RoPECache rope;
     Tokenizer tokenizer;
+    std::shared_ptr<GigaTokenWrapper> gigatoken;
 };
 
 #include <sys/stat.h>
@@ -246,8 +294,10 @@ size_t get_model_size_bytes() {
         for (const auto& t : l.terms) {
             total += t.combined.size() * sizeof(uint32_t);
         }
-        for (const auto& b : l.i2s_blocks) {
-            total += b.packed.size() * sizeof(uint8_t);
+        for (const auto& set : l.block_terms) {
+            for (const auto& b : set) {
+                total += b.packed.size() * sizeof(uint8_t);
+            }
         }
     }
     total += g_model.rope.sin.size() * sizeof(float);
@@ -273,7 +323,8 @@ static ModelSnap snapshot_model() {
         g_model.final_norm,
         g_model.layer_norms,
         g_model.rope,
-        g_model.tokenizer
+        g_model.tokenizer,
+        g_model.gigatoken
     };
 }
 
@@ -422,7 +473,9 @@ void handle_chat_completions(const httplib::Request& req,
                     tls_decode_buffer.push_back(token);
                     bool is_eos = (token == 0);
                     if (tls_decode_buffer.size() >= 16 || is_eos) {
-                        std::string text = c->snap->tokenizer.decode(tls_decode_buffer);
+                        std::string text = decode_with_fallback(
+                            c->snap->tokenizer, c->snap->gigatoken,
+                            tls_decode_buffer, g_model.helper_dir);
                         if (!text.empty()) {
                             json delta = {
                                 {"role",    "assistant"},
@@ -455,7 +508,9 @@ void handle_chat_completions(const httplib::Request& req,
 
                 // Flush remaining buffered tokens
                 if (!tls_decode_buffer.empty()) {
-                    std::string text = ctx->snap->tokenizer.decode(tls_decode_buffer);
+                    std::string text = decode_with_fallback(
+                        ctx->snap->tokenizer, ctx->snap->gigatoken,
+                        tls_decode_buffer, g_model.helper_dir);
                     if (!text.empty()) {
                         json delta = {{"role","assistant"}, {"content",text}};
                         json chunk = {
@@ -494,8 +549,10 @@ void handle_chat_completions(const httplib::Request& req,
         std::string decoded;
         std::string prompt_decoded;
         {
-            decoded        = snap->tokenizer.decode(all_tokens);
-            prompt_decoded = snap->tokenizer.decode(prompt_tokens);
+            decoded        = decode_with_fallback(snap->tokenizer, snap->gigatoken,
+                                                  all_tokens, g_model.helper_dir);
+            prompt_decoded = decode_with_fallback(snap->tokenizer, snap->gigatoken,
+                                                  prompt_tokens, g_model.helper_dir);
         }
 
         std::string generated_text;
@@ -648,7 +705,9 @@ void handle_completions(const httplib::Request& req,
                     tls_decode_buffer.push_back(token);
                     bool is_eos = (token == 0);
                     if (tls_decode_buffer.size() >= 16 || is_eos) {
-                        std::string text = c->snap->tokenizer.decode(tls_decode_buffer);
+                        std::string text = decode_with_fallback(
+                            c->snap->tokenizer, c->snap->gigatoken,
+                            tls_decode_buffer, g_model.helper_dir);
                         if (!text.empty()) {
                             json choice = {
                                 {"index",         0},
@@ -679,7 +738,9 @@ void handle_completions(const httplib::Request& req,
 
                 // Flush remaining buffered tokens
                 if (!tls_decode_buffer.empty()) {
-                    std::string text = ctx->snap->tokenizer.decode(tls_decode_buffer);
+                    std::string text = decode_with_fallback(
+                        ctx->snap->tokenizer, ctx->snap->gigatoken,
+                        tls_decode_buffer, g_model.helper_dir);
                     if (!text.empty()) {
                         json choice = {
                             {"index",0}, {"text",text},
@@ -720,8 +781,10 @@ void handle_completions(const httplib::Request& req,
 
         std::string decoded, prompt_decoded;
         {
-            decoded        = snap->tokenizer.decode(all_tokens);
-            prompt_decoded = snap->tokenizer.decode(prompt_tokens);
+            decoded        = decode_with_fallback(snap->tokenizer, snap->gigatoken,
+                                                  all_tokens, g_model.helper_dir);
+            prompt_decoded = decode_with_fallback(snap->tokenizer, snap->gigatoken,
+                                                  prompt_tokens, g_model.helper_dir);
         }
 
         std::string generated_text;

@@ -39,7 +39,7 @@ struct alignas(64) BitplaneTerm {
 };
 
 // TQ1.0 packed weight block: 120 elements → 24 bytes Base-3 encoded (5 trits/byte)
-// ~1.58 bits/weight, 27% smaller than I2_S (4 trits/byte, 2 bits/weight)
+// ~1.58 bits/weight, 27% smaller than block-scaled ternary (4 trits/byte, 2 bits/weight)
 struct TQ1Block {
     std::vector<uint8_t> packed;  // Base-3 encoded (5 trits/byte)
     float scale{0.0f};            // per-block scale
@@ -77,9 +77,10 @@ inline void tq1_decode_block(const uint8_t* packed, int8_t* ternary, int n) {
     }
 }
 
-// I2_S packed weight block: 128 elements → 32 bytes codes + 4 bytes scale
-struct I2SBlock {
-    std::vector<uint8_t> packed;  // packed I2_S codes (4 values/byte)
+// Block-scaled ternary weight block: 128 elements → 32 bytes codes + 4 bytes scale
+// Codes: 4 ternary values per byte, {0=-1, 1=0, 2=+1} (MSB first).
+struct BlockTerm {
+    std::vector<uint8_t> packed;  // packed codes (4 values/byte)
     float scale{0.0f};            // per-block scale
 };
 
@@ -94,10 +95,24 @@ struct alignas(64) LayerData {
     std::vector<TQ1Block> tq1_blocks;
     int tq1_qk{120};  // 120 elements per block → 24 bytes packed
 
-    // I2_S direct storage (optional, for new kernel path)
-    bool has_i2s{false};
-    std::vector<I2SBlock> i2s_blocks;  // one block per (out_feature, 128-element chunk)
-    int i2s_qk{128};                    // block size
+    // Block-scaled ternary storage (ALS): each term is a full set of
+    // BlockTerm (out_features*n_blocks). Single-term layers are a 1-element set.
+    bool has_blocks{false};
+    int block_qk{128};                                  // block size (elements)
+    std::vector<std::vector<BlockTerm>> block_terms;    // [term] → [out_f * n_blocks]
+
+    // ─── Lazy contiguous cache for block kernels ────────────────────────
+    // Built once on first matmul (ternary_linear_blocks) instead of rebuilding
+    // the packed layout on every call. Saves ~40MB of memcpy + 200+
+    // allocations per generated token. Mutable: built lazily, reused across
+    // tokens. Safe because a single generate loop runs serially and each
+    // server request operates on its own snapshot copy.
+    // Per-term: [term][row] pointer arrays; term 0 = single-term path.
+    mutable bool term_cache_built{false};
+    mutable std::vector<std::vector<uint8_t>> term_contig_data;      // [term] flat packed
+    mutable std::vector<std::vector<float>> term_contig_scales;      // [term] flat scales
+    mutable std::vector<std::vector<const uint8_t*>> term_block_data;   // [term][row]
+    mutable std::vector<std::vector<const float*>> term_block_scales;   // [term][row]
 
     // Raw FP32 weights (for layers unsuitable for ternary, e.g. lm_head)
     bool has_raw_weights{false};

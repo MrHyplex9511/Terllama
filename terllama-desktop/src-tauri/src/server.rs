@@ -45,6 +45,11 @@ impl ServerManager {
             .join(".terllama/models")
             .join(&model_id);
 
+        // Resolve the HF repo name for this model (registry id -> hf_repo).
+        // decode_helper.py needs the real repo id (e.g. "HuggingFaceTB/SmolLM2-135M"),
+        // which differs from the registry id used as the directory name.
+        let hf_repo = resolve_hf_repo(&model_id).await;
+
         let binary = find_terllama_binary(resource_dir)?;
 
         // Scripts dir for engine Python helpers: bundled resources first,
@@ -74,7 +79,8 @@ impl ServerManager {
                 "TERLLAMA_MODEL_DIR",
                 models_dir.to_string_lossy().to_string(),
             )
-            .env("TERLLAMA_PORT", port.to_string());
+            .env("TERLLAMA_PORT", port.to_string())
+            .env("TERLLAMA_HF_MODEL", hf_repo);
         if let Some(sd) = scripts_dir {
             cmd.env("TERLLAMA_SCRIPT_DIR", sd.to_string_lossy().to_string());
         }
@@ -280,4 +286,18 @@ pub fn find_terllama_binary(resource_dir: Option<&std::path::Path>) -> Result<St
     }
 
     Err("terllama binary not found in PATH or common locations".to_string())
+}
+
+/// Resolve the HuggingFace repo id for a model registry id.
+/// Falls back to the registry id itself if the registry is unreachable.
+pub async fn resolve_hf_repo(model_id: &str) -> String {
+    match crate::download::fetch_registry().await {
+        Ok(registry) => registry
+            .models
+            .iter()
+            .find(|m| m.id == model_id)
+            .map(|m| m.hf_repo.clone())
+            .unwrap_or_else(|| model_id.to_string()),
+        Err(_) => model_id.to_string(),
+    }
 }

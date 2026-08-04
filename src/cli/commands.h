@@ -11,7 +11,7 @@
 #include <atomic>
 #include <csignal>
 
-#define TERLLAMA_VERSION "1.0.0"
+#define TERLLAMA_VERSION "1.0.5"
 
 // ═══════════════════════════════════════════════════════════════════════════
 // SIGNAL HANDLING (defined in commands.cpp, installed in main.cpp)

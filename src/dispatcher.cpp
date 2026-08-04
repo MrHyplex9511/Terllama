@@ -21,7 +21,7 @@ __attribute__((weak)) void ternary_mul_neon(const uint32_t* const*, const int*, 
 #endif
 
 // Use CPU detection from kernel_dispatch.h's inline variants for fine-grained ISA
-// but keep the dispatch functions here for I2_S and MoTE-specific logic
+// but keep the dispatch functions here for block-scaled and MoTE-specific logic
 CPUArch detect_cpu_arch() {
 #if defined(__x86_64__) || defined(_M_X64)
     #if defined(__GNUC__) || defined(__clang__)
@@ -94,66 +94,91 @@ void ternary_linear(const LayerData& layer, const float* input, float* output,
                        layer.out_features, layer.in_features, input, output);
 }
 
-__attribute__((weak)) void ternary_mul_avx2_i2s(
-    const uint8_t* const*, const float* const*, int, int, int, const float*, float*);
-__attribute__((weak)) void ternary_mul_avx512_i2s_fairyfuse(
-    const uint8_t* const*, const float* const*, int, int, int, const float*, float*);
-__attribute__((weak)) void ternary_mul_scalar_i2s(
-    const uint8_t* const*, const float* const*, int, int, int, const float*, float*);
+__attribute__((weak)) void ternary_mul_avx2_blocks(
+    const uint8_t* const* const*, const float* const* const*, int, int, int, int, const float*, float*);
+__attribute__((weak)) void ternary_mul_avx512_fairyfuse(
+    const uint8_t* const* const*, const float* const* const*, int, int, int, int, const float*, float*);
+__attribute__((weak)) void ternary_mul_scalar_blocks(
+    const uint8_t* const* const*, const float* const* const*, int, int, int, int, const float*, float*);
 
-void ternary_linear_i2s(const LayerData& layer, const float* input, float* output,
-                        CPUArch override_arch) {
-    if (!layer.has_i2s || layer.i2s_blocks.empty() || layer.in_features == 0) {
+void ternary_linear_blocks(const LayerData& layer, const float* input, float* output,
+                           CPUArch override_arch) {
+    if (!layer.has_blocks || layer.block_terms.empty() || layer.in_features == 0) {
         ternary_linear(layer, input, output, override_arch);
         return;
     }
 
-    int n_blocks = (layer.in_features + layer.i2s_qk - 1) / layer.i2s_qk;
-    int codes_per_block = layer.i2s_qk / 4;  // 32 for qk=128
+    // Multi-term layers are a set of block-scaled term sets; single-term
+    // layers are a 1-element set (all term sets share out_f × n_blocks shape).
+    int n_terms = (int)layer.block_terms.size();
+    int n_blocks = (layer.in_features + layer.block_qk - 1) / layer.block_qk;
+    int codes_per_block = layer.block_qk / 4;  // 32 for qk=128
 
-    // Build contiguous per-row data for the kernel
-    std::vector<uint8_t> contiguous_data((size_t)layer.out_features * n_blocks * codes_per_block);
-    std::vector<float>   contiguous_scales((size_t)layer.out_features * n_blocks);
-    for (int row = 0; row < layer.out_features; row++) {
-        for (int b = 0; b < n_blocks; b++) {
-            size_t idx = (size_t)row * n_blocks + b;
-            std::memcpy(&contiguous_data[(size_t)row * n_blocks * codes_per_block + b * codes_per_block],
-                        layer.i2s_blocks[idx].packed.data(), (size_t)codes_per_block);
-            contiguous_scales[(size_t)row * n_blocks + b] = layer.i2s_blocks[idx].scale;
+    // ─── Lazy contiguous layout cache ────────────────────────────────────
+    // Build the packed/scale buffers once and reuse for every token.
+    // Previously this rebuilt + re-memcpy'd the whole weight matrix on every
+    // matmul call (211 calls/token, ~40MB of copies) — a major decode cost.
+    // Multi-term: builds one contiguous set per term.
+    if (!layer.term_cache_built) {
+        layer.term_contig_data.resize(n_terms);
+        layer.term_contig_scales.resize(n_terms);
+        layer.term_block_data.resize(n_terms);
+        layer.term_block_scales.resize(n_terms);
+
+        for (int t = 0; t < n_terms; t++) {
+            const std::vector<BlockTerm>& blocks = layer.block_terms[t];
+            layer.term_contig_data[t].assign((size_t)layer.out_features * n_blocks * codes_per_block, 0);
+            layer.term_contig_scales[t].assign((size_t)layer.out_features * n_blocks, 0.0f);
+            layer.term_block_data[t].resize(layer.out_features);
+            layer.term_block_scales[t].resize(layer.out_features);
+            for (int row = 0; row < layer.out_features; row++) {
+                for (int b = 0; b < n_blocks; b++) {
+                    size_t idx = (size_t)row * n_blocks + b;
+                    std::memcpy(&layer.term_contig_data[t][(size_t)row * n_blocks * codes_per_block + b * codes_per_block],
+                                blocks[idx].packed.data(), (size_t)codes_per_block);
+                    layer.term_contig_scales[t][(size_t)row * n_blocks + b] = blocks[idx].scale;
+                }
+                layer.term_block_data[t][row] = &layer.term_contig_data[t][(size_t)row * n_blocks * codes_per_block];
+                layer.term_block_scales[t][row] = &layer.term_contig_scales[t][(size_t)row * n_blocks];
+            }
         }
-    }
-    std::vector<const uint8_t*> block_data(layer.out_features);
-    std::vector<const float*> block_scales(layer.out_features);
-    for (int row = 0; row < layer.out_features; row++) {
-        block_data[row] = &contiguous_data[(size_t)row * n_blocks * codes_per_block];
-        block_scales[row] = &contiguous_scales[(size_t)row * n_blocks];
+        layer.term_cache_built = true;
     }
 
     CPUArch arch = (override_arch != CPUArch::UNKNOWN) ? override_arch : detect_cpu_arch();
 
+    // Build per-term pointer arrays for the kernel (term-major).
+    // The kernels expect: term_block_data[t][row] → packed codes for row.
+    const uint8_t* const* term_data[32];
+    const float* const* term_scales[32];
+    for (int t = 0; t < n_terms && t < 32; t++) {
+        term_data[t] = layer.term_block_data[t].data();
+        term_scales[t] = layer.term_block_scales[t].data();
+    }
+
 #if defined(__x86_64__) || defined(_M_X64)
     // FairyFuse AVX-512 path — zero-multiplication masked ternary kernel
     if (arch == CPUArch::X86_64_AVX512) {
-        if (ternary_mul_avx512_i2s_fairyfuse) {
-            ternary_mul_avx512_i2s_fairyfuse(block_data.data(), block_scales.data(),
-                                              layer.out_features, layer.in_features, n_blocks,
-                                              input, output);
+        if (ternary_mul_avx512_fairyfuse) {
+            ternary_mul_avx512_fairyfuse(term_data, term_scales,
+                                          n_terms, layer.out_features, layer.in_features, n_blocks,
+                                          input, output);
             return;
         }
     }
     if (arch == CPUArch::X86_64_AVX2) {
-        if (ternary_mul_avx2_i2s) {
-            ternary_mul_avx2_i2s(block_data.data(), block_scales.data(),
-                                 layer.out_features, layer.in_features, n_blocks,
-                                 input, output);
+        if (ternary_mul_avx2_blocks) {
+            ternary_mul_avx2_blocks(term_data, term_scales,
+                                    n_terms, layer.out_features, layer.in_features, n_blocks,
+                                    input, output);
             return;
         }
     }
 #endif
-    if (ternary_mul_scalar_i2s) {
-        ternary_mul_scalar_i2s(block_data.data(), block_scales.data(),
-                               layer.out_features, layer.in_features, n_blocks,
-                               input, output);
+    if (ternary_mul_scalar_blocks) {
+        ternary_mul_scalar_blocks(term_data, term_scales,
+                                  n_terms, layer.out_features, layer.in_features, n_blocks,
+                                  input, output);
         return;
     }
     ternary_linear(layer, input, output, override_arch);

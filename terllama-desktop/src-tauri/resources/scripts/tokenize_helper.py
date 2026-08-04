@@ -1,8 +1,9 @@
 """Read prompt from /tmp/ternary_prompt.txt. Write token IDs to /tmp/ternary_tokens.txt."""
-import sys
+import os, sys
 from transformers import AutoTokenizer
 
-t = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolLM2-135M")
+model_name = os.environ.get("TERLLAMA_HF_MODEL", "HuggingFaceTB/SmolLM2-135M")
+t = AutoTokenizer.from_pretrained(model_name)
 with open("/tmp/ternary_prompt.txt") as f:
     txt = f.read()
 ids = t.encode(txt)

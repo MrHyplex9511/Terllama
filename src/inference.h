@@ -62,6 +62,7 @@ void apply_rope(float* q, float* k, int seq_pos,
 void attention(float* x, int seq_pos, const ModelConfig& cfg,
                const LayerData& q_proj, const LayerData& k_proj,
                const LayerData& v_proj, const LayerData& o_proj,
+               const std::vector<float>& q_norm, const std::vector<float>& k_norm,
                const RoPECache& rope, KVCache& kv_cache, int layer_idx);
 
 // ─── SiLU + MLP ───────────────────────────────────────────────────────────

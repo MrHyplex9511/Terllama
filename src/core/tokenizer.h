@@ -17,5 +17,11 @@ struct Tokenizer {
                         const std::string& model,
                         int bos, int eos);
 
+    /// Load a HuggingFace tokenizer.json (HF tokenizer format) into this
+    /// tokenizer. Handles byte-level BPE (GPT2-style) and SentencePiece.
+    /// @param path path to tokenizer.json
+    /// @return true on success
+    bool load_from_tokenizer_json(const std::string& path);
+
     std::string decode(const std::vector<int>& token_ids) const;
 };

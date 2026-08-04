@@ -74,10 +74,10 @@ public:
         if (pk_threads) cfg.num_threads = std::max(1, std::stoi(pk_threads));
         if (pk_pin)     cfg.pin_threads = (std::string(pk_pin) == "1");
 
-        // Adjust for decode: memory-bound, fewer threads by default
-        if (phase == GenPhase::DECODE && !pk_threads) {
-            cfg.num_threads = std::max(1, cfg.num_threads / 2);
-        }
+        // NOTE: decode thread default is already num_cores_/2 in the constructor.
+        // Halving again here (was: cfg.num_threads / 2) double-halved to 1 thread
+        // on 4-core machines. Decode is memory-bound, so cores/2 is the intended
+        // spread; removing the second halving.
 
         Logger::info("Sandwich: phase=%s threads=%d batch=%d pin=%s",
                      phase_name(phase), cfg.num_threads, cfg.batch_size,

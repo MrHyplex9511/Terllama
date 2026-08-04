@@ -51,3 +51,6 @@ build-noomp/
 libgigatoken_rs.so
 third_party/gigatoken/
 .test-tmp/
+
+# Logs
+*.log

@@ -2,7 +2,7 @@
  * gguf_loader.cpp — GGUF format parser + Q2_0 decoder implementation
  *
  * Reads GGUF v3 files, extracts model config from metadata,
- * decodes Q2_0 quantized layers to I2_S format, and extracts
+ * decodes Q2_0 quantized layers to block-scaled layer data, and extracts
  * unquantized tensors (embedding, norms) for the inference engine.
  */
 #include "gguf_loader.h"
@@ -284,7 +284,7 @@ static bool extract_f32_tensor(const GGUFFile& gguf,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// CONVERT Q2_0 TENSOR TO I2_S LAYER DATA
+// CONVERT Q2_0 TENSOR TO BLOCK-SCALED LAYER DATA
 // ═══════════════════════════════════════════════════════════════════════════
 
 static bool convert_q2_0_to_layer(const GGUFFile& gguf,
@@ -301,29 +301,30 @@ static bool convert_q2_0_to_layer(const GGUFFile& gguf,
 
     layer.out_features = (int32_t)out_features;
     layer.in_features  = (int32_t)in_features;
-    layer.has_i2s      = true;
+    layer.has_blocks   = true;
     layer.num_terms    = 0;
-    layer.i2s_qk       = (int32_t)Q2_0_BLOCK_SIZE;  // always 128
+    layer.block_qk     = (int32_t)Q2_0_BLOCK_SIZE;  // always 128
 
     int qk = (int)Q2_0_BLOCK_SIZE;
     int n_blocks = (int)((in_features + qk - 1) / qk);
     int codes_per_block = qk / 4;  // 32
 
-    layer.i2s_blocks.resize((size_t)out_features * n_blocks);
+    layer.block_terms.resize(1);  // single term set
+    layer.block_terms[0].resize((size_t)out_features * n_blocks);
 
     const uint8_t* data_ptr = gguf.file_data.data() + (size_t)ti.offset;
 
     if (ti.type == 36) {
-        // Native I2_S format: 32 bytes packed codes per 128-element block, NO scale.
+        // Native packed format: 32 bytes packed codes per 128-element block, NO scale.
         // BitNet uses sub-layer normalization for scaling, not per-block scale.
         // Read 32 bytes codes; set scale = 1.0f.
         for (uint64_t row = 0; row < out_features; row++) {
             for (int b = 0; b < n_blocks; b++) {
                 int block_idx = (int)(row * n_blocks + b);
                 const uint8_t* block = data_ptr + (row * n_blocks + b) * 32;
-                auto& i2s = layer.i2s_blocks[block_idx];
-                i2s.packed.assign(block, block + codes_per_block);  // 32 bytes codes
-                i2s.scale = 1.0f;
+                auto& blk = layer.block_terms[0][block_idx];
+                blk.packed.assign(block, block + codes_per_block);  // 32 bytes codes
+                blk.scale = 1.0f;
             }
         }
     } else {
@@ -337,9 +338,9 @@ static bool convert_q2_0_to_layer(const GGUFFile& gguf,
                 float scale;
                 decode_q2_0_block(q2_block, codes, &scale);
 
-                auto& i2s = layer.i2s_blocks[block_idx];
-                i2s.packed.assign(codes, codes + codes_per_block);
-                i2s.scale = scale;
+                auto& blk = layer.block_terms[0][block_idx];
+                blk.packed.assign(codes, codes + codes_per_block);
+                blk.scale = scale;
             }
         }
     }

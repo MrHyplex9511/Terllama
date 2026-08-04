@@ -38,7 +38,7 @@ struct PackratConfig {
 };
 
 // ─── Synthetic micro-benchmark ─────────────────────────────────────────
-// Runs a ternary matmul with synthetic I2_S weights + random input.
+// Runs a ternary matmul with synthetic block-scaled weights + random input.
 // Measures throughput at different thread counts.
 class PackratTuner {
 public:
@@ -51,8 +51,8 @@ public:
     PackratConfig tune(int hidden_size, int intermediate_size) {
         PackratConfig cfg;
 
-        // Build synthetic I2_S layer data for benchmark
-        auto bench_layer = make_synthetic_i2s_layer(hidden_size, intermediate_size * 3);
+        // Build synthetic block-scaled layer data for benchmark
+        auto bench_layer = make_synthetic_blocks_layer(hidden_size, intermediate_size * 3);
         auto bench_input = make_random_input(hidden_size);
 
         // Test prefill (compute-bound): try all thread counts
@@ -122,29 +122,30 @@ private:
         max_test_threads_ = std::min(num_cores_, 32);  // cap at 32 for test
     }
 
-    // ─── Create synthetic I2_S layer for benchmarking ───────────────────
-    LayerData make_synthetic_i2s_layer(int out_features, int in_features) {
+    // ─── Create synthetic block-scaled layer for benchmarking ──────────
+    LayerData make_synthetic_blocks_layer(int out_features, int in_features) {
         LayerData ld;
         ld.name = "bench";
         ld.out_features = out_features;
         ld.in_features = in_features;
-        ld.has_i2s = true;
-        ld.i2s_qk = 128;
+        ld.has_blocks = true;
+        ld.block_qk = 128;
 
         int qk = 128;
         int n_blocks = (in_features + qk - 1) / qk;
         int codes_per_block = qk / 4;
-        ld.i2s_blocks.resize((size_t)out_features * n_blocks);
+        ld.block_terms.resize(1);
+        ld.block_terms[0].resize((size_t)out_features * n_blocks);
 
         // Fill with deterministic ternary patterns (not all zeros)
-        for (size_t i = 0; i < ld.i2s_blocks.size(); i++) {
-            ld.i2s_blocks[i].packed.resize(codes_per_block);
+        for (size_t i = 0; i < ld.block_terms[0].size(); i++) {
+            ld.block_terms[0][i].packed.resize(codes_per_block);
             for (int j = 0; j < codes_per_block; j++) {
                 uint8_t code = (uint8_t)((i * codes_per_block + j) % 3);
-                ld.i2s_blocks[i].packed[j] = (code << 6) | ((code + 1) % 3 << 4) |
-                                              ((code + 2) % 3 << 2) | code;
+                ld.block_terms[0][i].packed[j] = (code << 6) | ((code + 1) % 3 << 4) |
+                                                  ((code + 2) % 3 << 2) | code;
             }
-            ld.i2s_blocks[i].scale = 1.0f;
+            ld.block_terms[0][i].scale = 1.0f;
         }
         return ld;
     }
@@ -156,7 +157,7 @@ private:
         return v;
     }
 
-    // ─── Run a single benchmark: time ternary_linear_i2s ────────────────
+    // ─── Run a single benchmark: time ternary_linear_blocks ────────────
     double benchmark_matmul(const LayerData& layer,
                             const std::vector<float>& input,
                             int n_threads, int n_batches) {
@@ -167,7 +168,7 @@ private:
 
         // Warmup
         for (int w = 0; w < 3; w++) {
-            ternary_linear_i2s(layer, input.data(), output.data());
+            ternary_linear_blocks(layer, input.data(), output.data());
         }
 
         // Measured runs
@@ -175,7 +176,7 @@ private:
         int n_warm = 10;
         for (int b = 0; b < n_batches; b++) {
             for (int w = 0; w < n_warm; w++) {
-                ternary_linear_i2s(layer, input.data(), output.data());
+                ternary_linear_blocks(layer, input.data(), output.data());
             }
         }
         auto t1 = std::chrono::high_resolution_clock::now();

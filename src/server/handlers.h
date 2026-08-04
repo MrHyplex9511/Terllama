@@ -15,6 +15,7 @@
 #include "loader.h"
 #include "inference.h"
 #include "core/tokenizer.h"
+#include "core/gigatoken_wrapper.h"
 
 // ═══════════════════════════════════════════════════════════════════════════
 // SHARED GLOBAL STATE (defined in server.cpp)
@@ -32,6 +33,7 @@ struct ServerModelState {
     CPUArch arch{CPUArch::UNKNOWN};
     bool loaded{false};
     Tokenizer tokenizer;  // native tokenizer from GGUF metadata
+    std::shared_ptr<GigaTokenWrapper> gigatoken;  // HF tokenizer.json decode (byte-level BPE etc.)
 };
 
 extern ServerModelState g_model;
@@ -71,6 +73,15 @@ void send_error(httplib::Response& res, const std::string& message,
 
 std::vector<int> tokenize_with_helper(const std::string& prompt,
                                       const std::string& helper_dir);
+
+// ── Decode with fallback chain: native (llama) → GigaToken → Python ──────
+// The native Tokenizer only decodes SentencePiece-style ("llama") vocab.
+// Byte-level BPE models (e.g. SmolLM2 via tokenizer.json) decode through
+// GigaToken; if that's unavailable we fall back to the Python helper.
+std::string decode_with_fallback(const Tokenizer& tokenizer,
+                                 const std::shared_ptr<GigaTokenWrapper>& gigatoken,
+                                 const std::vector<int>& token_ids,
+                                 const std::string& helper_dir);
 
 // ═══════════════════════════════════════════════════════════════════════════
 // COMPLETION HELPERS

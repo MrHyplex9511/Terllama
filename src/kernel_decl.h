@@ -35,25 +35,29 @@ int extract_term_data(const LayerData& layer,
                       const uint32_t** term_data_out,
                       int* alpha_exps_out, int max_terms);
 
-void ternary_mul_avx2_i2s(const uint8_t* const* i2s_block_data,
-                          const float* const* i2s_block_scales,
-                          int out_f, int in_f, int n_blocks,
-                          const float* input, float* output);
-void ternary_mul_avx512_i2s_fairyfuse(
-    const uint8_t* const* i2s_block_data,
-    const float* const* i2s_block_scales,
-    int out_f, int in_f, int n_blocks,
+// Block-scaled ternary kernels: n_terms sets of (row → packed codes / scales)
+// pointer arrays.
+//   term_block_data[t]   = row pointer array for term t (packed codes per row)
+//   term_block_scales[t] = row pointer array for term t (scales per row)
+void ternary_mul_avx2_blocks(const uint8_t* const* const* term_block_data,
+                             const float* const* const* term_block_scales,
+                             int n_terms, int out_f, int in_f, int n_blocks,
+                             const float* input, float* output);
+void ternary_mul_avx512_fairyfuse(
+    const uint8_t* const* const* term_block_data,
+    const float* const* const* term_block_scales,
+    int n_terms, int out_f, int in_f, int n_blocks,
     const float* input, float* output);
-void ternary_mul_scalar_i2s(const uint8_t* const* i2s_block_data,
-                            const float* const* i2s_block_scales,
-                            int out_f, int in_f, int n_blocks,
-                            const float* input, float* output);
+void ternary_mul_scalar_blocks(const uint8_t* const* const* term_block_data,
+                               const float* const* const* term_block_scales,
+                               int n_terms, int out_f, int in_f, int n_blocks,
+                               const float* input, float* output);
 
 CPUArch detect_cpu_arch();
 void ternary_linear(const LayerData& layer, const float* input, float* output,
                     CPUArch override_arch = CPUArch::UNKNOWN);
-void ternary_linear_i2s(const LayerData& layer, const float* input, float* output,
-                        CPUArch override_arch = CPUArch::UNKNOWN);
+void ternary_linear_blocks(const LayerData& layer, const float* input, float* output,
+                           CPUArch override_arch = CPUArch::UNKNOWN);
 
 float validate_all_kernels(const LayerData& layer, const float* input,
                            float* output_reference = nullptr,

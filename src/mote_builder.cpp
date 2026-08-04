@@ -3,7 +3,7 @@
  *
  * Converts a standard dense ternary FFN to Mixture of Ternary Experts.
  * ALS grouping: distribute bitplane terms round-robin across K experts.
- * I2_S grouping: replicate blocks with perturbed scales.
+ * Block grouping: replicate block-scaled terms with perturbed scales.
  *
  * Usage: terllama mote-build <input_model_dir> <output_path> --experts K --topk k
  */
@@ -31,7 +31,7 @@ static void distribute_als_terms(const LayerData& src,
         expert_layers[e].out_features = src.out_features;
         expert_layers[e].in_features = src.in_features;
         expert_layers[e].has_raw_weights = false;
-        expert_layers[e].has_i2s = false;
+        expert_layers[e].has_blocks = false;
     }
 
     // Distribute terms round-robin
@@ -51,26 +51,27 @@ static void distribute_als_terms(const LayerData& src,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// I2_S block distribution: replicate with scale perturbation
+// Block term distribution: replicate with scale perturbation
 // ═══════════════════════════════════════════════════════════════════════════
-static void distribute_i2s_blocks(const LayerData& src,
+static void distribute_block_terms(const LayerData& src,
                                    int num_experts,
                                    std::vector<LayerData>& expert_layers) {
     expert_layers.resize(num_experts);
     for (int e = 0; e < num_experts; e++) {
         expert_layers[e].out_features = src.out_features;
         expert_layers[e].in_features = src.in_features;
-        expert_layers[e].has_i2s = true;
-        expert_layers[e].i2s_qk = src.i2s_qk;
+        expert_layers[e].has_blocks = true;
+        expert_layers[e].block_qk = src.block_qk;
         expert_layers[e].has_raw_weights = false;
 
-        // Replicate blocks with perturbed scales
-        expert_layers[e].i2s_blocks.resize(src.i2s_blocks.size());
-        for (size_t b = 0; b < src.i2s_blocks.size(); b++) {
-            expert_layers[e].i2s_blocks[b].packed = src.i2s_blocks[b].packed;
+        // Replicate blocks with perturbed scales (single term set per expert)
+        expert_layers[e].block_terms.resize(1);
+        expert_layers[e].block_terms[0] = src.block_terms[0];
+        for (size_t b = 0; b < expert_layers[e].block_terms[0].size(); b++) {
             // Perturb scale: multiply by (0.8 + 0.4 * e / (num_experts-1))
             float perturbation = 0.8f + 0.4f * (float)e / std::max(1, num_experts - 1);
-            expert_layers[e].i2s_blocks[b].scale = src.i2s_blocks[b].scale * perturbation;
+            expert_layers[e].block_terms[0][b].scale =
+                src.block_terms[0][b].scale * perturbation;
         }
 
         // Build combined[] bitplane for backward compat
@@ -81,7 +82,7 @@ static void distribute_i2s_blocks(const LayerData& src,
         term.n_elements = (size_t)src.out_features * src.in_features;
         term.combined.assign(n_words, 0);
 
-        int qk = src.i2s_qk;
+        int qk = src.block_qk;
         int n_blocks = (src.in_features + qk - 1) / qk;
         std::vector<int8_t> decoded(qk);
 
@@ -92,8 +93,8 @@ static void distribute_i2s_blocks(const LayerData& src,
                 int block_end = std::min(block_start + qk, src.in_features);
                 int block_size = block_end - block_start;
 
-                decode_i2s_block(expert_layers[e].i2s_blocks[block_idx].packed.data(),
-                                 decoded.data(), qk);
+                decode_block_ternary(expert_layers[e].block_terms[0][block_idx].packed.data(),
+                                     decoded.data(), qk);
 
                 for (int j = 0; j < block_size; j++) {
                     int8_t tv = decoded[j];
@@ -122,7 +123,7 @@ static void distribute_raw_weights(const LayerData& src,
         expert_layers[e].out_features = src.out_features;
         expert_layers[e].in_features = src.in_features;
         expert_layers[e].has_raw_weights = true;
-        expert_layers[e].has_i2s = false;
+        expert_layers[e].has_blocks = false;
         expert_layers[e].raw_weights = src.raw_weights;
 
         // Add small noise for diversity
@@ -143,8 +144,8 @@ static void distribute_layer(const LayerData& src,
                               std::vector<LayerData>& experts) {
     if (src.has_raw_weights) {
         distribute_raw_weights(src, num_experts, experts);
-    } else if (src.has_i2s) {
-        distribute_i2s_blocks(src, num_experts, experts);
+    } else if (src.has_blocks) {
+        distribute_block_terms(src, num_experts, experts);
     } else {
         distribute_als_terms(src, num_experts, experts);
     }
@@ -239,7 +240,7 @@ int cmd_mote_build(int argc, char** argv) {
             }
         }
 
-        Logger::debug("  Layer {}: {} experts x {} ALS/I2_S terms",
+        Logger::debug("  Layer {}: {} experts x {} ALS/block terms",
                       i, num_experts, ml.expert_gate[0].num_terms);
     }
 
@@ -307,7 +308,7 @@ int cmd_mote_list(int argc, char** argv) {
                      ml.router_weight.size());
         Logger::info("    Experts: {} {} {} ({} terms each)",
                      ml.expert_gate.size(),
-                     ml.expert_gate[0].has_i2s ? "I2_S" : (ml.expert_gate[0].has_raw_weights ? "RAW" : "ALS"),
+                     ml.expert_gate[0].has_blocks ? "BLK" : (ml.expert_gate[0].has_raw_weights ? "RAW" : "ALS"),
                      ml.expert_gate[0].num_terms > 0 ? ("terms=" + std::to_string(ml.expert_gate[0].num_terms)) : "",
                      ml.expert_gate[0].num_terms);
     }

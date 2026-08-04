@@ -126,47 +126,53 @@ static int run_python_script(const std::string& script_path) {
 // TOKENIZER (Python helper for encode only; native C++ decode)
 // ═══════════════════════════════════════════════════════════════════════════
 
+// Shared GigaToken instance for the CLI (encode + decode).
+static GigaTokenWrapper g_cli_gigatoken;
+static bool             g_cli_gigatoken_ok = false;
+static std::once_flag   g_cli_gigatoken_flag;
+
+// Lazy-load libgigatoken_rs.so + HF tokenizer.json from the model dir.
+// Thread-safe via std::call_once.
+static void ensure_gigatoken(const std::string& model_dir) {
+    std::call_once(g_cli_gigatoken_flag, [&]() {
+        if (model_dir.empty()) return;
+        // Search for .so next to binary, then CWD, then third_party
+        char exe_buf[4096];
+        ssize_t exe_len = readlink("/proc/self/exe", exe_buf, sizeof(exe_buf) - 1);
+        std::string exe_dir;
+        if (exe_len > 0) {
+            exe_buf[exe_len] = '\0';
+            exe_dir = std::string(exe_buf);
+            auto p = exe_dir.rfind('/');
+            if (p != std::string::npos) exe_dir = exe_dir.substr(0, p);
+        }
+        std::string so_paths = ".:./bin";
+        if (!exe_dir.empty()) so_paths = exe_dir + ":" + so_paths;
+        g_cli_gigatoken_ok = g_cli_gigatoken.load(so_paths);
+        if (g_cli_gigatoken_ok) {
+            g_cli_gigatoken_ok = g_cli_gigatoken.load_tokenizer(model_dir);
+            if (g_cli_gigatoken_ok) {
+                Logger::info(("GigaToken: loaded tokenizer from " + model_dir).c_str());
+            } else {
+                Logger::info(("GigaToken: no tokenizer.json in " + model_dir + ", fallback to Python").c_str());
+            }
+        } else {
+            Logger::info("GigaToken: .so not found, using Python subprocess");
+        }
+    });
+}
+
 // Try GigaToken encode first; fall back to Python subprocess.
 // model_dir should contain tokenizer.json for GigaToken to load.
 static std::vector<int> tokenize_with_helper(const std::string& prompt,
                                               const std::string& helper_dir,
                                               const std::string& model_dir = "") {
     // ── Try GigaToken (fast Rust) ─────────────────────────────────────
-    // Thread-safe init via std::call_once
-    if (!model_dir.empty()) {
-        static GigaTokenWrapper gt;
-        static bool gt_ok = false;
-        static std::once_flag gt_flag;
-        std::call_once(gt_flag, [&]() {
-            // Search for .so next to binary, then CWD, then third_party
-            char exe_buf[4096];
-            ssize_t exe_len = readlink("/proc/self/exe", exe_buf, sizeof(exe_buf) - 1);
-            std::string exe_dir;
-            if (exe_len > 0) {
-                exe_buf[exe_len] = '\0';
-                exe_dir = std::string(exe_buf);
-                auto p = exe_dir.rfind('/');
-                if (p != std::string::npos) exe_dir = exe_dir.substr(0, p);
-            }
-            std::string so_paths = ".:./bin";
-            if (!exe_dir.empty()) so_paths = exe_dir + ":" + so_paths;
-            gt_ok = gt.load(so_paths);
-            if (gt_ok) {
-                gt_ok = gt.load_tokenizer(model_dir);
-                if (gt_ok) {
-                    Logger::info(("GigaToken: loaded tokenizer from " + model_dir).c_str());
-                } else {
-                    Logger::info(("GigaToken: no tokenizer.json in " + model_dir + ", fallback to Python").c_str());
-                }
-            } else {
-                Logger::info("GigaToken: .so not found, using Python subprocess");
-            }
-        });
-        if (gt_ok && gt.has_tokenizer()) {
-            auto ids = gt.encode(prompt);
-            if (!ids.empty()) {
-                return std::vector<int>(ids.begin(), ids.end());
-            }
+    ensure_gigatoken(model_dir);
+    if (g_cli_gigatoken_ok && g_cli_gigatoken.has_tokenizer()) {
+        auto ids = g_cli_gigatoken.encode(prompt);
+        if (!ids.empty()) {
+            return std::vector<int>(ids.begin(), ids.end());
         }
     }
 
@@ -185,6 +191,43 @@ static std::vector<int> tokenize_with_helper(const std::string& prompt,
     int tid;
     while (tf >> tid) tokens.push_back(tid);
     return tokens;
+}
+
+// Decode with fallback: native (llama) → GigaToken (byte-level BPE) →
+// Python helper. Mirrors the server-side chain.
+static std::string decode_with_fallback(const Tokenizer& tokenizer,
+                                         const std::vector<int>& token_ids,
+                                         const std::string& helper_dir,
+                                         const std::string& model_dir = "") {
+    // Fast path: native tokenizer (llama style)
+    {
+        std::string native = tokenizer.decode(token_ids);
+        if (!native.empty() && native != "?") return native;
+    }
+
+    // GigaToken path
+    ensure_gigatoken(model_dir);
+    if (g_cli_gigatoken_ok && g_cli_gigatoken.has_tokenizer()) {
+        std::vector<uint32_t> ids(token_ids.begin(), token_ids.end());
+        std::string text = g_cli_gigatoken.decode(ids);
+        if (!text.empty()) return text;
+    }
+
+    // Python decode helper (shared /tmp paths)
+    std::string in_file  = "/tmp/ternary_decode_in.txt";
+    std::string out_file = "/tmp/ternary_decode_out.txt";
+    {
+        std::ofstream inf(in_file);
+        inf << token_ids[0];
+        for (size_t i = 1; i < token_ids.size(); i++) inf << ' ' << token_ids[i];
+    }
+    int ret = run_python_script(helper_dir + "/decode_helper.py");
+    if (ret != 0) { Logger::error("Decode failed"); return ""; }
+
+    std::ifstream outf(out_file);
+    if (!outf) return "";
+    return std::string((std::istreambuf_iterator<char>(outf)),
+                       std::istreambuf_iterator<char>());
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -442,8 +485,10 @@ static int cmd_chat_simple(const std::string& model_id,
 
     std::vector<int> all_tokens = prompt_tokens;
     all_tokens.insert(all_tokens.end(), output_tokens.begin(), output_tokens.end());
-    std::string decoded = loaded.tokenizer.decode(all_tokens);
-    std::string prompt_decoded = loaded.tokenizer.decode(prompt_tokens);
+    std::string decoded = decode_with_fallback(loaded.tokenizer, all_tokens,
+                                               helper_dir, model_dir);
+    std::string prompt_decoded = decode_with_fallback(loaded.tokenizer, prompt_tokens,
+                                                      helper_dir, model_dir);
 
     Logger::info("=== Response ===");
     Logger::info(decoded.c_str());
@@ -523,7 +568,8 @@ int cmd_chat(int argc, char** argv) {
 
             std::vector<int> all = tokens;
             all.insert(all.end(), out_tokens.begin(), out_tokens.end());
-            std::string text = loaded.tokenizer.decode(all);
+            std::string text = decode_with_fallback(loaded.tokenizer, all,
+                                                    helper_dir, model_dir);
 
             Logger::info("AI:  {}", text);
             double itok = (double)(tokens.size() + out_tokens.size());
@@ -750,7 +796,8 @@ int cmd_legacy(const std::string& prompt, int max_tokens, float temperature) {
 
     std::vector<int> all_tokens = prompt_tokens;
     all_tokens.insert(all_tokens.end(), output_tokens.begin(), output_tokens.end());
-    std::string decoded = loaded.tokenizer.decode(all_tokens);
+    std::string decoded = decode_with_fallback(loaded.tokenizer, all_tokens,
+                                               helper_dir, model_dir);
 
     Logger::info(decoded.c_str());
 

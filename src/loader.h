@@ -2,8 +2,8 @@
  * loader.h: Binary file I/O for Terllama model files
  *
  * Two formats:
- *   model_decomposed.bin        ALS bitplane format (original)
- *   model_decomposed_i2s.bin    I2_S packed format (BitNet-style)
+ *   model_decomposed.bin        ALS block-scaled format (magic 0xDEADBEEF)
+ *   model_decomposed_i2s.bin    legacy I2_S packed format (magic 0x5F533249)
  *   model_extra.bin             embedding + RMSNorm weights
  *
  * Also supports GGUF format (via gguf_loader.h):
@@ -21,6 +21,8 @@
 #include <vector>
 #include <string>
 #include <cstring>
+#include <cctype>
+#include <algorithm>
 #include <cmath>
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -39,41 +41,17 @@ inline int8_t decode_ternary(const uint8_t* data, size_t pos) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// I2_S DECODER (BitNet-style: 4 ternary values per byte)
+// BLOCK-SCALED TERNARY DECODER (4 ternary values per byte)
 // ═══════════════════════════════════════════════════════════════════════════
 // Format: 4 ternary values per byte, codes {0=-1, 1=0, 2=+1}
 // Per byte (MSB to LSB): [elem0(2bit), elem1(2bit), elem2(2bit), elem3(2bit)]
-inline void decode_i2s_block(const uint8_t* packed, int8_t* ternary, int qk) {
+inline void decode_block_ternary(const uint8_t* packed, int8_t* ternary, int qk) {
     for (int i = 0; i < qk / 4; i++) {
         uint8_t byte = packed[i];
         ternary[i*4 + 0] = ((byte >> 6) & 0x03) - 1;  // 0→-1, 1→0, 2→+1
         ternary[i*4 + 1] = ((byte >> 4) & 0x03) - 1;
         ternary[i*4 + 2] = ((byte >> 2) & 0x03) - 1;
         ternary[i*4 + 3] = (byte & 0x03) - 1;
-    }
-}
-
-// Decode I2_S row to combined[] bitplane format
-inline void i2s_row_to_combined(const uint8_t* row_packed,
-                                 int in_features, int qk, uint32_t* combined) {
-    int n_blocks = (in_features + qk - 1) / qk;
-    std::vector<int8_t> decoded(qk);
-    for (int b = 0; b < n_blocks; b++) {
-        int block_start = b * qk;
-        int block_end = std::min(block_start + qk, in_features);
-        int block_size = block_end - block_start;
-
-        // Decode I2_S to int8 ternary values
-        decode_i2s_block(row_packed + b * (qk / 4), decoded.data(), qk);
-
-        // Write to combined[] bitplane format
-        for (int j = 0; j < block_size; j++) {
-            int8_t tv = decoded[j];
-            int word = (block_start + j) / 16;
-            int bit = (block_start + j) % 16;
-            if (tv == 1)      combined[word] |= (1 << (bit + 16));       // nz only
-            else if (tv == -1) combined[word] |= (1 << (bit + 16)) | (1 << bit); // nz + neg
-        }
     }
 }
 
@@ -95,6 +73,14 @@ inline ModelConfig load_config(const std::string& path) {
     f.read(reinterpret_cast<char*>(&rne), 4);
     f.read(reinterpret_cast<char*>(&rt), 4);
     f.read(reinterpret_cast<char*>(&mpe), 4);
+    // KV cache memory guard: max_position_embeddings is the rope/KV length,
+    // so huge config values (e.g. Qwen3 40960) would pre-allocate ~9 GB of
+    // cache on this machine. Cap the *effective* context; generation beyond
+    // this is not supported for such models (short-prompt testing is fine).
+    if (mpe > 4096) {
+        Logger::warn("Capping max_position_embeddings {} -> 4096 (KV cache memory guard)", mpe);
+        mpe = 4096;
+    }
     cfg = {vs, hs, is, nl, nah, nkv, rne, rt, mpe, hs / nah};
     return cfg;
 }
@@ -125,6 +111,8 @@ struct NormWeights {
     std::vector<float> post_attention_layernorm;
     std::vector<float> attn_sub_norm;  // BitNet: scale attention output before residual
     std::vector<float> ffn_sub_norm;   // BitNet: scale FFN output before residual
+    std::vector<float> q_norm;         // Qwen3: per-head Q RMSNorm weight [head_dim]
+    std::vector<float> k_norm;         // Qwen3: per-head K RMSNorm weight [head_dim]
 };
 
 inline std::vector<NormWeights> load_layer_norms(const std::string& path, const ModelConfig& cfg) {
@@ -213,19 +201,163 @@ inline std::vector<LayerData> load_decomposed_layers(const std::string& path) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// I2_S LAYER LOADER (model_decomposed_i2s.bin)
+// ALS LAYER LOADER (model_decomposed.bin / legacy model_decomposed_i2s.bin)
 // ═══════════════════════════════════════════════════════════════════════════
-// Format: magic(I2S_=0x5F533249), num_layers(uint32)
-//   per layer: name_len(uint32), name, out_f(uint32), in_f(uint32),
-//              data_len(uint32), packed_data
-//   packed_data = codes(4val/byte) + scales(per-block float32)
-inline std::vector<LayerData> load_decomposed_layers_i2s(const std::string& path) {
+// ALS is the only quantized format. Two magics are accepted:
+//   ALS:   magic 0xDEADBEEF — layer layout is auto-sniffed per layer:
+//          * old ALS export: u32 num_terms after in_f (0 = raw FP32, else
+//            num_terms × [alpha(int32) + packed 2-bit ternary codes]); loaded
+//            as classic bitplane terms (matches load_decomposed_layers).
+//          * new ALS export: u8 layer_type + u32 data_len after in_f.
+//   I2S_:  magic 0x5F533249 — legacy I2_S file, layer_type layout, kept for
+//          backward compat (old single-term I2S loads as a 1-term block set).
+//
+// New-format layer_type: 1=RAW_FP32, 2=multi-term block container, 0=single-term.
+//
+// Parse a packed block-term buffer into a BlockTerm vector.
+// Layout (per row): [block0_codes][block0_scale][block1_codes][block1_scale]...
+static std::vector<BlockTerm> parse_block_terms(const uint8_t* data, size_t data_len,
+                                                int out_f, int in_f, int qk) {
+    int n_blocks = (in_f + qk - 1) / qk;
+    int codes_per_block = qk / 4;
+    std::vector<BlockTerm> blocks((size_t)out_f * n_blocks);
+    int row_stride = n_blocks * (codes_per_block + (int)sizeof(float));
+    for (int row = 0; row < out_f; row++) {
+        for (int b = 0; b < n_blocks; b++) {
+            int block_idx = row * n_blocks + b;
+            int offset = row * row_stride + b * (codes_per_block + (int)sizeof(float));
+            if (offset + codes_per_block + (int)sizeof(float) > (int)data_len) {
+                Logger::error("Block data truncated at row {} block {}", row, b);
+                exit(1);
+            }
+            blocks[block_idx].packed.assign(
+                data + offset, data + offset + codes_per_block);
+            float scale;
+            std::memcpy(&scale, data + offset + codes_per_block, sizeof(float));
+            blocks[block_idx].scale = scale;
+        }
+    }
+    return blocks;
+}
+
+// Decode a set of block terms into a single combined[] bitplane term.
+// Backward-compatible fallback for the legacy I2S_ magic only; the real
+// multi-term path is ternary_linear_blocks. Only term 0 is used for
+// multi-term layers.
+static BitplaneTerm decode_block_terms_to_combined(const std::vector<BlockTerm>& blocks,
+                                                   int out_f, int in_f, int qk) {
+    int n_blocks = (in_f + qk - 1) / qk;
+    int words_per_row = (in_f + 15) / 16;
+    size_t n_words = (size_t)out_f * words_per_row;
+
+    BitplaneTerm term;
+    term.alpha_exp = 0;  // scale handled per-block
+    term.n_elements = (size_t)out_f * in_f;
+    term.combined.assign(n_words, 0);
+
+    std::vector<int8_t> decoded(qk);
+    for (int row = 0; row < out_f; row++) {
+        for (int b = 0; b < n_blocks; b++) {
+            int block_idx = row * n_blocks + b;
+            int block_start = b * qk;
+            int block_end = std::min(block_start + qk, in_f);
+            int block_size = block_end - block_start;
+
+            decode_block_ternary(blocks[block_idx].packed.data(), decoded.data(), qk);
+
+            for (int j = 0; j < block_size; j++) {
+                int8_t tv = decoded[j];
+                int word = (block_start + j) / 16;
+                int bit = (block_start + j) % 16;
+                size_t abs_word = (size_t)row * words_per_row + word;
+                if (tv == 1)       term.combined[abs_word] |= (1 << (bit + 16));
+                else if (tv == -1) term.combined[abs_word] |= (1 << (bit + 16)) | (1 << bit);
+            }
+        }
+    }
+    return term;
+}
+
+// Parse an ALS/Legacy-I2S layer in the new layer_type layout.
+//   data layout: u8 layer_type + u32 data_len already consumed by caller.
+//   layer_type: 1=RAW_FP32, 2=multi-term container, 0=single-term.
+//   build_combined: decode term 0 to combined[] bitplane (legacy I2S_ only).
+static void parse_layer_type_data(LayerData& ld, uint8_t layer_type,
+                                  const std::vector<uint8_t>& data,
+                                  bool build_combined) {
+    int qk = 128;
+    ld.has_blocks = true;
+    ld.block_qk = qk;
+
+    if (layer_type == 1) {
+        // RAW_FP32: store flat float weights
+        ld.has_raw_weights = true;
+        ld.has_blocks = false;
+        ld.raw_weights.resize(data.size() / sizeof(float));
+        std::memcpy(ld.raw_weights.data(), data.data(), data.size());
+        return;
+    }
+
+    if (layer_type == 2) {
+        // ─── Multi-term block container ─────────────────────────────────
+        // data = [num_terms:u32][term0_len:u32][term0_data]...[termN_len:u32][termN_data]
+        uint32_t num_terms;
+        if (data.size() < 4) { Logger::error("ALS multi-term: bad header"); exit(1); }
+        std::memcpy(&num_terms, data.data(), 4);
+        if (num_terms == 0 || num_terms > 32) {
+            Logger::error("ALS multi-term: invalid num_terms={}", num_terms);
+            exit(1);
+        }
+        ld.block_terms.resize(num_terms);
+        size_t pos = 4;
+        for (uint32_t t = 0; t < num_terms; t++) {
+            if (pos + 4 > data.size()) { Logger::error("ALS multi-term: truncated term len"); exit(1); }
+            uint32_t tlen;
+            std::memcpy(&tlen, data.data() + pos, 4);
+            pos += 4;
+            if (pos + tlen > data.size()) { Logger::error("ALS multi-term: truncated term data"); exit(1); }
+            ld.block_terms[t] = parse_block_terms(data.data() + pos, tlen,
+                                                  ld.out_features, ld.in_features, qk);
+            pos += tlen;
+        }
+        // Backward-compat combined[] from term 0 (degraded fallback only)
+        if (build_combined) {
+            ld.num_terms = 1;
+            ld.terms.push_back(decode_block_terms_to_combined(ld.block_terms[0],
+                                                              ld.out_features, ld.in_features, qk));
+        }
+        return;
+    }
+
+    // ─── Single-term (layer_type == 0) ────────────────────────────────
+    ld.block_terms.resize(1);
+    ld.block_terms[0] = parse_block_terms(data.data(), data.size(),
+                                          ld.out_features, ld.in_features, qk);
+
+    if (build_combined) {
+        // Decode to combined[] for backward-compatible kernels
+        ld.num_terms = 1;
+        ld.terms.push_back(decode_block_terms_to_combined(ld.block_terms[0],
+                                                          ld.out_features, ld.in_features, qk));
+    }
+}
+
+// Sniff the ALS layer layout after [out_f][in_f]: new exports store a u8
+// layer_type (≤2) followed by u32 data_len (bytes shift in → large u32);
+// old exports store u32 num_terms (≤32, 0 = raw FP32).
+// Returns 0 = layer_type layout, 1 = old num_terms layout.
+static int sniff_als_layout(const std::ifstream& f, uint32_t x) {
+    return x <= 32 ? 1 : 0;
+}
+
+inline std::vector<LayerData> load_decomposed_layers_als(const std::string& path) {
     std::ifstream f(path, std::ios::binary);
     if (!f) { Logger::error("Cannot open: {}", path); exit(1); }
     uint32_t magic;
     f.read(reinterpret_cast<char*>(&magic), 4);
-    if (magic != 0x5F533249) {  // "I2S_"
-        Logger::error("Bad magic (expected I2S_): 0x{:x}", magic);
+    const bool legacy_i2s = (magic == 0x5F533249);  // "I2S_"
+    if (magic != 0xDEADBEEF && !legacy_i2s) {
+        Logger::error("Bad magic: 0x{:x}", magic);
         exit(1);
     }
     uint32_t num_layers;
@@ -239,83 +371,81 @@ inline std::vector<LayerData> load_decomposed_layers_i2s(const std::string& path
         f.read(&ld.name[0], name_len);
         f.read(reinterpret_cast<char*>(&ld.out_features), 4);
         f.read(reinterpret_cast<char*>(&ld.in_features), 4);
-        uint8_t layer_type;
-        f.read(reinterpret_cast<char*>(&layer_type), 1);
-        uint32_t data_len;
-        f.read(reinterpret_cast<char*>(&data_len), 4);
 
+        if (legacy_i2s) {
+            // Legacy I2S_: always layer_type layout.
+            uint8_t layer_type;
+            f.read(reinterpret_cast<char*>(&layer_type), 1);
+            uint32_t data_len;
+            f.read(reinterpret_cast<char*>(&data_len), 4);
+            std::vector<uint8_t> data(data_len);
+            f.read(reinterpret_cast<char*>(data.data()), data_len);
+            if (layer_type > 2) {
+                Logger::error("Legacy I2S layer {}: bad layer_type {}", ld.name, layer_type);
+                exit(1);
+            }
+            parse_layer_type_data(ld, layer_type, data, /*build_combined=*/true);
+            continue;
+        }
+
+        // ALS (0xDEADBEEF): sniff layout from the u32 following in_f.
+        uint32_t x;
+        f.read(reinterpret_cast<char*>(&x), 4);
+        if (sniff_als_layout(f, x) == 1) {
+            // ─── Old ALS layout: u32 num_terms (0 = raw) ────────────────
+            if (x == 0) {
+                // Raw FP32 layer: data_len(u32) + float32 data
+                uint32_t data_len;
+                f.read(reinterpret_cast<char*>(&data_len), 4);
+                ld.has_raw_weights = true;
+                ld.raw_weights.resize(data_len / sizeof(float));
+                f.read(reinterpret_cast<char*>(ld.raw_weights.data()), data_len);
+                continue;
+            }
+            ld.terms.resize(x);
+            for (uint32_t t = 0; t < x; t++) {
+                auto& term = ld.terms[t];
+                size_t n_elements = (size_t)ld.out_features * ld.in_features;
+                size_t n_bytes = (n_elements * 2 + 7) / 8;
+                f.read(reinterpret_cast<char*>(&term.alpha_exp), 4);
+                std::vector<uint8_t> packed(n_bytes);
+                f.read(reinterpret_cast<char*>(packed.data()), n_bytes);
+                // Coalesced bitplane format: combined[word] = (nz << 16) | neg
+                term.n_elements = n_elements;
+                int words_per_row = (ld.in_features + 15) / 16;
+                size_t n_words = (size_t)ld.out_features * words_per_row;
+                term.combined.assign(n_words, 0);
+                for (int r = 0; r < ld.out_features; r++) {
+                    for (int j = 0; j < ld.in_features; j++) {
+                        size_t pos = (size_t)r * ld.in_features + j;
+                        int8_t tv = decode_ternary(packed.data(), pos);
+                        int word = j / 16;
+                        int bit = j % 16;
+                        size_t abs_word = (size_t)r * words_per_row + word;
+                        if (tv == 1) term.combined[abs_word] |= (1 << (bit + 16));
+                        else if (tv == -1) term.combined[abs_word] |= (1 << (bit + 16)) | (1 << bit);
+                    }
+                }
+            }
+            continue;
+        }
+
+        // ─── New ALS layout: u8 layer_type + u32 data_len ───────────────
+        // The export interleaves [layer_type:u8][data_len:u32], so the u32 `x`
+        // read above already consumed layer_type + data_len's low 3 bytes.
+        // Reassemble the length: low 24 bits from x>>8, high byte from stream.
+        uint8_t layer_type = (uint8_t)(x & 0xFF);
+        if (layer_type > 2) {
+            Logger::error("ALS layer {}: bad layer_type {}", ld.name, (int)layer_type);
+            exit(1);
+        }
+        uint32_t data_len = (x >> 8) & 0x00FFFFFF;
+        uint8_t len_hi;
+        f.read(reinterpret_cast<char*>(&len_hi), 1);
+        data_len |= (uint32_t(len_hi) << 24);
         std::vector<uint8_t> data(data_len);
         f.read(reinterpret_cast<char*>(data.data()), data_len);
-
-        if (layer_type == 1) {
-            // RAW_FP32: store flat float weights
-            ld.has_raw_weights = true;
-            ld.raw_weights.resize(data_len / sizeof(float));
-            std::memcpy(ld.raw_weights.data(), data.data(), data_len);
-            continue;  // skip I2_S parsing
-        }
-
-        // I2_S format: codes(32 bytes per block) + scales(4 bytes per block)
-        int qk = 128;
-        int n_blocks = (ld.in_features + qk - 1) / qk;
-        int codes_per_block = qk / 4;
-
-        // Store I2_S blocks for direct kernel path
-        ld.has_i2s = true;
-        ld.i2s_qk = qk;
-        ld.i2s_blocks.resize((size_t)ld.out_features * n_blocks);
-
-        // Data layout (per row): [block0_codes][block0_scale][block1_codes][block1_scale]...
-        int row_stride = n_blocks * (codes_per_block + (int)sizeof(float));
-        for (int row = 0; row < ld.out_features; row++) {
-            for (int b = 0; b < n_blocks; b++) {
-                int block_idx = row * n_blocks + b;
-                int offset = row * row_stride + b * (codes_per_block + (int)sizeof(float));
-                if (offset + codes_per_block + (int)sizeof(float) > (int)data_len) {
-                    Logger::error("I2_S data truncated at row {} block {}", row, b);
-                    exit(1);
-                }
-                ld.i2s_blocks[block_idx].packed.assign(
-                    data.data() + offset,
-                    data.data() + offset + codes_per_block);
-                float scale;
-                std::memcpy(&scale, data.data() + offset + codes_per_block, sizeof(float));
-                ld.i2s_blocks[block_idx].scale = scale;
-            }
-        }
-
-        // Decode to combined[] for backward-compatible kernels
-        int words_per_row = (ld.in_features + 15) / 16;
-        size_t n_words = (size_t)ld.out_features * words_per_row;
-
-        // Create a single bitplane term (I2_S is single-term)
-        BitplaneTerm term;
-        term.alpha_exp = 0;  // scale handled per-block
-        term.n_elements = (size_t)ld.out_features * ld.in_features;
-        term.combined.assign(n_words, 0);
-
-        for (int row = 0; row < ld.out_features; row++) {
-            for (int b = 0; b < n_blocks; b++) {
-                int block_idx = row * n_blocks + b;
-                int block_start = b * qk;
-                int block_end = std::min(block_start + qk, ld.in_features);
-                int block_size = block_end - block_start;
-
-                std::vector<int8_t> decoded(qk);
-                decode_i2s_block(ld.i2s_blocks[block_idx].packed.data(), decoded.data(), qk);
-
-                for (int j = 0; j < block_size; j++) {
-                    int8_t tv = decoded[j];
-                    int word = (block_start + j) / 16;
-                    int bit = (block_start + j) % 16;
-                    size_t abs_word = (size_t)row * words_per_row + word;
-                    if (tv == 1)      term.combined[abs_word] |= (1 << (bit + 16));
-                    else if (tv == -1) term.combined[abs_word] |= (1 << (bit + 16)) | (1 << bit);
-                }
-            }
-        }
-        ld.num_terms = 1;
-        ld.terms.push_back(std::move(term));
+        parse_layer_type_data(ld, layer_type, data, /*build_combined=*/false);
     }
     return layers;
 }
@@ -329,9 +459,9 @@ inline std::vector<LayerData> load_decomposed_layers_i2s(const std::string& path
 //   layer_type: 0=TQ1, 1=RAW_FP32
 //   TQ1 packed_data = Base-3 codes(24 bytes per 120-element block) + scales(float per block)
 //
-// TQ1.0 packs 5 ternary trits per byte (vs I2_S's 4), giving ~27% smaller files
-// and ~1.58 bits/weight.  At load time we convert TQ1→I2_S so all existing
-// I2_S kernels work transparently.
+// TQ1.0 packs 5 ternary trits per byte (vs block-scaled ternary's 4), giving
+// ~27% smaller files and ~1.58 bits/weight.  At load time we convert TQ1→
+// block-scaled ternary so all existing block kernels work transparently.
 inline std::vector<LayerData> load_decomposed_layers_tq1(const std::string& path) {
     std::ifstream f(path, std::ios::binary);
     if (!f) { Logger::error("Cannot open: {}", path); exit(1); }
@@ -367,13 +497,13 @@ inline std::vector<LayerData> load_decomposed_layers_tq1(const std::string& path
             continue;
         }
 
-        // TQ1.0 → convert to I2_S for kernel compatibility
+        // TQ1.0 → convert to block-scaled ternary for kernel compatibility
         int tq1_qk = 120;
-        int i2s_qk = 128;
+        int blk_qk = 128;
         int n_tq1_blocks = (ld.in_features + tq1_qk - 1) / tq1_qk;
-        int n_i2s_blocks = (ld.in_features + i2s_qk - 1) / i2s_qk;
+        int n_blk_blocks = (ld.in_features + blk_qk - 1) / blk_qk;
 
-        // Decode TQ1 → int8 ternary, then repack as I2_S
+        // Decode TQ1 → int8 ternary, then repack as 2-bit codes
         std::vector<int8_t> all_ternary((size_t)ld.out_features * ld.in_features);
 
         // Data layout (per row): [block0_codes(24B)][block0_scale(4B)]...
@@ -394,26 +524,27 @@ inline std::vector<LayerData> load_decomposed_layers_tq1(const std::string& path
             }
         }
 
-        // Store as I2_S blocks (128 elements per block)
-        ld.has_i2s = true;
-        ld.i2s_qk = i2s_qk;
-        ld.i2s_blocks.resize((size_t)ld.out_features * n_i2s_blocks);
+        // Store as block-scaled ternary (128 elements per block), single term
+        ld.has_blocks = true;
+        ld.block_qk = blk_qk;
+        ld.block_terms.resize(1);
+        ld.block_terms[0].resize((size_t)ld.out_features * n_blk_blocks);
 
         for (int row = 0; row < ld.out_features; row++) {
-            for (int b = 0; b < n_i2s_blocks; b++) {
-                int block_idx = row * n_i2s_blocks + b;
-                int block_start = b * i2s_qk;
-                int block_end = std::min(block_start + i2s_qk, ld.in_features);
+            for (int b = 0; b < n_blk_blocks; b++) {
+                int block_idx = row * n_blk_blocks + b;
+                int block_start = b * blk_qk;
+                int block_end = std::min(block_start + blk_qk, ld.in_features);
                 int block_size = block_end - block_start;
 
-                // Encode int8 ternary → I2_S
-                ld.i2s_blocks[block_idx].packed.resize(i2s_qk / 4, 0);
+                // Encode int8 ternary → 2-bit codes
+                ld.block_terms[0][block_idx].packed.resize(blk_qk / 4, 0);
                 for (int j = 0; j < block_size; j++) {
                     int8_t tv = all_ternary[(size_t)row * ld.in_features + block_start + j];
                     uint8_t code = (uint8_t)(tv + 1);  // -1→0, 0→1, +1→2
                     int byte_idx = j / 4;
                     int shift = 6 - 2 * (j % 4);
-                    ld.i2s_blocks[block_idx].packed[byte_idx] |= (code << shift);
+                    ld.block_terms[0][block_idx].packed[byte_idx] |= (code << shift);
                 }
                 // Compute block scale: max absolute value
                 float max_abs = 0.0f;
@@ -421,7 +552,7 @@ inline std::vector<LayerData> load_decomposed_layers_tq1(const std::string& path
                     float v = std::abs((float)all_ternary[(size_t)row * ld.in_features + block_start + j]);
                     if (v > max_abs) max_abs = v;
                 }
-                ld.i2s_blocks[block_idx].scale = max_abs > 0.0f ? max_abs : 1.0f;
+                ld.block_terms[0][block_idx].scale = max_abs > 0.0f ? max_abs : 1.0f;
             }
         }
 
@@ -453,7 +584,8 @@ inline std::vector<LayerData> load_decomposed_layers_tq1(const std::string& path
 // UNIFIED LOADER: auto-detect GGUF vs .bin format
 // ═══════════════════════════════════════════════════════════════════════════
 // If model_dir/given path ends with .gguf, load directly via GGUF parser.
-// Otherwise, load from model_extra.bin + model_decomposed_i2s.bin.
+// Otherwise, load from model_extra.bin + model_decomposed.bin (or the legacy
+// model_decomposed_i2s.bin).
 
 inline bool has_gguf_ext(const std::string& path) {
     return path.size() >= 5 && path.substr(path.size() - 5) == ".gguf";
@@ -534,11 +666,85 @@ inline LoadedModel load_model_from(const std::string& model_path_or_dir) {
         m.final_norm = load_final_norm(extra_path, m.cfg);
         m.layer_norms = load_layer_norms(extra_path, m.cfg);
 
-        std::ifstream test_i2s(i2s_path);
-        if (test_i2s.good()) {
-            m.layers = load_decomposed_layers_i2s(i2s_path);
+        // Prefer the current ALS format (model_decomposed.bin) so a stale
+        // legacy I2S_ file left from an older export can't shadow the good
+        // weights; fall back to legacy I2S_ only when the ALS file is absent.
+        std::ifstream test_als(als_path);
+        if (test_als.good()) {
+            m.layers = load_decomposed_layers_als(als_path);  // ALS (old/new layout)
         } else {
-            m.layers = load_decomposed_layers(als_path);
+            m.layers = load_decomposed_layers_als(i2s_path);  // legacy I2S_ fallback
+        }
+
+        // ── Qwen3-style per-head Q/K RMSNorm + head_dim fixup ───────────
+        // Qwen3 uses head_dim=128 with Q/K RMSNorm (q_proj is H*128 wide,
+        // i.e. wider than hidden_size). Derive the true head_dim from the
+        // q_proj layer of layer 0, and lift q_norm/k_norm RAW pseudo-layers
+        // out of the flat layer list into NormWeights so transformer_block
+        // can apply them. Both are no-ops for standard (SmolLM2-style) ALS.
+        for (size_t i = 0; i < m.layers.size(); i++) {
+            if (m.layers[i].name == "model.layers.0.self_attn.q_proj" &&
+                m.cfg.num_attention_heads > 0) {
+                int qd = m.layers[i].out_features / m.cfg.num_attention_heads;
+                if (qd != m.cfg.head_dim) {
+                    Logger::warn("head_dim derived {} -> {} (from q_proj {}/{})",
+                                 m.cfg.head_dim, qd, m.layers[i].out_features,
+                                 m.cfg.num_attention_heads);
+                    m.cfg.head_dim = qd;
+                }
+                break;
+            }
+        }
+        // Extract q_norm/k_norm pseudo-layers (named model.layers.<N>.self_attn.q_norm)
+        // into layer_norms[N]. They are RAW_FP32 weights of size head_dim.
+        // NOTE: must match the FULL name — a bare sscanf("...%d.self_attn.q_norm")
+        // also "matches" q_proj/k_proj (only %d assigned, return==1), which would
+        // wrongly erase real projection layers. Require the suffix as well.
+        auto norm_layer_index = [](const std::string& nm, const char* suffix) -> int {
+            const std::string s(suffix);
+            if (nm.size() <= s.size()) return -1;
+            if (nm.compare(nm.size() - s.size(), s.size(), s) != 0) return -1;
+            const std::string pre = nm.substr(0, nm.size() - s.size());
+            const std::string pfx = "model.layers.";
+            if (pre.compare(0, pfx.size(), pfx) != 0) return -1;
+            std::string num = pre.substr(pfx.size());
+            if (num.empty() || !std::all_of(num.begin(), num.end(), ::isdigit)) return -1;
+            return std::stoi(num);
+        };
+        if ((int)m.layer_norms.size() == m.cfg.num_hidden_layers) {
+            for (auto it = m.layers.begin(); it != m.layers.end(); ) {
+                const char* suffix = nullptr;
+                int li = -1;
+                int lq = norm_layer_index(it->name, ".self_attn.q_norm");
+                int lk = norm_layer_index(it->name, ".self_attn.k_norm");
+                if (lq >= 0) { suffix = ".self_attn.q_norm"; li = lq; }
+                else if (lk >= 0) { suffix = ".self_attn.k_norm"; li = lk; }
+                if (suffix) {
+                    if (li < m.cfg.num_hidden_layers && it->has_raw_weights) {
+                        if (lq >= 0) m.layer_norms[li].q_norm = it->raw_weights;
+                        else         m.layer_norms[li].k_norm = it->raw_weights;
+                    }
+                    it = m.layers.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+
+        // ── Tokenizer for legacy .bin models ─────────────────────────────
+        // Native vocab comes from a HuggingFace tokenizer.json co-located in
+        // the model dir (written by the export script since v1.0.5). If it's
+        // absent, the server falls back to the Python decode helper.
+        std::string tok_json = model_path_or_dir + "/tokenizer.json";
+        if (stat(tok_json.c_str(), &st) == 0) {
+            if (m.tokenizer.load_from_tokenizer_json(tok_json)) {
+                Logger::info("  Tokenizer: {} (from tokenizer.json), vocab={}",
+                    m.tokenizer.model_type, m.tokenizer.vocab.size());
+            } else {
+                Logger::info("  Tokenizer: tokenizer.json present but unreadable, falling back to Python helper");
+            }
+        } else {
+            Logger::info("  Tokenizer: no tokenizer.json in model dir — will use Python decode helper");
         }
     }
 
@@ -588,7 +794,7 @@ inline std::vector<uint8_t> serialize_layer_data(const LayerData& ld) {
     append(&nt, 4);
 
     uint8_t has_raw = ld.has_raw_weights ? 1 : 0;
-    uint8_t has_i2s = ld.has_i2s ? 1 : 0;
+    uint8_t has_blocks = ld.has_blocks ? 1 : 0;
     append(&has_raw, 1);
 
     if (ld.has_raw_weights) {
@@ -598,13 +804,15 @@ inline std::vector<uint8_t> serialize_layer_data(const LayerData& ld) {
         return buf;
     }
 
-    append(&has_i2s, 1);
+    append(&has_blocks, 1);
 
-    if (ld.has_i2s) {
-        uint32_t nb = (uint32_t)ld.i2s_blocks.size();
+    if (ld.has_blocks && !ld.block_terms.empty()) {
+        // Serialize the first term set (legacy MoTE files stored a single set).
+        const auto& blocks = ld.block_terms[0];
+        uint32_t nb = (uint32_t)blocks.size();
         append(&nb, 4);
-        append(&ld.i2s_qk, 4);
-        for (auto& blk : ld.i2s_blocks) {
+        append(&ld.block_qk, 4);
+        for (auto& blk : blocks) {
             uint32_t ps = (uint32_t)blk.packed.size();
             append(&ps, 4);
             append(blk.packed.data(), ps);
@@ -649,17 +857,18 @@ inline size_t deserialize_layer_data(const uint8_t* buf, size_t offset, LayerDat
         return pos - offset;
     }
 
-    uint8_t has_i2s = buf[pos++];
-    if (has_i2s) {
-        ld.has_i2s = true;
+    uint8_t has_blocks = buf[pos++];
+    if (has_blocks) {
+        ld.has_blocks = true;
         uint32_t nb = read32();
-        ld.i2s_qk = (int32_t)read32();
-        ld.i2s_blocks.resize(nb);
+        ld.block_qk = (int32_t)read32();
+        ld.block_terms.resize(1);
+        ld.block_terms[0].resize(nb);
         for (uint32_t b = 0; b < nb; b++) {
             uint32_t ps = read32();
-            ld.i2s_blocks[b].packed.resize(ps);
-            std::memcpy(ld.i2s_blocks[b].packed.data(), buf + pos, ps); pos += ps;
-            std::memcpy(&ld.i2s_blocks[b].scale, buf + pos, 4); pos += 4;
+            ld.block_terms[0][b].packed.resize(ps);
+            std::memcpy(ld.block_terms[0][b].packed.data(), buf + pos, ps); pos += ps;
+            std::memcpy(&ld.block_terms[0][b].scale, buf + pos, 4); pos += 4;
         }
         return pos - offset;
     }
