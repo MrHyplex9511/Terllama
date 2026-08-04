@@ -18,7 +18,7 @@ pub struct RegistryModel {
     pub formats: Formats,
 }
 
-/// Three download formats: fp (original weights), q4 (GGUF Q4_K_M), ternary (I2_S/ALS).
+/// Three download formats: fp (original weights), q4 (GGUF Q4_K_M), ternary (ALS).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Formats {
     pub fp: FormatInfo,

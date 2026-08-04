@@ -272,7 +272,6 @@ size_t get_model_size_bytes() {
         if (g_model.model_dir.empty()) return 0;
         std::vector<std::string> files = {
             g_model.model_dir + "/model_extra.bin",
-            g_model.model_dir + "/model_decomposed_i2s.bin",
             g_model.model_dir + "/model_decomposed.bin",
             g_model.model_dir + "/model.gguf"
         };

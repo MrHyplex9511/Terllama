@@ -131,7 +131,7 @@ def pack_als_block_terms(terms_with_scales, qk=128):
 
     Layout: [num_terms:u32][term0_len:u32][term0_data]...[termN_len:u32][termN_data]
 
-    Each term_data is the I2_S per-row block layout:
+    Each term_data is the per-row ternary block layout:
       per row: [block0: 32 code bytes + 4 scale bytes] x n_blocks,
       n_blocks = ceil(in_f/128). Codes are 2-bit/weight, 4 vals/byte MSB-first,
       mapping +1->2, -1->3, 0->0.

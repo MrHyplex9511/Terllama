@@ -86,14 +86,14 @@ static std::string get_helper_dir() {
 
 struct RegistryEntry {
     std::string hf_repo;
-    std::string format;  // "i2s", "als", or "gguf"
+    std::string format;  // "als" or "gguf"
     int64_t size_mb;
 };
 
 static std::unordered_map<std::string, RegistryEntry> get_registry() {
     return {
         {"tinyllama",    {"TinyLlama/TinyLlama-1.1B-Chat-v1.0", "als",  139}},
-        {"smolLM2",      {"HuggingFaceTB/SmolLM2-135M",          "i2s",  54}},
+        {"smolLM2",      {"HuggingFaceTB/SmolLM2-135M",          "als",  54}},
         {"mistral-7b",   {"mistralai/Mistral-7B-v0.3",           "gguf", 4100}},
         {"llama-3.1-8b", {"meta-llama/Llama-3.1-8B",             "gguf", 4800}},
         {"phi-3.5-mini", {"microsoft/Phi-3.5-mini-instruct",     "gguf", 2600}},
@@ -314,7 +314,6 @@ int cmd_show(const std::string& model_id) {
         : models_dir() + "/" + model_id;
 
     std::string extra_path = model_dir + "/model_extra.bin";
-    std::string i2s_path  = model_dir + "/model_decomposed_i2s.bin";
     std::string als_path  = model_dir + "/model_decomposed.bin";
 
     struct stat st;
@@ -327,9 +326,7 @@ int cmd_show(const std::string& model_id) {
         Logger::info("  Config: not found");
     }
 
-    if (stat(i2s_path.c_str(), &st) == 0) {
-        Logger::info("  Weights (I2_S):     {}", fmt_size((double)st.st_size));
-    } else if (stat(als_path.c_str(), &st) == 0) {
+    if (stat(als_path.c_str(), &st) == 0) {
         Logger::info("  Weights (ALS):      {}", fmt_size((double)st.st_size));
     } else {
         Logger::info("  Weights: not found");
@@ -373,7 +370,6 @@ int cmd_rm(const std::string& model_id) {
             Logger::info("  Removed: {}", path);
     };
 
-    rm_file(model_dir + "/model_decomposed_i2s.bin");
     rm_file(model_dir + "/model_decomposed.bin");
     rm_file(model_dir + "/model_extra.bin");
 
@@ -589,7 +585,7 @@ int cmd_chat(int argc, char** argv) {
 
 int cmd_pull(int argc, char** argv) {
     if (argc < 3) {
-        Logger::error("Usage: {} pull <model> [--fmt i2s|als|gguf]", argv[0]);
+        Logger::error("Usage: {} pull <model> [--fmt als|gguf]", argv[0]);
         return 1;
     }
 
@@ -1267,7 +1263,7 @@ void print_usage(const char* prog) {
     Logger::error("  {} \"prompt\" [max_tokens] [temp]    Run inference (legacy)", prog);
     Logger::error("  {} list                            List installed models", prog);
     Logger::error("  {} show <model>                    Show model info", prog);
-    Logger::error("  {} pull <hf-repo> [--fmt i2s|als] Download model from HF", prog);
+    Logger::error("  {} pull <hf-repo> [--fmt als|gguf] Download model from HF", prog);
     Logger::error("  {} rm <model>                      Remove a model", prog);
     Logger::error("  {} serve [--port N] [--keep-alive SEC] [--memory-limit MB]  Start API server", prog);
     Logger::error("  {} chat --model <m> [--prompt p]   CLI chat", prog);
@@ -1281,7 +1277,7 @@ void print_usage(const char* prog) {
     Logger::error("  TERLLAMA_ARCH        override CPU arch");
     Logger::error("");
     Logger::error("Usage examples:");
-    Logger::error("  {} pull HuggingFaceTB/SmolLM2-135M --format i2s", prog);
+    Logger::error("  {} pull HuggingFaceTB/SmolLM2-135M --format als", prog);
     Logger::error("  {} list", prog);
     Logger::error("  {} serve --port 8375", prog);
     Logger::error("  {} \"Hello, world!\" 100 0.8", prog);

@@ -1,9 +1,8 @@
 /*
  * loader.h: Binary file I/O for Terllama model files
  *
- * Two formats:
+ * Binary formats:
  *   model_decomposed.bin        ALS block-scaled format (magic 0xDEADBEEF)
- *   model_decomposed_i2s.bin    legacy I2_S packed format (magic 0x5F533249)
  *   model_extra.bin             embedding + RMSNorm weights
  *
  * Also supports GGUF format (via gguf_loader.h):
@@ -201,16 +200,14 @@ inline std::vector<LayerData> load_decomposed_layers(const std::string& path) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// ALS LAYER LOADER (model_decomposed.bin / legacy model_decomposed_i2s.bin)
+// ALS LAYER LOADER (model_decomposed.bin)
 // ═══════════════════════════════════════════════════════════════════════════
-// ALS is the only quantized format. Two magics are accepted:
-//   ALS:   magic 0xDEADBEEF — layer layout is auto-sniffed per layer:
-//          * old ALS export: u32 num_terms after in_f (0 = raw FP32, else
-//            num_terms × [alpha(int32) + packed 2-bit ternary codes]); loaded
-//            as classic bitplane terms (matches load_decomposed_layers).
-//          * new ALS export: u8 layer_type + u32 data_len after in_f.
-//   I2S_:  magic 0x5F533249 — legacy I2_S file, layer_type layout, kept for
-//          backward compat (old single-term I2S loads as a 1-term block set).
+// ALS is the only quantized format. One magic is accepted:
+//   magic 0xDEADBEEF — layer layout is auto-sniffed per layer:
+//   * old ALS export: u32 num_terms after in_f (0 = raw FP32, else
+//     num_terms × [alpha(int32) + packed 2-bit ternary codes]); loaded
+//     as classic bitplane terms (matches load_decomposed_layers).
+//   * new ALS export: u8 layer_type + u32 data_len after in_f.
 //
 // New-format layer_type: 1=RAW_FP32, 2=multi-term block container, 0=single-term.
 //
@@ -241,9 +238,8 @@ static std::vector<BlockTerm> parse_block_terms(const uint8_t* data, size_t data
 }
 
 // Decode a set of block terms into a single combined[] bitplane term.
-// Backward-compatible fallback for the legacy I2S_ magic only; the real
-// multi-term path is ternary_linear_blocks. Only term 0 is used for
-// multi-term layers.
+// Legacy fallback; the real multi-term path is ternary_linear_blocks.
+// Only term 0 is used for multi-term layers.
 static BitplaneTerm decode_block_terms_to_combined(const std::vector<BlockTerm>& blocks,
                                                    int out_f, int in_f, int qk) {
     int n_blocks = (in_f + qk - 1) / qk;
@@ -278,10 +274,11 @@ static BitplaneTerm decode_block_terms_to_combined(const std::vector<BlockTerm>&
     return term;
 }
 
-// Parse an ALS/Legacy-I2S layer in the new layer_type layout.
+// Parse an ALS layer in the new layer_type layout.
 //   data layout: u8 layer_type + u32 data_len already consumed by caller.
 //   layer_type: 1=RAW_FP32, 2=multi-term container, 0=single-term.
-//   build_combined: decode term 0 to combined[] bitplane (legacy I2S_ only).
+//   build_combined: decode term 0 to combined[] bitplane (legacy fallback;
+//   only ever passed false today).
 static void parse_layer_type_data(LayerData& ld, uint8_t layer_type,
                                   const std::vector<uint8_t>& data,
                                   bool build_combined) {
@@ -355,8 +352,7 @@ inline std::vector<LayerData> load_decomposed_layers_als(const std::string& path
     if (!f) { Logger::error("Cannot open: {}", path); exit(1); }
     uint32_t magic;
     f.read(reinterpret_cast<char*>(&magic), 4);
-    const bool legacy_i2s = (magic == 0x5F533249);  // "I2S_"
-    if (magic != 0xDEADBEEF && !legacy_i2s) {
+    if (magic != 0xDEADBEEF) {
         Logger::error("Bad magic: 0x{:x}", magic);
         exit(1);
     }
@@ -371,22 +367,6 @@ inline std::vector<LayerData> load_decomposed_layers_als(const std::string& path
         f.read(&ld.name[0], name_len);
         f.read(reinterpret_cast<char*>(&ld.out_features), 4);
         f.read(reinterpret_cast<char*>(&ld.in_features), 4);
-
-        if (legacy_i2s) {
-            // Legacy I2S_: always layer_type layout.
-            uint8_t layer_type;
-            f.read(reinterpret_cast<char*>(&layer_type), 1);
-            uint32_t data_len;
-            f.read(reinterpret_cast<char*>(&data_len), 4);
-            std::vector<uint8_t> data(data_len);
-            f.read(reinterpret_cast<char*>(data.data()), data_len);
-            if (layer_type > 2) {
-                Logger::error("Legacy I2S layer {}: bad layer_type {}", ld.name, layer_type);
-                exit(1);
-            }
-            parse_layer_type_data(ld, layer_type, data, /*build_combined=*/true);
-            continue;
-        }
 
         // ALS (0xDEADBEEF): sniff layout from the u32 following in_f.
         uint32_t x;
@@ -584,8 +564,7 @@ inline std::vector<LayerData> load_decomposed_layers_tq1(const std::string& path
 // UNIFIED LOADER: auto-detect GGUF vs .bin format
 // ═══════════════════════════════════════════════════════════════════════════
 // If model_dir/given path ends with .gguf, load directly via GGUF parser.
-// Otherwise, load from model_extra.bin + model_decomposed.bin (or the legacy
-// model_decomposed_i2s.bin).
+// Otherwise, load from model_extra.bin + model_decomposed.bin.
 
 inline bool has_gguf_ext(const std::string& path) {
     return path.size() >= 5 && path.substr(path.size() - 5) == ".gguf";
@@ -652,7 +631,6 @@ inline LoadedModel load_model_from(const std::string& model_path_or_dir) {
     } else {
         // ── Legacy .bin path ─────────────────────────────────────────────
         std::string extra_path = model_path_or_dir + "/model_extra.bin";
-        std::string i2s_path   = model_path_or_dir + "/model_decomposed_i2s.bin";
         std::string als_path   = model_path_or_dir + "/model_decomposed.bin";
 
         struct stat st_extra;
@@ -666,15 +644,11 @@ inline LoadedModel load_model_from(const std::string& model_path_or_dir) {
         m.final_norm = load_final_norm(extra_path, m.cfg);
         m.layer_norms = load_layer_norms(extra_path, m.cfg);
 
-        // Prefer the current ALS format (model_decomposed.bin) so a stale
-        // legacy I2S_ file left from an older export can't shadow the good
-        // weights; fall back to legacy I2S_ only when the ALS file is absent.
-        std::ifstream test_als(als_path);
-        if (test_als.good()) {
-            m.layers = load_decomposed_layers_als(als_path);  // ALS (old/new layout)
-        } else {
-            m.layers = load_decomposed_layers_als(i2s_path);  // legacy I2S_ fallback
+        if (stat(als_path.c_str(), &st_extra) != 0) {
+            Logger::error("No ALS weights (model_decomposed.bin) in {}", model_path_or_dir);
+            exit(1);
         }
+        m.layers = load_decomposed_layers_als(als_path);  // ALS (old/new layout)
 
         // ── Qwen3-style per-head Q/K RMSNorm + head_dim fixup ───────────
         // Qwen3 uses head_dim=128 with Q/K RMSNorm (q_proj is H*128 wide,

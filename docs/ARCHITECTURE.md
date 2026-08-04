@@ -7,7 +7,7 @@ Terllama is a CPU-first ternary (1.58-bit) LLM inference engine. It runs quantiz
 Design goals:
 - **CPU-first** — no GPU required. Runs on x86-64 (Haswell+) and ARM64 (Apple Silicon).
 - **Multi-ISA** — scalar fallback through AVX-512, with runtime dispatch.
-- **Compact** — model weights shrink to ~25% of FP32 size via I2_S ternary packing.
+- **Compact** — model weights shrink to ~25% of FP32 size via packed ternary blocks.
 - **Minimal dependencies** — C++17, OpenMP, make, Python 3 (tokenizer fallback), Rust (GigaToken rebuild).
 
 ### Source Layout
@@ -23,9 +23,9 @@ src/kernel_dispatch.h   CPU detection + 6 ISA kernel variants
 src/kernel_avx2.cpp     Standalone AVX2 kernel compilation unit
 src/kernel_neon.cpp     Standalone NEON kernel compilation unit
 src/kernel_scalar.cpp   Standalone scalar kernel compilation unit
-src/model.h             Data structures (ModelConfig, LayerData, BitplaneTerm, I2SBlock)
+src/model.h             Data structures (ModelConfig, LayerData, BitplaneTerm)
 src/loader.h            Binary I/O for .bin and GGUF formats
-src/gguf_loader.h       GGUF v3 parser, Q2_0 → I2_S converter
+src/gguf_loader.h       GGUF v3 parser, Q2_0 → ternary block converter
 src/inference.h         Inference pipeline declarations
 src/dispatcher.cpp      Runtime kernel selection (isa_has_avx512 etc.)
 src/server.cpp          OpenAI-compatible HTTP server
@@ -42,19 +42,6 @@ Terllama quantizes 7 projection layers per transformer block: `q_proj`, `k_proj`
 
 Two quantization methods are available:
 
-### I2_S (BitNet Mean-Scale)
-
-Block-wise mean quantization (block_size=128):
-
-```
-For each block of 128 weights:
-  1. Compute mean_abs = mean(|W|)
-  2. Scale factor = 1 / mean_abs
-  3. Round each weight: ternary = round(W * scale_factor) → {-1, 0, +1}
-```
-
-Each block produces a `float32` scale appended to the packed codes. This is the default format, balancing conversion speed with accuracy.
-
 ### ALS (Alternating Least Squares Multi-Term)
 
 Decomposes each weight matrix into a sum of rank-1 ternary terms:
@@ -69,7 +56,7 @@ Each term has a `float32` alpha (`αₜ`) and two ternary vectors. More terms = 
 - **10 terms**: FFN error <2%, attention error ~5-7%, PPL ratio ~1.02×
 - **12 terms**: TinyLlama-1.1B PPL ratio **1.003×** (nearly lossless)
 
-ALS requires the Python export script and is slower to convert than I2_S.
+ALS requires the Python export script and is slower to convert than single-term packing.
 
 ### Quality-vs-Size (Mistral-7B)
 
@@ -77,7 +64,7 @@ ALS requires the Python export script and is slower to convert than I2_S.
 |--------|-----|-----------------|
 | FP16 | ~14 GB | ~2 |
 | GGUF Q4 | ~4.5 GB | ~8 |
-| Ternary (I2_S) | **~2.1 GB** | **~18** |
+| Ternary | **~2.1 GB** | **~18** |
 
 ## Kernel Dispatch
 
@@ -120,7 +107,7 @@ Key pattern:
 
 `validate_all_kernels()` runs every available kernel on the same input and compares outputs to the scalar reference. Used by `terllama bench` for correctness testing. All SIMD variants must match scalar output within `1e-4` abs error.
 
-## I2_S Packing Format
+## Ternary Block Packing (I2_S block encoding)
 
 ### Binary codes
 
@@ -155,23 +142,6 @@ At load time, I2_S blocks are decoded into a fused bitplane format for efficient
 
 This packs 16 elements per `uint32_t` word. One cache-line touch instead of two (was separate nz/neg arrays). The kernel loads one `uint32_t` per 16-wide chunk and extracts add/sub masks via bit manipulation.
 
-### I2_S file format (`model_decomposed_i2s.bin`)
-
-```
-Magic:      0x5F533249 ("I2S_")  — uint32
-Num layers: uint32
-Per layer:
-  name_len:   uint32
-  name:       byte[name_len]
-  out_f:      uint32
-  in_f:       uint32
-  layer_type: uint8  (0=I2_S, 1=RAW_FP32)
-  data_len:   uint32
-  data:       byte[data_len]
-    For I2_S: per row → [block0_codes(32B)][block0_scale(4B)]...
-    For RAW: flat float32[]
-```
-
 ### ALS file format (`model_decomposed.bin`)
 
 ```
@@ -203,14 +173,14 @@ Terllama can load GGUF v3 format models directly, without the Python export scri
 | BPE tokenizer (from GGUF metadata) | ✅ |
 | Architecture auto-detect | ✅ |
 
-### GGUF → I2_S conversion
+### GGUF → ternary block conversion
 
 At load time, `load_gguf_model()` in `gguf_loader.h`:
 
 1. Parses GGUF header (magic, version, tensor count, metadata key-values)
 2. Reads tensor info KV pairs (name, dimensions, type, offset)
 3. Maps projection tensor names (`blk.{i}.attn_q.weight` → `q_proj`)
-4. For Q2_0 tensors: decodes each 128-element block (FP16 scale + 32 bytes codes), converts to I2_S block format
+4. For Q2_0 tensors: decodes each 128-element block (FP16 scale + 32 bytes codes), converts to the ternary block format
 5. Extracts embedding, RMS norm weights, and final norm from F32/F16 tensors
 6. Extracts tokenizer vocab from metadata (SentencePiece model or BPE scores)
 
@@ -349,10 +319,10 @@ Large matmuls are split into 128-column tiles:
 flowchart LR
     HF[(HuggingFace\nModel)] --> export[export_ternary_model_bitnet.py]
     export --> extra[model_extra.bin]
-    export --> i2s[model_decomposed_i2s.bin\nor model_decomposed.bin]
+    export --> als[model_decomposed.bin]
     extra --> loader[terllama loader]
-    i2s --> loader
-    GGUF[(GGUF .gguf)] --> GGUFparse[GGUF parser\nQ2_0 → I2_S]
+    als --> loader
+    GGUF[(GGUF .gguf)] --> GGUFparse[GGUF parser\nQ2_0 → ternary blocks]
     GGUFparse --> loader
     loader --> engine[Inference Engine\nkernel_dispatch.h]
     engine --> output[Generated Text]
@@ -362,11 +332,9 @@ flowchart LR
 
 1. **Load**: Loads model from HuggingFace via `transformers`
 2. **Inspect**: Scans `model.named_modules()` for `nn.Linear` projections (Q, K, V, O, gate, up, down)
-3. **Quantize**: For each projection:
-   - **I2_S**: Block-wise mean quantization (block_size=128)
-   - **ALS**: ALS decomposition with configurable term count (default 12)
+3. **Quantize**: For each projection: ALS decomposition with configurable term count (default 12)
 4. **Extract**: Reads embedding table, RMS norm weights, RoPE theta
-5. **Write**: Saves `model_extra.bin` (config + embeddings + norms) and either `model_decomposed_i2s.bin` or `model_decomposed.bin`
+5. **Write**: Saves `model_extra.bin` (config + embeddings + norms) and `model_decomposed.bin` (ALS weights)
 
 ### Architecture auto-detect
 
@@ -387,7 +355,7 @@ All must use `nn.Linear` projections, `nn.Embedding`, RMSNorm, and RoPE.
 GGUF models skip the Python export step entirely. The built-in GGUF parser:
 - Detects `.gguf` files in the model directory (or accepts a direct path)
 - Parses Q2_0 g128 quantized tensors
-- Converts to I2_S block format in memory
+- Converts to ternary block format in memory
 - Extracts tokenizer vocab from GGUF metadata
 
 ---

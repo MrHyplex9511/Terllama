@@ -9,7 +9,7 @@ Usage:
 import argparse, struct, sys, time
 import torch
 
-CODE_MAP = {0: -1.0, 1: 0.0, 2: 1.0}  # legacy I2S mapping {-1,0,+1}->{0,1,2}
+CODE_MAP = {0: -1.0, 1: 0.0, 2: 1.0}  # ternary mapping {-1,0,+1}->{0,1,2}
 
 def unpack_block_layer(data, off):
     nl = struct.unpack('<I', data[off:off+4])[0]; off += 4

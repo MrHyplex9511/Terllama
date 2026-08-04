@@ -8,7 +8,7 @@
  *   terllama "prompt" [max_tokens] [temp]   ← legacy mode
  *   terllama list                            ← list local models
  *   terllama show <model>                    ← model info
- *   terllama pull <hf-repo> [--format i2s]  ← download from HF
+ *   terllama pull <hf-repo> [--format als]  ← download from HF
  *   terllama rm <model>                      ← remove a model
  *   terllama serve [--port N]                ← start API server
  *   terllama chat --model <m> [--prompt p]   ← interactive CLI chat

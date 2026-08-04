@@ -196,10 +196,10 @@ def pack_als_block_terms(terms_with_scales, qk=128):
 
     Layout: [num_terms:u32][term0_len:u32][term0_data]...[termN_len:u32][termN_data]
 
-    Each term_data is the I2_S per-row block layout:
+    Each term_data is the per-row ternary block layout:
       per row: [block0: 32 code bytes + 4 scale bytes] x n_blocks,
       n_blocks = ceil(in_f/128). Codes are 2-bit/weight, 4 vals/byte MSB-first,
-      mapping {-1,0,+1} -> {0,1,2} (legacy I2S, matches all C++ decoders).
+      mapping {-1,0,+1} -> {0,1,2} (matches all C++ decoders).
     """
     buf = bytearray(struct.pack('<I', len(terms_with_scales)))
     for scales, tv in terms_with_scales:
@@ -212,7 +212,7 @@ def pack_als_block(tv_tensor, scales, qk=128):
     """Pack one ALS term (ternary matrix + per-block scales) into the per-row block blob.
 
     Per row: for each qk-wide block: qk/4 code bytes (2-bit, MSB-first) + 4 scale bytes.
-    Encoding matches the C++ decoders (all four kernels use legacy I2S mapping):
+    Encoding matches the C++ decoders (all four kernels use this ternary mapping):
         {-1, 0, +1} -> {0, 1, 2}; code 3 is never emitted.
     Tail blocks are zero-padded with code 1 (ternary 0).
     """

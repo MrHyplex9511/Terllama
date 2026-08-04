@@ -1,6 +1,6 @@
 # Model Conversion Guide
 
-Convert HuggingFace models to Terllama's ternary inference format (I2_S or ALS).
+Convert HuggingFace models to Terllama's ternary inference format (ALS multi-term, or GGUF).
 
 ## Prerequisites
 
@@ -20,33 +20,23 @@ pip install torch transformers
 # 1. Install deps
 pip install torch transformers
 
-# 2. Export a model (I2_S format — default)
+# 2. Export a model (ALS format — default)
 python scripts/export_ternary_model_bitnet.py \
     --model HuggingFaceTB/SmolLM2-135M \
-    --format i2s
+    --format als --terms 12
 
 # 3. Verify output
 ls ~/.terllama/models/HuggingFaceTB-SmolLM2-135M/
 #   model_extra.bin          (config + embeddings + norms)
-#   model_decomposed_i2s.bin (packed ternary weights)
+#   model_decomposed.bin     (ALS packed ternary weights)
 ```
 
 ## Format Options
 
-### `--format i2s` (default)
+The legacy single-term `i2s` format was removed; the export script accepts
+`als` (default) or `gguf`.
 
-BitNet mean-scale ternary quantization.
-
-- **Method:** Block-wise mean quantization (block_size=128). Each block is scaled by `1 / mean(|W|)` and rounded to `{-1, 0, +1}`.
-- **Packing:** 4 ternary values per byte, 2-bit codes. Per-block `float32` scale appended.
-- **Output file:** `model_decomposed_i2s.bin`
-- **Best for:** Fast conversion, balanced accuracy/size.
-
-```bash
-python scripts/export_ternary_model_bitnet.py --model <name> --format i2s
-```
-
-### `--format als`
+### `--format als` (default)
 
 Alternating Least Squares multi-term ternary decomposition.
 
@@ -87,7 +77,7 @@ Terllama can directly load GGUF format models (Q2_0 g128) via its built-in GGUF 
 - **GGUF v3** supported (header + metadata + Q2_0 quantized tensors)
 - Loads `.gguf` files directly: `terllama serve --model path/to/model.gguf`
 - Auto-detects `.gguf` files in model directories
-- Converts Q2_0 ternary weights to I2_S format in-memory
+- Converts Q2_0 ternary weights to packed ternary blocks in-memory
 - Supported architectures: Mistral, Qwen, Llama, SmolLM, Gemma
 
 GGUF models do not require the Python export script — just download and run.
@@ -100,8 +90,7 @@ extracted from the GGUF metadata automatically (SentencePiece or BPE).
 | File | Contents | Always present? |
 |---|---|---|
 | `model_extra.bin` | 9 config fields (int32/float32), embedding table `[vocab_size × hidden_size]`, final norm, per-layer input + post-attention norms | ✅ Yes |
-| `model_decomposed_i2s.bin` | I2_S packed ternary weights + per-block scales | With `--format i2s` |
-| `model_decomposed.bin` | ALS multi-term ternary weights | With `--format als` |
+| `model_decomposed.bin` | ALS multi-term ternary weights | ✅ Yes (ALS export) |
 
 ### `model_extra.bin` Layout
 
@@ -139,7 +128,7 @@ python scripts/export_ternary_model_bitnet.py \
 Large models (7B+) may OOM on CPU. Solutions:
 - Run on a GPU machine (`torch` auto-detects CUDA)
 - Reduce batch — export script processes one layer at a time, but embedding requires full vocab
-- Use `--format i2s` (lower memory than ALS)
+- Reduce term count with `--terms 8` (lower memory than 12-term ALS)
 
 ### "Tokenization failed" or "Decoding failed" at inference
 
