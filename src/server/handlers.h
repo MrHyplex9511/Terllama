@@ -29,7 +29,6 @@ struct ServerModelState {
     std::vector<NormWeights> layer_norms;
     RoPECache rope;
     std::string model_dir;
-    std::string helper_dir;
     CPUArch arch{CPUArch::UNKNOWN};
     bool loaded{false};
     Tokenizer tokenizer;  // native tokenizer from GGUF metadata
@@ -68,20 +67,19 @@ void send_error(httplib::Response& res, const std::string& message,
                 const std::string& type = "server_error");
 
 // ═══════════════════════════════════════════════════════════════════════════
-// TOKENIZER (Python subprocess for encode, native C++ for decode)
+// TOKENIZER (GigaToken encode; native C++ decode; no Python fallback)
 // ═══════════════════════════════════════════════════════════════════════════
 
-std::vector<int> tokenize_with_helper(const std::string& prompt,
-                                      const std::string& helper_dir);
+std::vector<int> tokenize_with_helper(const std::string& prompt);
 
-// ── Decode with fallback chain: native (llama) → GigaToken → Python ──────
+// ── Decode with fallback chain: native (llama) → GigaToken ────────────────
 // The native Tokenizer only decodes SentencePiece-style ("llama") vocab.
 // Byte-level BPE models (e.g. SmolLM2 via tokenizer.json) decode through
-// GigaToken; if that's unavailable we fall back to the Python helper.
+// GigaToken. If neither is available the function returns empty and the
+// engine fails cleanly — it never spawns a Python helper.
 std::string decode_with_fallback(const Tokenizer& tokenizer,
                                  const std::shared_ptr<GigaTokenWrapper>& gigatoken,
-                                 const std::vector<int>& token_ids,
-                                 const std::string& helper_dir);
+                                 const std::vector<int>& token_ids);
 
 // ═══════════════════════════════════════════════════════════════════════════
 // COMPLETION HELPERS

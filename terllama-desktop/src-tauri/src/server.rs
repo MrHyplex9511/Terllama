@@ -46,23 +46,11 @@ impl ServerManager {
             .join(&model_id);
 
         // Resolve the HF repo name for this model (registry id -> hf_repo).
-        // decode_helper.py needs the real repo id (e.g. "HuggingFaceTB/SmolLM2-135M"),
+        // The engine needs the real repo id (e.g. "HuggingFaceTB/SmolLM2-135M"),
         // which differs from the registry id used as the directory name.
         let hf_repo = resolve_hf_repo(&model_id).await;
 
         let binary = find_terllama_binary(resource_dir)?;
-
-        // Scripts dir for engine Python helpers: bundled resources first,
-        // then dev layout relative to the binary's repo.
-        let scripts_dir = resource_dir
-            .map(|rd| rd.join("resources").join("scripts"))
-            .filter(|p| p.exists())
-            .or_else(|| {
-                let dev = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("resources")
-                    .join("scripts");
-                dev.exists().then_some(dev)
-            });
 
         // Log file: ~/.terllama/logs/server-<model_id>.log
         let log_dir = dirs::home_dir()
@@ -81,9 +69,6 @@ impl ServerManager {
             )
             .env("TERLLAMA_PORT", port.to_string())
             .env("TERLLAMA_HF_MODEL", hf_repo);
-        if let Some(sd) = scripts_dir {
-            cmd.env("TERLLAMA_SCRIPT_DIR", sd.to_string_lossy().to_string());
-        }
 
         let mut child = cmd
             .stdout(Stdio::piped())

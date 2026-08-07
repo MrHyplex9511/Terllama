@@ -102,6 +102,10 @@ add_library(terllama_core OBJECT
     src/server.cpp
     src/downloader.cpp
     src/gguf_loader.cpp
+    src/convert/hf_download.cpp
+    src/convert/safetensors.cpp
+    src/convert/als_decompose.cpp
+    src/convert/export.cpp
 )
 target_include_directories(terllama_core PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src

@@ -1,3 +1,5 @@
+# NOTE: legacy Python fallback — engine no longer requires Python. No shipped
+# code path invokes this script; it is kept as a development tool only.
 """Read prompt from /tmp/ternary_prompt.txt. Write token IDs to /tmp/ternary_tokens.txt."""
 import os, sys
 from transformers import AutoTokenizer

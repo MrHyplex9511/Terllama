@@ -56,8 +56,7 @@ fn main() {
             commands::check_update,
             commands::convert_model,
             commands::cancel_conversion,
-            commands::check_python,
-            commands::check_convert_deps,
+            commands::check_engine,
         ])
         .setup(|app| {
             // Tray icon and menu

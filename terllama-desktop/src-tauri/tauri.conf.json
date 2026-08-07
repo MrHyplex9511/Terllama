@@ -28,8 +28,8 @@
     "active": true,
     "targets": "all",
     "resources": [
-      "resources/scripts/*.py",
-      "resources/bin/terllama"
+      "resources/bin/terllama",
+      "resources/bin/libgigatoken_rs.so"
     ],
     "icon": [
       "icons/32x32.png",

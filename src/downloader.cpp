@@ -1,41 +1,22 @@
 // ═══════════════════════════════════════════════════════════════════════════
-// Terllama — HuggingFace model puller (download + convert via Python export)
+// Terllama — HuggingFace model puller (native download + ALS convert)
 // ═══════════════════════════════════════════════════════════════════════════
 //
-// The actual download + ternary conversion is done by the Python script
-// scripts/export_ternary_model_bitnet.py. This C++ stub finds the script
-// relative to the binary path and invokes it with the right args.
+// The pull used to shell out to python3 (pip install + export script). It now
+// runs entirely in-process: src/convert/export.cpp downloads config.json,
+// tokenizer files and the safetensors checkpoint via libcurl, decomposes the
+// weights with the native ALS pipeline, and writes model_decomposed.bin +
+// model_extra.bin. Zero Python, zero subprocesses.
 
+#include "convert/export.h"
 #include "core/logger.h"
 #include <iostream>
 #include <string>
 #include <cstdlib>
 #include <cstring>
-#include <libgen.h>   // dirname
-#include <unistd.h>   // readlink, access
-#include <limits.h>   // PATH_MAX
-#include <vector>
 #include <thread>
 #include <atomic>
 #include <chrono>
-#include <spawn.h>
-#include <sys/wait.h>
-
-extern char **environ;
-
-static std::string get_bin_dir(const char* argv0) {
-    // Try /proc/self/exe first (Linux)
-    char buf[PATH_MAX];
-    ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
-    if (len != -1) {
-        buf[len] = '\0';
-        char* d = dirname(buf);
-        return std::string(d);
-    }
-    // Fallback: argv[0]
-    char* d = dirname(const_cast<char*>(argv0));
-    return std::string(d);
-}
 
 static std::string slugify(const std::string& repo) {
     std::string s = repo;
@@ -53,6 +34,7 @@ static void print_usage(const char* prog) {
     Logger::error("Arguments:");
     Logger::error("  <hf_repo>    HuggingFace repo (e.g. HuggingFaceTB/SmolLM2-135M)");
     Logger::error("  --format     'als' (default) or 'gguf'");
+    Logger::error("  --outdir     output directory (default: ~/.terllama/models/<repo>)");
     Logger::error("");
     Logger::error("Models stored in ~/.terllama/models/<repo-name>/");
     Logger::error("Tracked in ~/.terllama/models.json");
@@ -74,7 +56,7 @@ int downloader_main(int argc, char** argv) {
             }
             format = argv[++i];
             if (format != "als" && format != "gguf") {
-                Logger::error("Error: unknown format '{}' (i2s is deprecated; use 'als')", format);
+                Logger::error("Error: unknown format '{}' (use 'als')", format);
                 return 1;
             }
         } else if (arg == "--outdir" || arg == "-o") {
@@ -97,26 +79,6 @@ int downloader_main(int argc, char** argv) {
         return 1;
     }
 
-    // Find scripts dir: env var > relative to binary > CWD
-    std::string script_path;
-    const char* env_script_dir = getenv("TERLLAMA_SCRIPT_DIR");
-    if (env_script_dir) {
-        script_path = std::string(env_script_dir) + "/export_ternary_model_bitnet.py";
-    } else {
-        std::string bin_dir = get_bin_dir(argv[0]);
-        script_path = bin_dir + "/../scripts/export_ternary_model_bitnet.py";
-    }
-
-    // Check if script exists
-    if (access(script_path.c_str(), F_OK) != 0) {
-        // Try relative to CWD
-        script_path = "scripts/export_ternary_model_bitnet.py";
-        if (access(script_path.c_str(), F_OK) != 0) {
-            Logger::error("Error: can't find export script at scripts/export_ternary_model_bitnet.py");
-            return 1;
-        }
-    }
-
     std::string model_slug = slugify(hf_repo);
     std::string out_dir = outdir_override;
     if (out_dir.empty()) {
@@ -128,57 +90,30 @@ int downloader_main(int argc, char** argv) {
     Logger::info("Converting to {} format...", format);
     Logger::info("Output: {}", out_dir);
 
-    // Run pip install via posix_spawnp (no shell)
-    auto run_spawn = [](const std::string& prog, const std::vector<std::string>& args) -> int {
-        pid_t pid;
-        std::vector<const char*> argv;
-        argv.push_back(prog.c_str());
-        for (const auto& a : args) argv.push_back(a.c_str());
-        argv.push_back(nullptr);
-
-        int ret = posix_spawnp(&pid, prog.c_str(), nullptr, nullptr,
-                               const_cast<char* const*>(argv.data()), environ);
-        if (ret != 0) return -1;
-        int status;
-        waitpid(pid, &status, 0);
-        if (WIFEXITED(status)) return WEXITSTATUS(status);
-        return -1;
-    };
-
-    // Install dependencies first
-    Logger::info("  Installing Python dependencies...");
-    int pip_ret = run_spawn("pip", {"install", "transformers", "torch", "-q"});
-    if (pip_ret != 0) {
-        Logger::error("pip install failed (exit {}), continuing anyway...", pip_ret);
-    }
-
-    // Run export script with spinner
-    std::atomic<bool> downloading{true};
+    // Spinner on stderr while the native converter downloads + decomposes;
+    // [PROGRESS] lines (parseable by the desktop UI) go to stdout from
+    // convert_model.
+    std::atomic<bool> running{true};
     std::thread spinner([&]() {
         const char* frames = "|/-\\";
         int i = 0;
-        while (downloading) {
+        while (running) {
             fprintf(stderr, "\r  Converting... %c", frames[i++ % 4]);
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
         fprintf(stderr, "\r%*s\r", 40, "");
     });
 
-    int ret = run_spawn("python3", {
-        script_path,
-        "--model", hf_repo,
-        "--outdir", out_dir,
-        "--format", format
-    });
+    const int ret = terllama::convert_model(hf_repo, out_dir, 12, format);
 
-    downloading = false;
+    running = false;
     spinner.join();
 
     if (ret != 0) {
-        Logger::error("Export failed (exit code %d)", ret);
+        Logger::error("Conversion failed (exit code {})", ret);
         return 1;
     }
 
-    Logger::info("Model downloaded to: %s", out_dir.c_str());
+    Logger::info("Model downloaded to: {}", out_dir);
     return 0;
 }

@@ -708,17 +708,18 @@ inline LoadedModel load_model_from(const std::string& model_path_or_dir) {
         // ── Tokenizer for legacy .bin models ─────────────────────────────
         // Native vocab comes from a HuggingFace tokenizer.json co-located in
         // the model dir (written by the export script since v1.0.5). If it's
-        // absent, the server falls back to the Python decode helper.
+        // absent, GigaToken may still pick it up at runtime; otherwise the
+        // tokenizer is unavailable and the engine fails cleanly (no Python).
         std::string tok_json = model_path_or_dir + "/tokenizer.json";
         if (stat(tok_json.c_str(), &st) == 0) {
             if (m.tokenizer.load_from_tokenizer_json(tok_json)) {
                 Logger::info("  Tokenizer: {} (from tokenizer.json), vocab={}",
                     m.tokenizer.model_type, m.tokenizer.vocab.size());
             } else {
-                Logger::info("  Tokenizer: tokenizer.json present but unreadable, falling back to Python helper");
+                Logger::info("  Tokenizer: tokenizer.json present but unreadable — tokenizer unavailable");
             }
         } else {
-            Logger::info("  Tokenizer: no tokenizer.json in model dir — will use Python decode helper");
+            Logger::info("  Tokenizer: no tokenizer.json in model dir — tokenizer unavailable");
         }
     }
 

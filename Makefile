@@ -12,6 +12,12 @@
 CXX         := g++
 CXXFLAGS    := -std=c++17 -O3 -fopenmp -flto -Wall -Wextra -Wno-unknown-pragmas -Wno-address
 LDFLAGS     := -lm -fopenmp -lpthread -ldl -flto
+# libcurl dev symlink may be missing system-wide; allow a staged dev tree for
+# headers, and link the runtime shared lib directly (-l:libcurl.so.4). Static
+# libcurl drags in GSSAPI/Kerberos, so never prefer it.
+CURL_LINK    := -l:libcurl.so.4
+CURL_LIBDIR  := $(dir $(firstword $(wildcard $(CURL_DIR)/usr/lib/*/libcurl.so)))
+CURL_INCLUDE := $(subst /usr/lib/,/usr/include/,$(CURL_LIBDIR))
 
 SRC_DIR     := src
 BUILD_DIR   := build
@@ -43,7 +49,11 @@ MAIN_OBJS := $(BUILD_DIR)/main.o \
              $(BUILD_DIR)/logger.o \
              $(BUILD_DIR)/tokenizer.o \
              $(BUILD_DIR)/gigatoken_wrapper.o \
-             $(BUILD_DIR)/mote_builder.o
+             $(BUILD_DIR)/mote_builder.o \
+             $(BUILD_DIR)/hf_download.o \
+             $(BUILD_DIR)/safetensors.o \
+             $(BUILD_DIR)/als_decompose.o \
+             $(BUILD_DIR)/export.o
 
 .PHONY: all build-terllama build-bench clean help
 
@@ -109,6 +119,22 @@ $(BUILD_DIR)/mote_builder.o: $(SRC_DIR)/mote_builder.cpp | $(BUILD_DIR)
 $(BUILD_DIR)/gguf_loader.o: $(SRC_DIR)/gguf_loader.cpp $(SRC_DIR)/gguf_loader.h | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
+# HF download (libcurl)
+$(BUILD_DIR)/hf_download.o: $(SRC_DIR)/convert/hf_download.cpp $(SRC_DIR)/convert/hf_download.h | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) -DTERLLAMA_HAVE_CURL -I$(SRC_DIR) -I$(THIRD_PARTY) $(if $(CURL_INCLUDE),-I$(CURL_INCLUDE)) -c $< -o $@
+
+# Safetensors parser
+$(BUILD_DIR)/safetensors.o: $(SRC_DIR)/convert/safetensors.cpp $(SRC_DIR)/convert/safetensors.h | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) -I$(SRC_DIR) -I$(THIRD_PARTY) -c $< -o $@
+
+# ALS decomposition + packing (Track B)
+$(BUILD_DIR)/als_decompose.o: $(SRC_DIR)/convert/als_decompose.cpp $(SRC_DIR)/convert/als_decompose.h | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) -I$(SRC_DIR) -I$(THIRD_PARTY) -c $< -o $@
+
+# Native ALS converter (Track C)
+$(BUILD_DIR)/export.o: $(SRC_DIR)/convert/export.cpp $(SRC_DIR)/convert/export.h $(SRC_DIR)/convert/als_decompose.h $(SRC_DIR)/convert/safetensors.h $(SRC_DIR)/convert/hf_download.h | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) -DTERLLAMA_HAVE_CURL -I$(SRC_DIR) -I$(THIRD_PARTY) $(if $(CURL_INCLUDE),-I$(CURL_INCLUDE)) -c $< -o $@
+
 # Core inference
 $(BUILD_DIR)/inference.o: $(SRC_DIR)/core/inference.cpp | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -I$(SRC_DIR) -c $< -o $@
@@ -119,7 +145,7 @@ $(BUILD_DIR)/logger.o: $(SRC_DIR)/core/logger.cpp | $(BUILD_DIR)
 
 # Tokenizer
 $(BUILD_DIR)/tokenizer.o: $(SRC_DIR)/core/tokenizer.cpp $(SRC_DIR)/core/tokenizer.h | $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS) -I$(SRC_DIR) -c $< -o $@
+	$(CXX) $(CXXFLAGS) -I$(SRC_DIR) -I$(THIRD_PARTY) -c $< -o $@
 
 # GigaToken C API shared library (Rust)
 GIGATOKEN_SO := $(THIRD_PARTY)/gigatoken/target/release/libgigatoken_rs.so
@@ -140,14 +166,14 @@ $(BUILD_DIR)/benchmark.o: $(SRC_DIR)/benchmark.cpp | $(BUILD_DIR)
 
 # Main binary (CLI + server + downloader + kernels)
 $(TARGET): $(GIGATOKEN_SO) $(MAIN_OBJS) $(KERNEL_OBJS)
-	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(CURL_LINK) $(LDFLAGS)
 	# Copy GigaToken .so next to binary
 	cp $(GIGATOKEN_SO) ./libgigatoken_rs.so
 	@echo "  -> Copied libgigatoken_rs.so"
 
 # Benchmark binary
 $(BENCH): $(BUILD_DIR)/benchmark.o $(BUILD_DIR)/dispatcher.o $(BUILD_DIR)/logger.o $(KERNEL_OBJS)
-	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(CURL_LINK) $(LDFLAGS)
 
 clean:
 	rm -rf $(BUILD_DIR) $(TARGET) $(BENCH)

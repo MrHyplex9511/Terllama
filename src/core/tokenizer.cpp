@@ -32,7 +32,7 @@ bool Tokenizer::load_from_tokenizer_json(const std::string& path) {
     std::string type = model.value("type", std::string());
     if (type != "BPE" && type != "Unigram" && type != "WordPiece" &&
         type != "SentencePiece") {
-        // unknown tokenizer type — bail, caller will fall back to Python
+        // unknown tokenizer type — bail; callers fall back to GigaToken
         return false;
     }
 
@@ -111,8 +111,8 @@ bool Tokenizer::load_from_tokenizer_json(const std::string& path) {
 
     // Native decode can only handle SentencePiece-style ("llama") tokens.
     // Byte-level BPE ("gpt2") tokens are byte-encoded unicode (Ġ etc.) that
-    // only GigaToken / Python can decode correctly, so leave valid=false —
-    // callers must use the GigaToken wrapper (see handlers.cpp / commands.cpp).
+    // only GigaToken can decode correctly, so leave valid=false — callers
+    // must use the GigaToken wrapper (see handlers.cpp / commands.cpp).
     valid = (model_type == "llama");
     return true;
 }

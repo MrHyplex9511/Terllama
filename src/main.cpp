@@ -9,6 +9,7 @@
  *   terllama list                            ← list local models
  *   terllama show <model>                    ← model info
  *   terllama pull <hf-repo> [--format als]  ← download from HF
+ *   terllama convert --model <hf-repo>      ← native ALS conversion
  *   terllama rm <model>                      ← remove a model
  *   terllama serve [--port N]                ← start API server
  *   terllama chat --model <m> [--prompt p]   ← interactive CLI chat
@@ -18,6 +19,7 @@
  *   TERLLAMA_PORT        server port (default 8375)
  */
 #include "cli/commands.h"
+#include "convert/export.h"
 #include "core/logger.h"
 
 #include <iostream>
@@ -103,6 +105,10 @@ int main(int argc, char** argv) {
 
     if (cmd == "pull" || cmd == "download") {
         return cmd_pull(argc, argv);
+    }
+
+    if (cmd == "convert") {
+        return terllama::export_main(argc, argv);
     }
 
     if (cmd == "serve" || cmd == "server") {

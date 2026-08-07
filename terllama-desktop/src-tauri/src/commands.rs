@@ -120,26 +120,18 @@ pub async fn download_model(
                     &out_dir,
                 ).await;
             }
-            // Conversion path (fall through to the python export flow below).
+            // Conversion path (fall through to the native engine flow below).
         }
         _ => return Err(format!("Unknown download format: {}", format)),
     }
 
-    // Ternary format (als): run C++ binary with Python export script
+    // Ternary format (als): engine's native `pull` subcommand (downloads from
+    // HuggingFace and converts to ALS in-process — no Python).
     let resource_dir = app
         .path()
         .resource_dir()
         .ok();
     let binary = crate::server::find_terllama_binary(resource_dir.as_deref())?;
-
-    // Resolve scripts directory (Tauri resource dir for bundled, or dev path)
-    let scripts_dir = match crate::convert::get_scripts_dir(&app) {
-        Ok(d) => d,
-        Err(_) => {
-            // Fallback: relative to CWD (dev mode)
-            std::path::PathBuf::from("scripts")
-        }
-    };
 
     // Spawn subprocess with piped stdout/stderr so we can stream progress
     let mut child = tokio::process::Command::new(&binary)
@@ -149,7 +141,6 @@ pub async fn download_model(
         .arg(&model.format)
         .arg("--outdir")
         .arg(&out_dir)
-        .env("TERLLAMA_SCRIPT_DIR", scripts_dir.to_string_lossy().to_string())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -563,20 +554,56 @@ pub async fn cancel_conversion() -> Result<(), String> {
 }
 
 #[tauri::command]
-pub async fn check_python() -> Result<String, String> {
-    let python = convert::find_python().ok_or_else(|| "Python 3 not found".to_string())?;
-    let (major, minor) = convert::check_python_version(&python)?;
-    Ok(format!("Python {}.{} at {}", major, minor, python.display()))
-}
+pub async fn check_engine(app: tauri::AppHandle) -> Result<String, String> {
+    let resource_dir = app.path().resource_dir().ok();
+    let binary = crate::server::find_terllama_binary(resource_dir.as_deref())?;
 
-#[tauri::command]
-pub async fn check_convert_deps() -> Result<bool, String> {
-    let python = convert::find_python().ok_or_else(|| "Python 3 not found".to_string())?;
-    let out = std::process::Command::new(&python)
-        .args(["-c", "import torch, transformers; print('ok')"])
+    // Confirm the binary runs at all.
+    let version = std::process::Command::new(&binary)
+        .arg("--version")
         .output()
-        .map_err(|e| format!("Failed to check deps: {}", e))?;
-    Ok(out.status.success())
+        .map_err(|e| format!("Failed to run engine: {}", e))?;
+    if !version.status.success() {
+        let stderr = String::from_utf8_lossy(&version.stderr);
+        return Err(format!(
+            "Engine binary at {} failed to run: {}",
+            binary,
+            stderr.lines().next().unwrap_or("unknown error")
+        ));
+    }
+    let version_str = String::from_utf8_lossy(&version.stdout).trim().to_string();
+
+    // Confirm the native `convert` subcommand exists. Invoke it with no model:
+    // the engine prints its usage line (containing "--model") and exits without
+    // touching the network.
+    let probe = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio::process::Command::new(&binary)
+            .arg("convert")
+            .output(),
+    )
+    .await
+    .map_err(|_| "Engine convert subcommand check timed out".to_string())?
+    .map_err(|e| format!("Failed to probe engine convert subcommand: {}", e))?;
+
+    let probe_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&probe.stdout),
+        String::from_utf8_lossy(&probe.stderr)
+    );
+    if !probe_out.contains("--model") {
+        return Err(
+            "Bundled engine does not support the 'convert' subcommand. Reinstall the application."
+                .to_string(),
+        );
+    }
+
+    let label = if version_str.is_empty() {
+        binary
+    } else {
+        version_str
+    };
+    Ok(format!("Engine ready ({})", label))
 }
 
 #[tauri::command]

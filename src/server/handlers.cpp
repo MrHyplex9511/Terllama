@@ -1,7 +1,8 @@
 /*
  * handlers.cpp — HTTP route handler implementations for Terllama server
  *
- * Uses nlohmann/json for JSON construction, posix_spawn for Python subprocess.
+ * Uses nlohmann/json for JSON construction. Tokenization/decode use native
+ * C++ + GigaToken; the engine never spawns a Python subprocess.
  * API response shapes are byte-identical to the original manual JSON output.
  */
 #include "server/handlers.h"
@@ -22,16 +23,11 @@
 #include <chrono>
 #include <thread>
 #include <memory>
-#include <spawn.h>
-#include <sys/wait.h>
 #include <unistd.h>
 #include <csignal>
 
 // Thread-local batch decode buffer (16-token batches for streaming)
 static thread_local std::vector<int> tls_decode_buffer;
-
-// Mutex serializing Python tokenizer subprocess (fixed /tmp file paths)
-static std::mutex g_tokenize_mutex;
 
 // Signal flag (defined in commands.cpp)
 extern std::atomic<bool> g_interrupted;
@@ -97,52 +93,26 @@ static bool check_api_key(const httplib::Request& req,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// TOKENIZER (Python subprocess for encode only; native C++ decode)
+// TOKENIZER (GigaToken encode; native C++ decode)
 // ═══════════════════════════════════════════════════════════════════════════
-// The encode path (tokenize) is called once per request and uses Python
-// via posix_spawn. The decode path is called per-token in streaming and
-// uses native C++ (Tokenizer from GGUF metadata) for performance.
+// The encode path (tokenize) goes through the GigaToken wrapper (tokenizer.json
+// loaded at model init). The decode path is called per-token in streaming and
+// uses native C++ (Tokenizer from GGUF metadata) with a GigaToken fallback.
+// There is NO Python subprocess fallback: if neither path is available the
+// caller gets an empty result / error and fails cleanly.
 
-extern char **environ;
-
-static int run_python_script(const std::string& script_path) {
-    pid_t pid;
-    std::string python = "python3";
-    const char* argv[] = {"python3", script_path.c_str(), nullptr};
-
-    int ret = posix_spawnp(&pid, python.c_str(), nullptr, nullptr,
-                           const_cast<char* const*>(argv), environ);
-    if (ret != 0) {
-        Logger::error("posix_spawnp failed for {} (errno={})", script_path, ret);
-        return -1;
-    }
-    int status;
-    waitpid(pid, &status, 0);
-    if (WIFEXITED(status)) return WEXITSTATUS(status);
-    return -1;
-}
-
-std::vector<int> tokenize_with_helper(const std::string& prompt,
-                                      const std::string& helper_dir)
+std::vector<int> tokenize_with_helper(const std::string& prompt)
 {
-    // Serialize via mutex: Python script uses fixed /tmp file paths
-    std::lock_guard<std::mutex> lock(g_tokenize_mutex);
-    std::string prompt_file = "/tmp/ternary_prompt.txt";
-    std::string token_file  = "/tmp/ternary_tokens.txt";
-    {
-        std::ofstream pf(prompt_file);
-        if (!pf) { Logger::error("Cannot write prompt file"); return {}; }
-        pf << prompt;
+    // GigaToken encode (tokenizer.json loaded at model init)
+    if (g_model.gigatoken && g_model.gigatoken->has_tokenizer()) {
+        auto ids = g_model.gigatoken->encode(prompt);
+        return std::vector<int>(ids.begin(), ids.end());
     }
-    std::string script = helper_dir + "/tokenize_helper.py";
-    int ret = run_python_script(script);
-    if (ret != 0) { Logger::error("Tokenization failed"); return {}; }
 
-    std::vector<int> tokens;
-    std::ifstream tf(token_file);
-    int tid;
-    while (tf >> tid) tokens.push_back(tid);
-    return tokens;
+    // No Python fallback: the engine must not require Python. The caller
+    // (HTTP handler) turns this into a 500 error response.
+    Logger::error("Tokenizer unavailable: no GigaToken .so / tokenizer.json and native encode is not supported. Install the bundled libgigatoken_rs.so or provide tokenizer.json.");
+    return {};
 }
 
 // ── Decode fallback chain ─────────────────────────────────────────────────
@@ -150,11 +120,10 @@ std::vector<int> tokenize_with_helper(const std::string& prompt,
 //    C++ path. Byte-level BPE ("gpt2") tokenizers can't be decoded natively;
 //    native decode() returns "?" for those.
 // 2. GigaToken wrapper (loaded from tokenizer.json in the model dir).
-// 3. Python decode helper (last resort; bundled decode_helper.py).
+// No Python decode helper — if neither path works, return empty and log once.
 std::string decode_with_fallback(const Tokenizer& tokenizer,
                                  const std::shared_ptr<GigaTokenWrapper>& gigatoken,
-                                 const std::vector<int>& token_ids,
-                                 const std::string& helper_dir)
+                                 const std::vector<int>& token_ids)
 {
     // Fast path: native tokenizer (llama style)
     {
@@ -169,27 +138,13 @@ std::string decode_with_fallback(const Tokenizer& tokenizer,
         if (!text.empty()) return text;
     }
 
-    // Python decode helper (shared /tmp paths — same mutex as tokenize)
-    std::lock_guard<std::mutex> lock(g_tokenize_mutex);
-    std::string in_file  = "/tmp/ternary_decode_in.txt";
-    std::string out_file = "/tmp/ternary_decode_out.txt";
-    {
-        std::ofstream inf(in_file);
-        if (!inf) { Logger::error("Cannot write decode input file"); return ""; }
-        for (size_t i = 0; i < token_ids.size(); i++) {
-            if (i) inf << ' ';
-            inf << token_ids[i];
-        }
-    }
-    std::string script = helper_dir + "/decode_helper.py";
-    int ret = run_python_script(script);
-    if (ret != 0) { Logger::error("Decode failed"); return ""; }
-
-    std::ifstream outf(out_file);
-    if (!outf) return "";
-    std::string text((std::istreambuf_iterator<char>(outf)),
-                     std::istreambuf_iterator<char>());
-    return text;
+    // No Python fallback. Log once per process (this is called per token
+    // batch in streaming) and return empty so the stream skips gracefully.
+    static std::once_flag warned;
+    std::call_once(warned, [] {
+        Logger::error("Tokenizer unavailable: no native vocab and no GigaToken .so / tokenizer.json. Install the bundled libgigatoken_rs.so or provide tokenizer.json.");
+    });
+    return "";
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -424,7 +379,7 @@ void handle_chat_completions(const httplib::Request& req,
     std::vector<int> prompt_tokens;
     {
         std::lock_guard<std::mutex> lock(g_model_mutex);
-        prompt_tokens = tokenize_with_helper(prompt, g_model.helper_dir);
+        prompt_tokens = tokenize_with_helper(prompt);
     }
     if (prompt_tokens.empty()) {
         send_error(res, "Tokenization failed", 500, "tokenization_error");
@@ -474,7 +429,7 @@ void handle_chat_completions(const httplib::Request& req,
                     if (tls_decode_buffer.size() >= 16 || is_eos) {
                         std::string text = decode_with_fallback(
                             c->snap->tokenizer, c->snap->gigatoken,
-                            tls_decode_buffer, g_model.helper_dir);
+                            tls_decode_buffer);
                         if (!text.empty()) {
                             json delta = {
                                 {"role",    "assistant"},
@@ -509,7 +464,7 @@ void handle_chat_completions(const httplib::Request& req,
                 if (!tls_decode_buffer.empty()) {
                     std::string text = decode_with_fallback(
                         ctx->snap->tokenizer, ctx->snap->gigatoken,
-                        tls_decode_buffer, g_model.helper_dir);
+                        tls_decode_buffer);
                     if (!text.empty()) {
                         json delta = {{"role","assistant"}, {"content",text}};
                         json chunk = {
@@ -549,9 +504,9 @@ void handle_chat_completions(const httplib::Request& req,
         std::string prompt_decoded;
         {
             decoded        = decode_with_fallback(snap->tokenizer, snap->gigatoken,
-                                                  all_tokens, g_model.helper_dir);
+                                                  all_tokens);
             prompt_decoded = decode_with_fallback(snap->tokenizer, snap->gigatoken,
-                                                  prompt_tokens, g_model.helper_dir);
+                                                  prompt_tokens);
         }
 
         std::string generated_text;
@@ -656,7 +611,7 @@ void handle_completions(const httplib::Request& req,
     std::vector<int> prompt_tokens;
     {
         std::lock_guard<std::mutex> lock(g_model_mutex);
-        prompt_tokens = tokenize_with_helper(prompt, g_model.helper_dir);
+        prompt_tokens = tokenize_with_helper(prompt);
     }
     if (prompt_tokens.empty()) {
         send_error(res, "Tokenization failed", 500, "tokenization_error");
@@ -706,7 +661,7 @@ void handle_completions(const httplib::Request& req,
                     if (tls_decode_buffer.size() >= 16 || is_eos) {
                         std::string text = decode_with_fallback(
                             c->snap->tokenizer, c->snap->gigatoken,
-                            tls_decode_buffer, g_model.helper_dir);
+                            tls_decode_buffer);
                         if (!text.empty()) {
                             json choice = {
                                 {"index",         0},
@@ -739,7 +694,7 @@ void handle_completions(const httplib::Request& req,
                 if (!tls_decode_buffer.empty()) {
                     std::string text = decode_with_fallback(
                         ctx->snap->tokenizer, ctx->snap->gigatoken,
-                        tls_decode_buffer, g_model.helper_dir);
+                        tls_decode_buffer);
                     if (!text.empty()) {
                         json choice = {
                             {"index",0}, {"text",text},
@@ -781,9 +736,9 @@ void handle_completions(const httplib::Request& req,
         std::string decoded, prompt_decoded;
         {
             decoded        = decode_with_fallback(snap->tokenizer, snap->gigatoken,
-                                                  all_tokens, g_model.helper_dir);
+                                                  all_tokens);
             prompt_decoded = decode_with_fallback(snap->tokenizer, snap->gigatoken,
-                                                  prompt_tokens, g_model.helper_dir);
+                                                  prompt_tokens);
         }
 
         std::string generated_text;

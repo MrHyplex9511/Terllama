@@ -35,7 +35,6 @@
 #include <ctime>
 #include <climits>
 #include <unistd.h>
-#include <libgen.h>
 #include <mutex>
 #include <thread>
 #include <atomic>
@@ -64,19 +63,6 @@ bool init_server(const std::string& model_dir) {
     if (g_model.loaded) return true;
 
     g_model.model_dir  = model_dir;
-    // Resolve scripts/ relative to this binary (co-located in repo).
-    // Prefer TERLLAMA_SCRIPT_DIR (set by desktop app) so bundled/macOS
-    // installs find the Python helpers without /proc/self/exe.
-    g_model.helper_dir = []{
-        const char* env_scripts = std::getenv("TERLLAMA_SCRIPT_DIR");
-        if (env_scripts && env_scripts[0]) {
-            return std::string(env_scripts);
-        }
-        char buf[PATH_MAX];
-        ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf)-1);
-        if (len != -1) { buf[len]='\0'; return std::string(dirname(buf))+"/scripts"; }
-        return std::string("scripts");
-    }();
     g_model.arch       = detect_cpu_arch();
 
     // Allow environment override for testing
@@ -132,11 +118,11 @@ bool init_server(const std::string& model_dir) {
                     Logger::info("  GigaToken: loaded HF tokenizer from {} (vocab={})",
                                  (model_dir + "/tokenizer.json"), g_model.gigatoken->vocab_size());
                 } else {
-                    Logger::info("  GigaToken: no tokenizer.json in model dir — using native/Python decode");
+                    Logger::info("  GigaToken: no tokenizer.json in model dir — using native decode only");
                     g_model.gigatoken.reset();
                 }
             } else {
-                Logger::info("  GigaToken: .so not found — using native/Python decode");
+                Logger::info("  GigaToken: .so not found — using native decode only");
                 g_model.gigatoken.reset();
             }
         }

@@ -8,26 +8,25 @@
   let format = $state('als');
   let terms = $state(12);
 
-  let pythonStatus = $state<string>('');
-  let depsOk = $state<boolean | null>(null);
+  let engineStatus = $state<string>('');
+  let engineOk = $state<boolean | null>(null);
   let isConverting = $state(false);
   let output = $state<string[]>([]);
   let outputEl: HTMLDivElement | undefined = $state();
 
   $effect(() => {
-    checkPython();
+    checkEngine();
   });
 
-  async function checkPython() {
-    pythonStatus = 'Checking...';
+  async function checkEngine() {
+    engineStatus = 'Checking...';
     try {
-      const info = await invoke<string>('check_python');
-      pythonStatus = info;
-      const deps = await invoke<boolean>('check_convert_deps');
-      depsOk = deps;
+      const info = await invoke<string>('check_engine');
+      engineStatus = info;
+      engineOk = true;
     } catch (e: any) {
-      pythonStatus = e;
-      depsOk = false;
+      engineStatus = e;
+      engineOk = false;
     }
   }
 
@@ -85,26 +84,25 @@
   <p class="subtitle">Download and ternarize HuggingFace models for local inference</p>
 
   <FadeContent duration={0.4} delay={0.05}>
-  <!-- Python Status -->
+  <!-- Engine Status -->
   <div class="card-base status-card">
     <div class="status-row">
-      <span class="label">Python Status</span>
+      <span class="label">Engine Status</span>
       <span
         class="value"
-        class:ok={pythonStatus && !pythonStatus.startsWith('Check') && depsOk}
-        class:err={depsOk === false}
+        class:ok={engineOk === true}
+        class:err={engineOk === false}
       >
-        {pythonStatus || 'Checking...'}
+        {engineStatus || 'Checking...'}
       </span>
     </div>
-    {#if depsOk === false && pythonStatus}
+    {#if engineOk === false && engineStatus}
       <div class="deps-warning">
-        <p><strong>Missing dependencies.</strong> Install them:</p>
-        <code>pip install torch transformers</code>
-        <button class="btn-sm" onclick={checkPython}>Retry</button>
+        <p><strong>Conversion engine not ready.</strong></p>
+        <button class="btn-sm" onclick={checkEngine}>Retry</button>
       </div>
-    {:else if depsOk === true}
-      <div class="deps-ok">✓ torch + transformers available</div>
+    {:else if engineOk === true}
+      <div class="deps-ok">✓ Native engine ready (no Python required)</div>
     {/if}
   </div>
 
@@ -142,7 +140,7 @@
 
     <div class="actions">
       {#if !isConverting}
-        <button class="btn-primary" onclick={startConvert} disabled={!depsOk || !modelName.trim()}>
+        <button class="btn-primary" onclick={startConvert} disabled={!engineOk || !modelName.trim()}>
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <polyline points="23 4 23 10 17 10" />
             <polyline points="1 20 1 14 7 14" />
@@ -240,15 +238,6 @@
   }
 
   .deps-warning p { margin: 0 0 8px; }
-  .deps-warning code {
-    display: block;
-    padding: 8px 12px;
-    background: hsl(var(--surface));
-    border-radius: 6px;
-    font-size: 13px;
-    margin-bottom: 8px;
-    color: hsl(var(--content));
-  }
 
   .deps-ok {
     margin-top: 8px;

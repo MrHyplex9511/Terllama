@@ -2,8 +2,8 @@
  * commands.cpp — CLI subcommand implementations for Terllama
  *
  * All cmd_* functions migrated from main.cpp.
- * Tokenizer helper uses posix_spawn (no shell) + /proc/self/exe for
- * script directory resolution.
+ * Tokenizer uses GigaToken (.so + tokenizer.json); the engine no longer
+ * spawns a Python subprocess.
  */
 #include "cli/commands.h"
 #include "model.h"
@@ -27,13 +27,9 @@
 #include <dirent.h>
 #include <unistd.h>
 #include <pwd.h>
-#include <spawn.h>
-#include <sys/wait.h>
 
 #include "core/tokenizer.h"
 #include "core/gigatoken_wrapper.h"
-
-extern char **environ;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // SIGNAL HANDLING
@@ -63,23 +59,6 @@ static std::string slugify(const std::string& repo) {
     return s;
 }
 
-// Resolve scripts/ directory relative to the running binary via
-// /proc/self/exe, not CWD.
-static std::string get_helper_dir() {
-    char buf[4096];
-    ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
-    if (len <= 0) return "scripts"; // fallback
-    buf[len] = '\0';
-    std::string exe(buf);
-    auto pos = exe.rfind('/');
-    if (pos == std::string::npos) return "scripts";
-    std::string dir = exe.substr(0, pos) + "/scripts";
-    struct stat st;
-    if (stat(dir.c_str(), &st) == 0 && S_ISDIR(st.st_mode))
-        return dir;
-    return "scripts"; // fallback
-}
-
 // ═══════════════════════════════════════════════════════════════════════════
 // MODEL REGISTRY — shortname → HuggingFace repo resolution
 // ═══════════════════════════════════════════════════════════════════════════
@@ -101,29 +80,12 @@ static std::unordered_map<std::string, RegistryEntry> get_registry() {
     };
 }
 
-// Run a Python helper script via posix_spawn (no shell).
-// Returns the exit code, or -1 on spawn failure.
-static int run_python_script(const std::string& script_path) {
-    pid_t pid;
-    std::string python = "python3";
-    const char* argv[] = {"python3", script_path.c_str(), nullptr};
-
-    int ret = posix_spawnp(&pid, python.c_str(), nullptr, nullptr,
-                           const_cast<char* const*>(argv), environ);
-    if (ret != 0) {
-        Logger::error(("Failed to spawn python3 for " + script_path).c_str());
-        return -1;
-    }
-
-    int status;
-    waitpid(pid, &status, 0);
-    if (WIFEXITED(status))
-        return WEXITSTATUS(status);
-    return -1;
-}
+// Legacy Python helper (run_python_script) removed — the engine no longer
+// spawns python3. Any runtime path that needs tokenization must use
+// GigaToken or fail cleanly.
 
 // ═══════════════════════════════════════════════════════════════════════════
-// TOKENIZER (Python helper for encode only; native C++ decode)
+// TOKENIZER (GigaToken encode/decode; no Python fallback)
 // ═══════════════════════════════════════════════════════════════════════════
 
 // Shared GigaToken instance for the CLI (encode + decode).
@@ -154,50 +116,34 @@ static void ensure_gigatoken(const std::string& model_dir) {
             if (g_cli_gigatoken_ok) {
                 Logger::info(("GigaToken: loaded tokenizer from " + model_dir).c_str());
             } else {
-                Logger::info(("GigaToken: no tokenizer.json in " + model_dir + ", fallback to Python").c_str());
+                Logger::info(("GigaToken: no tokenizer.json in " + model_dir + ", tokenizer unavailable").c_str());
             }
         } else {
-            Logger::info("GigaToken: .so not found, using Python subprocess");
+            Logger::info("GigaToken: .so not found, tokenizer unavailable");
         }
     });
 }
 
-// Try GigaToken encode first; fall back to Python subprocess.
+// Try GigaToken encode. There is no Python fallback — if GigaToken cannot
+// load (no .so / no tokenizer.json), fail cleanly with a clear error.
 // model_dir should contain tokenizer.json for GigaToken to load.
 static std::vector<int> tokenize_with_helper(const std::string& prompt,
-                                              const std::string& helper_dir,
                                               const std::string& model_dir = "") {
-    // ── Try GigaToken (fast Rust) ─────────────────────────────────────
     ensure_gigatoken(model_dir);
     if (g_cli_gigatoken_ok && g_cli_gigatoken.has_tokenizer()) {
         auto ids = g_cli_gigatoken.encode(prompt);
-        if (!ids.empty()) {
-            return std::vector<int>(ids.begin(), ids.end());
-        }
+        return std::vector<int>(ids.begin(), ids.end());
     }
 
-    // ── Fallback: Python subprocess ───────────────────────────────────
-    std::string prompt_file = "/tmp/ternary_prompt.txt";
-    std::string token_file = "/tmp/ternary_tokens.txt";
-    {
-        std::ofstream pf(prompt_file);
-        pf << prompt;
-    }
-    int ret = run_python_script(helper_dir + "/tokenize_helper.py");
-    if (ret != 0) { Logger::error("Tokenization failed"); return {}; }
-
-    std::vector<int> tokens;
-    std::ifstream tf(token_file);
-    int tid;
-    while (tf >> tid) tokens.push_back(tid);
-    return tokens;
+    // No Python fallback: the engine must not require Python.
+    Logger::error("Tokenizer unavailable: no GigaToken .so / tokenizer.json and native encode is not supported. Install the bundled libgigatoken_rs.so or provide tokenizer.json.");
+    return {};
 }
 
-// Decode with fallback: native (llama) → GigaToken (byte-level BPE) →
-// Python helper. Mirrors the server-side chain.
+// Decode with fallback: native (llama) → GigaToken (byte-level BPE).
+// No Python fallback — if neither can decode, fail cleanly.
 static std::string decode_with_fallback(const Tokenizer& tokenizer,
                                          const std::vector<int>& token_ids,
-                                         const std::string& helper_dir,
                                          const std::string& model_dir = "") {
     // Fast path: native tokenizer (llama style)
     {
@@ -213,21 +159,13 @@ static std::string decode_with_fallback(const Tokenizer& tokenizer,
         if (!text.empty()) return text;
     }
 
-    // Python decode helper (shared /tmp paths)
-    std::string in_file  = "/tmp/ternary_decode_in.txt";
-    std::string out_file = "/tmp/ternary_decode_out.txt";
-    {
-        std::ofstream inf(in_file);
-        inf << token_ids[0];
-        for (size_t i = 1; i < token_ids.size(); i++) inf << ' ' << token_ids[i];
-    }
-    int ret = run_python_script(helper_dir + "/decode_helper.py");
-    if (ret != 0) { Logger::error("Decode failed"); return ""; }
-
-    std::ifstream outf(out_file);
-    if (!outf) return "";
-    return std::string((std::istreambuf_iterator<char>(outf)),
-                       std::istreambuf_iterator<char>());
+    // No Python fallback. Log once per process to avoid spamming streaming
+    // loops; return empty so callers fail gracefully.
+    static std::once_flag warned;
+    std::call_once(warned, [] {
+        Logger::error("Tokenizer unavailable: no native vocab and no GigaToken .so / tokenizer.json. Install the bundled libgigatoken_rs.so or provide tokenizer.json.");
+    });
+    return "";
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -430,8 +368,6 @@ static int cmd_chat_simple(const std::string& model_id,
         ? std::string(std::getenv("TERLLAMA_MODEL_DIR"))
         : models_dir() + "/" + model_id;
 
-    std::string helper_dir = get_helper_dir();
-
     srand(42);
     CPUArch arch = detect_cpu_arch();
     const char* arch_override = std::getenv("TERLLAMA_ARCH");
@@ -468,7 +404,7 @@ static int cmd_chat_simple(const std::string& model_id,
     auto rope = build_rope_cache(cfg.max_position_embeddings, cfg.head_dim, cfg.rope_theta);
 
     Logger::info("Prompt: {}", prompt_text);
-    auto prompt_tokens = tokenize_with_helper(prompt_text, helper_dir, model_dir);
+    auto prompt_tokens = tokenize_with_helper(prompt_text, model_dir);
 
     if (prompt_tokens.empty()) {
         Logger::error("Tokenization failed");
@@ -481,10 +417,8 @@ static int cmd_chat_simple(const std::string& model_id,
 
     std::vector<int> all_tokens = prompt_tokens;
     all_tokens.insert(all_tokens.end(), output_tokens.begin(), output_tokens.end());
-    std::string decoded = decode_with_fallback(loaded.tokenizer, all_tokens,
-                                               helper_dir, model_dir);
-    std::string prompt_decoded = decode_with_fallback(loaded.tokenizer, prompt_tokens,
-                                                      helper_dir, model_dir);
+    std::string decoded = decode_with_fallback(loaded.tokenizer, all_tokens, model_dir);
+    std::string prompt_decoded = decode_with_fallback(loaded.tokenizer, prompt_tokens, model_dir);
 
     Logger::info("=== Response ===");
     Logger::info(decoded.c_str());
@@ -539,7 +473,6 @@ int cmd_chat(int argc, char** argv) {
         std::string model_dir = std::getenv("TERLLAMA_MODEL_DIR")
             ? std::string(std::getenv("TERLLAMA_MODEL_DIR"))
             : models_dir() + "/" + model_id;
-        std::string helper_dir = get_helper_dir();
 
         srand(42);
         auto loaded = load_model_from(model_dir);
@@ -555,7 +488,7 @@ int cmd_chat(int argc, char** argv) {
             Logger::info("You: ");
             if (!std::getline(std::cin, line) || line.empty()) break;
 
-            auto tokens = tokenize_with_helper(line, helper_dir, model_dir);
+            auto tokens = tokenize_with_helper(line, model_dir);
             if (tokens.empty()) continue;
 
             auto [out_tokens, ms] = generate(
@@ -564,8 +497,7 @@ int cmd_chat(int argc, char** argv) {
 
             std::vector<int> all = tokens;
             all.insert(all.end(), out_tokens.begin(), out_tokens.end());
-            std::string text = decode_with_fallback(loaded.tokenizer, all,
-                                                    helper_dir, model_dir);
+            std::string text = decode_with_fallback(loaded.tokenizer, all, model_dir);
 
             Logger::info("AI:  {}", text);
             double itok = (double)(tokens.size() + out_tokens.size());
@@ -756,7 +688,6 @@ int cmd_legacy(const std::string& prompt, int max_tokens, float temperature) {
     std::string model_dir = std::getenv("TERLLAMA_MODEL_DIR")
         ? std::string(std::getenv("TERLLAMA_MODEL_DIR"))
         : ".";
-    std::string helper_dir = get_helper_dir();
 
     srand(42);
     CPUArch arch = detect_cpu_arch();
@@ -783,7 +714,12 @@ int cmd_legacy(const std::string& prompt, int max_tokens, float temperature) {
     auto rope = build_rope_cache(cfg.max_position_embeddings, cfg.head_dim, cfg.rope_theta);
 
     Logger::info("Tokenizing prompt...");
-    auto prompt_tokens = tokenize_with_helper(prompt, helper_dir, model_dir);
+    auto prompt_tokens = tokenize_with_helper(prompt, model_dir);
+
+    if (prompt_tokens.empty()) {
+        Logger::error("Tokenization failed — aborting before generation");
+        return 1;
+    }
 
     Logger::info("=== Generating ===");
     auto [output_tokens, total_ms] = generate(
@@ -792,8 +728,7 @@ int cmd_legacy(const std::string& prompt, int max_tokens, float temperature) {
 
     std::vector<int> all_tokens = prompt_tokens;
     all_tokens.insert(all_tokens.end(), output_tokens.begin(), output_tokens.end());
-    std::string decoded = decode_with_fallback(loaded.tokenizer, all_tokens,
-                                               helper_dir, model_dir);
+    std::string decoded = decode_with_fallback(loaded.tokenizer, all_tokens, model_dir);
 
     Logger::info(decoded.c_str());
 
@@ -843,7 +778,12 @@ int cmd_bench() {
 
     // Fixed benchmark prompt
     std::string bench_prompt = "The future of AI is";
-    auto prompt_tokens = tokenize_with_helper(bench_prompt, get_helper_dir(), model_dir);
+    auto prompt_tokens = tokenize_with_helper(bench_prompt, model_dir);
+
+    if (prompt_tokens.empty()) {
+        Logger::error("Tokenization failed — cannot benchmark without a tokenizer");
+        return 1;
+    }
 
     // Warmup run
     Logger::info("Warmup...");
@@ -963,7 +903,8 @@ static std::string make_bench_text(size_t target_bytes) {
     return result;
 }
 
-// Benchmark tokenizer throughput: GigaToken (Rust) vs Python subprocess.
+// Benchmark GigaToken tokenizer throughput. (Legacy Python-subprocess leg
+// removed: the engine no longer requires Python.)
 int cmd_bench_tokenizer(int argc, char** argv) {
     std::string model_dir;
     std::string bench_text;
@@ -1027,19 +968,16 @@ int cmd_bench_tokenizer(int argc, char** argv) {
     Logger::info("");
     Logger::info("── GigaToken (Rust) ──");
 
-    // Hoisted stats for comparison section
     double gt_avg_sec = 0;
     double gt_mb_per_sec = 0;
     double gt_mtok_per_sec = 0;
     std::vector<int> gt_token_counts;
-    bool gt_has_data = false;
+    bool gt_ready = false;
 
     GigaTokenWrapper gt;
-    auto t0 = std::chrono::high_resolution_clock::now();
     bool gt_loaded = gt.load(".:./bin");
     if (!gt_loaded) {
         Logger::info(("  Library load: FAILED (" + gt.error() + ")").c_str());
-        Logger::info("  (Use Python fallback only)");
     } else {
         bool tok_loaded = gt.load_tokenizer(model_dir);
         if (!tok_loaded) {
@@ -1048,7 +986,6 @@ int cmd_bench_tokenizer(int argc, char** argv) {
             char buf[128];
             snprintf(buf, sizeof(buf), "  Tokenizer:  loaded (vocab_size=%d)", gt.vocab_size());
             Logger::info(buf);
-            auto t1 = std::chrono::high_resolution_clock::now();
 
             // Warmup
             auto warmup = gt.encode("Warmup sentence for cache effects.");
@@ -1072,7 +1009,7 @@ int cmd_bench_tokenizer(int argc, char** argv) {
             double avg_tokens = (double)total_tokens / NUM_RUNS;
             gt_mb_per_sec = (double)text_bytes / gt_avg_sec / (1024.0 * 1024.0);
             gt_mtok_per_sec = avg_tokens / gt_avg_sec / 1e6;
-            gt_has_data = true;
+            gt_ready = true;
 
             {
                 char buf[256];
@@ -1107,131 +1044,24 @@ int cmd_bench_tokenizer(int argc, char** argv) {
         }
     }
 
-    // ── 2. Python subprocess ────────────────────────────────
+    // ── 2. Legacy Python subprocess ────────────────────────
+    // Removed: the engine no longer requires Python and never spawns python3.
+    // GigaToken (above) is the only tokenizer path, so there is nothing to
+    // benchmark against. scripts/tokenize_helper.py is kept only as a dev tool.
     Logger::info("");
     Logger::info("── Legacy (Python subprocess) ──");
-
-    // Write text to temp file (same paths as tokenize_helper.py)
-    std::string prompt_file = "/tmp/ternary_prompt.txt";
-    std::string token_file = "/tmp/ternary_tokens.txt";
-    {
-        std::ofstream pf(prompt_file);
-        pf << bench_text;
+    Logger::info("  Removed — engine no longer spawns python3. GigaToken is the only encode path.");
+    if (!gt_ready) {
+        Logger::info("  GigaToken unavailable — nothing to benchmark.");
+        Logger::info("  Install the bundled libgigatoken_rs.so or provide tokenizer.json");
+        Logger::info("  in the model directory to benchmark tokenization.");
+    } else {
+        char buf[160];
+        snprintf(buf, sizeof(buf), "  GigaToken:      %.1f MB/s  (%.1f Mtok/s)",
+                 gt_mb_per_sec, gt_mtok_per_sec);
+        Logger::info(buf);
     }
-    std::string helper_dir = get_helper_dir();
-
-    // Warmup
-    {
-        std::ofstream pf(prompt_file);
-        pf << "Warmup sentence";
-    }
-    run_python_script(helper_dir + "/tokenize_helper.py");
-
-    // Write real text
-    {
-        std::ofstream pf(prompt_file);
-        pf << bench_text;
-    }
-
-    const int NUM_PY_RUNS = 3;  // Python is slow, fewer runs
-    double py_total_sec = 0;
-    size_t py_total_tokens = 0;
-    std::vector<int> py_token_counts;
-    for (int r = 0; r < NUM_PY_RUNS; r++) {
-        auto start = std::chrono::high_resolution_clock::now();
-        int ret = run_python_script(helper_dir + "/tokenize_helper.py");
-        auto end = std::chrono::high_resolution_clock::now();
-        if (ret != 0) {
-            char buf[128];
-            snprintf(buf, sizeof(buf), "  Python tokenization failed (exit=%d)", ret);
-            Logger::error(buf);
-            break;
-        }
-        double sec = std::chrono::duration<double>(end - start).count();
-        py_total_sec += sec;
-
-        std::vector<int> tokens;
-        std::ifstream tf(token_file);
-        int tid;
-        while (tf >> tid) tokens.push_back(tid);
-        py_total_tokens += tokens.size();
-        py_token_counts.push_back((int)tokens.size());
-    }
-
-    if (!py_token_counts.empty()) {
-        double py_avg_sec = py_total_sec / NUM_PY_RUNS;
-        double py_avg_tokens = (double)py_total_tokens / NUM_PY_RUNS;
-        double py_mb_per_sec = (double)text_bytes / py_avg_sec / (1024.0 * 1024.0);
-        double py_mtok_per_sec = py_avg_tokens / py_avg_sec / 1e6;
-
-        {
-            char buf[256];
-            snprintf(buf, sizeof(buf), "  Runs:       %d (avg of %d)", NUM_PY_RUNS, NUM_PY_RUNS);
-            Logger::info(buf);
-        }
-        {
-            char buf[128];
-            snprintf(buf, sizeof(buf), "  Time:       %.4fs avg", py_avg_sec);
-            Logger::info(buf);
-        }
-        {
-            char buf[128];
-            snprintf(buf, sizeof(buf), "  Throughput: %.2f MB/s (%.4f GB/s)",
-                     py_mb_per_sec, py_mb_per_sec / 1024.0);
-            Logger::info(buf);
-        }
-        {
-            char buf[128];
-            snprintf(buf, sizeof(buf), "  Tokens:     %.0f avg (%.2f Mtok/s)",
-                     py_avg_tokens, py_mtok_per_sec);
-            Logger::info(buf);
-        }
-
-        // ── Comparison ──────────────────────────────────────
-        Logger::info("");
-        Logger::info("═══════════════════════════════════════════");
-        Logger::info("   Comparison");
-        Logger::info("");
-
-        if (gt_has_data && gt_token_counts.size() > 0) {
-            double speedup = py_avg_sec / gt_avg_sec;
-            {
-                char buf[128];
-                snprintf(buf, sizeof(buf), "   Speedup:        %.1fx", speedup);
-                Logger::info(buf);
-            }
-
-            // Token count validation
-            int gt_n = gt_token_counts[0];
-            int py_n = py_token_counts[0];
-            if (gt_n == py_n) {
-                char buf[128];
-                snprintf(buf, sizeof(buf), "   Token match:    Both = %d", gt_n);
-                Logger::info(buf);
-            } else {
-                double pct = 100.0 * std::abs(gt_n - py_n) / std::max(gt_n, py_n);
-                char buf[128];
-                snprintf(buf, sizeof(buf), "   Token match:    Giga=%d vs Py=%d  (diff %.2f%%)",
-                         gt_n, py_n, pct);
-                Logger::info(buf);
-            }
-        }
-
-        Logger::info("");
-        if (gt_has_data) {
-            char buf[128];
-            snprintf(buf, sizeof(buf), "   GigaToken:      %.1f MB/s  (%.1f Mtok/s)",
-                     gt_mb_per_sec, gt_mtok_per_sec);
-            Logger::info(buf);
-        }
-        {
-            char buf[128];
-            snprintf(buf, sizeof(buf), "   Legacy (Py):    %.1f MB/s  (%.1f Mtok/s)",
-                     py_mb_per_sec, py_mtok_per_sec);
-            Logger::info(buf);
-        }
-        Logger::info("═══════════════════════════════════════════");
-    }
+    Logger::info("═══════════════════════════════════════════");
 
     return 0;
 }

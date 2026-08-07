@@ -71,141 +71,28 @@ fn event(config: &ConvertConfig, pct: u64, line: String, done: bool, error: Opti
     }
 }
 
-/// Find Python 3 binary on the system
-pub fn find_python() -> Option<PathBuf> {
-    let candidates = ["python3", "python"];
-    for cmd in &candidates {
-        let out = std::process::Command::new("which")
-            .arg(cmd)
-            .output()
-            .ok()?;
-        if out.status.success() {
-            let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !path.is_empty() {
-                return Some(PathBuf::from(path));
-            }
-        }
-    }
-
-    // Also check common paths directly
-    let common = [
-        "/usr/bin/python3",
-        "/usr/local/bin/python3",
-        "/usr/bin/python",
-        "/usr/local/bin/python",
-    ];
-    for p in &common {
-        if std::path::Path::new(p).exists() {
-            return Some(PathBuf::from(p));
-        }
-    }
-    None
-}
-
-/// Check Python version meets minimum
-pub fn check_python_version(python: &PathBuf) -> Result<(u32, u32), String> {
-    let out = std::process::Command::new(python)
-        .arg("--version")
-        .output()
-        .map_err(|e| format!("Failed to run Python: {}", e))?;
-
-    let ver_str = String::from_utf8_lossy(&out.stdout);
-    // Parse "Python 3.X.Y"
-    let parts: Vec<&str> = ver_str.split_whitespace().collect();
-    if parts.len() < 2 {
-        return Err(format!("Could not parse Python version: {}", ver_str));
-    }
-    let nums: Vec<&str> = parts[1].split('.').collect();
-    if nums.len() < 2 {
-        return Err(format!("Could not parse version number: {}", parts[1]));
-    }
-    let major: u32 = nums[0].parse().map_err(|_| "Invalid major version")?;
-    let minor: u32 = nums[1].parse().map_err(|_| "Invalid minor version")?;
-    Ok((major, minor))
-}
-
-/// Get the directory where conversion scripts are bundled
-pub fn get_scripts_dir(app_handle: &tauri::AppHandle) -> Result<PathBuf, String> {
-    // In production, scripts are bundled in the AppImage/deb/rpm resources.
-    // Tauri v2 places bundled resources under <resource_dir>/resources/scripts
-    // (verified in .deb layout: /usr/lib/Terllama/resources/scripts/*.py).
-    let resource_dir = app_handle
-        .path()
-        .resource_dir()
-        .map_err(|e| format!("Failed to get resource dir: {}", e))?;
-
-    // Try the Tauri v2 bundle layout first, then the older direct layout.
-    let bundled_paths = [
-        resource_dir.join("resources").join("scripts"),
-        resource_dir.join("scripts"),
-    ];
-    for scripts_dir in bundled_paths {
-        if scripts_dir.exists() {
-            return Ok(scripts_dir);
-        }
-    }
-
-    // Fallback: try the repo scripts directory (development)
-    let dev_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("resources")
-        .join("scripts");
-    if dev_path.exists() {
-        return Ok(dev_path);
-    }
-
-    Err("Conversion scripts not found. Reinstall the application.".to_string())
-}
-
-/// Run the conversion as a subprocess, streaming output via Tauri events
+/// Run the conversion via the engine's native `convert` subcommand.
+///
+/// No Python involved: the engine binary downloads the HF repo and converts
+/// it to ALS in-process, writing model_decomposed.bin + model_extra.bin and
+/// printing `[PROGRESS] NN%` lines on stdout.
 pub async fn run_conversion(
     app_handle: tauri::AppHandle,
     cancel_flag: Arc<AtomicBool>,
     config: ConvertConfig,
 ) -> Result<(), String> {
-    let python = find_python().ok_or_else(|| {
-        "Python 3 not found. Install Python 3.10+ to use model conversion.".to_string()
-    })?;
-
-    let (major, minor) = check_python_version(&python)?;
-    if major < 3 || (major == 3 && minor < 10) {
-        return Err(format!(
-            "Python 3.10+ required, found {}.{}",
-            major, minor
-        ));
-    }
-
-    let scripts_dir = get_scripts_dir(&app_handle)?;
-    let script_path = scripts_dir.join("export_ternary_model_bitnet.py");
-
-    if !script_path.exists() {
-        return Err(format!(
-            "Conversion script not found at {}",
-            script_path.display()
-        ));
-    }
+    // Resolve the bundled engine binary (resources/bin/terllama).
+    let resource_dir = app_handle.path().resource_dir().ok();
+    let binary = crate::server::find_terllama_binary(resource_dir.as_deref())?;
 
     // Ensure output directory exists
     let out_dir = PathBuf::from(&config.out_dir);
     std::fs::create_dir_all(&out_dir)
         .map_err(|e| format!("Failed to create output directory: {}", e))?;
 
-    // Check for required Python packages first
-    let check_result = std::process::Command::new(&python)
-        .args(["-c", "import torch, transformers; print('ok')"])
-        .output()
-        .map_err(|e| format!("Failed to check Python packages: {}", e))?;
-
-    if !check_result.status.success() {
-        let stderr = String::from_utf8_lossy(&check_result.stderr);
-        return Err(format!(
-            "Missing required Python packages (torch, transformers).\nInstall: pip install torch transformers\nError: {}",
-            stderr.lines().next().unwrap_or("unknown")
-        ));
-    }
-
-    // Build command
-    let mut cmd = tokio::process::Command::new(&python);
-    cmd.arg(&script_path)
+    // Build command: terllama convert --model <repo> --format <fmt> --outdir <dir> [--terms N]
+    let mut cmd = tokio::process::Command::new(&binary);
+    cmd.arg("convert")
         .arg("--model")
         .arg(&config.model)
         .arg("--format")
