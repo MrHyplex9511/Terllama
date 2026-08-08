@@ -110,7 +110,8 @@ jobs:
               cp "build/$t" "$BUNDLE/bin/"
             fi
           done
-          cp build/libgigatoken_rs.so "$BUNDLE/bin/"
+          cp build/libgigatoken_rs.so "$BUNDLE/bin/" 2>/dev/null || true
+          cp build/libgigatoken_rs.dylib "$BUNDLE/bin/" 2>/dev/null || true
           cp web/index.html web/network.js web/anime.min.js "$BUNDLE/share/terllama/web/"
           cp install.sh uninstall.sh "$BUNDLE/"
           tar -czf "terllama-${VER}-${{ matrix.target }}.tar.gz" "$BUNDLE"
@@ -121,17 +122,6 @@ jobs:
         with:
           name: terllama-${{ matrix.target }}
           path: '*.tar.gz'
-
-      - name: Upload web assets & installers
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: terllama-web-${{ matrix.target }}
-          path: |
-            install.sh
-            uninstall.sh
-            web/index.html
-            web/network.js
-            web/anime.min.js
 
   publish:
     name: Publish Release
@@ -148,8 +138,20 @@ jobs:
         with:
           path: artifacts
 
+      # Tarballs come from the matrix; installers/web assets live in the
+      # repo checkout so we attach a single canonical copy (avoids the
+      # duplicate-asset-name collisions softprops hits with 4x install.sh).
+      - name: Stage release files
+        shell: bash
+        run: |
+          mkdir -p release
+          cp artifacts/terllama-*/terllama-*.tar.gz release/ || true
+          cp install.sh uninstall.sh release/
+          ls -la release/
+
       - name: Create Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
-          files: artifacts/**/*
+          files: release/*
+          update_release: true
           generate_release_notes: true
