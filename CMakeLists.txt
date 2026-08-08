@@ -64,11 +64,21 @@ set(GIGATOKEN_DIR     ${THIRD_PARTY_DIR}/gigatoken)
 set(GIGATOKEN_LIB     ${GIGATOKEN_DIR}/target/release/libgigatoken_rs.so)
 set(GIGATOKEN_BUILD   ${CMAKE_BINARY_DIR}/libgigatoken_rs.so)
 
-if(EXISTS ${GIGATOKEN_LIB})
+# Preferred tokenizer library: the Python-free C ABI crate (gigatoken-capi)
+# exports the same gt_* ABI with no pyo3/libpython dependency and carries the
+# byte-gap + digit-pretokenizer patches. Fall back to the legacy pyo3 build.
+set(GIGATOKEN_CAPI_LIB ${THIRD_PARTY_DIR}/gigatoken-capi/target/release/libgigatoken_rs.so)
+if(EXISTS ${GIGATOKEN_CAPI_LIB})
+    set(GIGATOKEN_SO ${GIGATOKEN_CAPI_LIB})
+elseif(EXISTS ${GIGATOKEN_LIB})
+    set(GIGATOKEN_SO ${GIGATOKEN_LIB})
+endif()
+
+if(EXISTS ${GIGATOKEN_SO})
     set(GIGATOKEN_FOUND YES)
 else()
     set(GIGATOKEN_FOUND NO)
-    message(STATUS "GigaToken .so: NOT FOUND — run 'cargo build --release -p gigatoken' in third_party/gigatoken/")
+    message(STATUS "GigaToken .so: NOT FOUND — run 'cargo build --release -p gigatoken' in third_party/gigatoken/ (or gigatoken-capi/)")
     message(STATUS "  Python tokenizer fallback will be used at runtime.")
 endif()
 
@@ -173,10 +183,10 @@ if(TERLLAMA_EXE_LINK_FLAGS)
 endif()
 
 # Post-build: copy GigaToken .so next to the binary so dlopen finds it
-if(EXISTS ${GIGATOKEN_LIB})
+if(EXISTS ${GIGATOKEN_SO})
     add_custom_command(TARGET terllama POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            ${GIGATOKEN_LIB} ${CMAKE_BINARY_DIR}/libgigatoken_rs.so
+            ${GIGATOKEN_SO} ${CMAKE_BINARY_DIR}/libgigatoken_rs.so
         COMMENT "Copying libgigatoken_rs.so → ${CMAKE_BINARY_DIR}/"
     )
 endif()
@@ -278,17 +288,11 @@ if(BUILD_DISTRIBUTED)
     terllama_link_dist(terllama-cluster)
 
     # Copy GigaToken .so next to terllama-cluster (coordinator dlopens it).
-    # Prefer the Python-free C ABI crate (gigatoken-capi); fall back to the
-    # legacy pyo3 build. Same filename either way (gt_* C ABI).
-    if(EXISTS ${THIRD_PARTY_DIR}/gigatoken-capi/target/release/libgigatoken_rs.so)
-        set(GIGATOKEN_DIST_SO ${THIRD_PARTY_DIR}/gigatoken-capi/target/release/libgigatoken_rs.so)
-    elseif(EXISTS ${GIGATOKEN_LIB})
-        set(GIGATOKEN_DIST_SO ${GIGATOKEN_LIB})
-    endif()
-    if(GIGATOKEN_DIST_SO)
+    # Same preferred .so as the main binary (GIGATOKEN_SO).
+    if(GIGATOKEN_SO)
         add_custom_command(TARGET terllama-cluster POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                ${GIGATOKEN_DIST_SO} ${CMAKE_BINARY_DIR}/libgigatoken_rs.so
+                ${GIGATOKEN_SO} ${CMAKE_BINARY_DIR}/libgigatoken_rs.so
             COMMENT "Copying libgigatoken_rs.so → ${CMAKE_BINARY_DIR}/"
         )
     endif()
@@ -310,8 +314,8 @@ endif()
 install(DIRECTORY web/ DESTINATION share/terllama/web)
 
 # Install GigaToken shared library alongside the binary
-if(EXISTS ${GIGATOKEN_LIB})
-    install(FILES ${GIGATOKEN_LIB} DESTINATION bin
+if(EXISTS ${GIGATOKEN_SO})
+    install(FILES ${GIGATOKEN_SO} DESTINATION bin
         PERMISSIONS OWNER_READ OWNER_WRITE GROUP_READ WORLD_READ)
     message(STATUS "GigaToken .so: will install to bin/")
 endif()
