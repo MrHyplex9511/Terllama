@@ -3,8 +3,17 @@
 
   let { message }: { message: Message } = $props();
 
+  function escapeHtml(s: string): string {
+    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+
   function renderMarkdown(content: string): string {
-    let html = content.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+    // Escape ALL HTML first — model output is untrusted. Only the whitelisted
+    // markdown transforms below are applied afterwards, so raw HTML never
+    // reaches the DOM as markup (prevents stored XSS / prompt-injection chains).
+    let html = escapeHtml(content);
+    html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
     html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
     html = html.replace(/```(\w*)\n([\s\S]*?)```/g, '<pre><code class="lang-$1">$2</code></pre>');
     html = html.replace(/\n/g, '<br/>');

@@ -26,6 +26,30 @@ static std::string slugify(const std::string& repo) {
     return s;
 }
 
+// A repo id must be "org/name": no empty components, no ".." that could
+// traverse, no path separators other than the single '/'.
+static bool hf_repo_is_valid(const std::string& repo) {
+    if (repo.empty()) return false;
+    size_t pos = 0;
+    while (pos <= repo.size()) {
+        size_t next = repo.find('/', pos);
+        if (next == std::string::npos) next = repo.size();
+        const std::string comp = repo.substr(pos, next - pos);
+        if (comp.empty() || comp == "." || comp == "..") return false;
+        if (comp.find('\\') != std::string::npos) return false;
+        if (next == repo.size()) break;
+        pos = next + 1;
+    }
+    return true;
+}
+
+// The slug becomes a directory name under ~/.terllama/models/; it must never
+// contain ".." (path escape) and must not be empty.
+static bool slug_is_safe(const std::string& s) {
+    return !s.empty() && s != "." && s != ".." &&
+           s.find("..") == std::string::npos;
+}
+
 static void print_usage(const char* prog) {
     Logger::error("Usage: {} pull <hf_repo> [--format als|gguf]", prog);
     Logger::error("");
@@ -79,7 +103,19 @@ int downloader_main(int argc, char** argv) {
         return 1;
     }
 
+    if (!hf_repo_is_valid(hf_repo)) {
+        Logger::error("Error: invalid HuggingFace repo '{}' (must be "
+                      "'org/name' with no '..' and no path separators)",
+                      hf_repo);
+        return 1;
+    }
+
     std::string model_slug = slugify(hf_repo);
+    if (!slug_is_safe(model_slug)) {
+        Logger::error("Error: repo '{}' maps to unsafe path '{}'", hf_repo,
+                      model_slug);
+        return 1;
+    }
     std::string out_dir = outdir_override;
     if (out_dir.empty()) {
         out_dir = std::string(getenv("HOME") ? getenv("HOME") : "/root")

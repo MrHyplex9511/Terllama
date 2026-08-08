@@ -10,8 +10,11 @@
 # ═══════════════════════════════════════════════════════════════════════════
 
 CXX         := g++
-CXXFLAGS    := -std=c++17 -O3 -fopenmp -flto -Wall -Wextra -Wno-unknown-pragmas -Wno-address
-LDFLAGS     := -lm -fopenmp -lpthread -ldl -flto
+# Hardening: stack protector, FORTIFY (needs -O1+; build uses -O3) and PIE at
+# compile time. -pie/-z relro,now are applied at link (LDFLAGS) — both link
+# rules below are executables; there are no shared-object link rules here.
+CXXFLAGS    := -std=c++17 -O3 -fopenmp -flto -Wall -Wextra -Wno-unknown-pragmas -Wno-address -fstack-protector-strong -D_FORTIFY_SOURCE=2 -fPIE
+LDFLAGS     := -lm -fopenmp -lpthread -ldl -flto -pie -Wl,-z,relro,-z,now
 # libcurl dev symlink may be missing system-wide; allow a staged dev tree for
 # headers, and link the runtime shared lib directly (-l:libcurl.so.4). Static
 # libcurl drags in GSSAPI/Kerberos, so never prefer it.

@@ -4,6 +4,9 @@ param(
     [string]$InstallDir = "$env:ProgramFiles\Terllama"
 )
 
+# Fail loudly on any error instead of printing false success.
+$ErrorActionPreference = "Stop"
+
 $Repo = "MrHyplex9511/Terllama"
 $Arch = if ([Environment]::Is64BitOperatingSystem) { "amd64" } else { Write-Error "32-bit not supported"; exit 1 }
 
@@ -14,11 +17,25 @@ if ($Version -eq "latest") {
 }
 
 Write-Host "📦 Downloading Terllama (windows-$Arch)..." -ForegroundColor Cyan
-$OutPath = "$env:TEMP\terllama.exe"
-Invoke-WebRequest -Uri $Url -OutFile $OutPath
+# Unique temp name: avoids clobbering concurrent installs / leftover files.
+$OutPath = Join-Path $env:TEMP ("terllama-" + [guid]::NewGuid().ToString() + ".exe")
 
-New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-Move-Item -Path $OutPath -Destination "$InstallDir\terllama.exe" -Force
+try {
+    Invoke-WebRequest -Uri $Url -OutFile $OutPath
+
+    New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+    Move-Item -Path $OutPath -Destination "$InstallDir\terllama.exe" -Force
+
+    # Move-Item can fail silently for non-elevated users writing into
+    # protected dirs (e.g. Program Files); verify before reporting success.
+    if (-not (Test-Path -LiteralPath "$InstallDir\terllama.exe")) {
+        Write-Error "Terllama install failed: destination file missing after move. Check write access to $InstallDir (re-run as Administrator)."
+        exit 1
+    }
+} catch {
+    Write-Error "Terllama install failed: $($_.Exception.Message)"
+    exit 1
+}
 
 # Add to PATH if not already
 $UserPath = [Environment]::GetEnvironmentVariable("Path", "User")

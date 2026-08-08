@@ -23,6 +23,9 @@
 #include <mutex>
 #include <atomic>
 #include <chrono>
+#include <cerrno>
+#include <fcntl.h>
+#include <filesystem>
 #include <sys/stat.h>
 #include <dirent.h>
 #include <unistd.h>
@@ -57,6 +60,105 @@ static std::string slugify(const std::string& repo) {
         if (c == '/') c = '-';
     }
     return s;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PATH SAFETY — model ids / HF repos must never escape models_dir()
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Reject model ids that could traverse out of the models directory:
+// empty, "..", or containing '/' or '\'. Returns "" on invalid input.
+static std::string sanitize_model_id(const std::string& id) {
+    if (id.empty()) return "";
+    if (id.find("..") != std::string::npos) return "";
+    if (id.find('/') != std::string::npos) return "";
+    if (id.find('\\') != std::string::npos) return "";
+    return id;
+}
+
+// Build "<models_dir>/<model_id>" and verify the canonicalized path stays
+// inside models_dir(). Returns "" when the id is invalid or the resolved
+// path escapes the models directory (defense in depth behind sanitize).
+static std::string model_path_for_id(const std::string& model_id) {
+    std::string safe = sanitize_model_id(model_id);
+    if (safe.empty()) return "";
+    std::string base = models_dir();
+    std::string joined = base + "/" + safe;
+    std::error_code ec;
+    std::filesystem::path joined_canon = std::filesystem::weakly_canonical(joined, ec);
+    std::filesystem::path base_canon = std::filesystem::weakly_canonical(base, ec);
+    if (!ec) {
+        std::string j = joined_canon.string();
+        std::string b = base_canon.string();
+        if (j != b && j.rfind(b + "/", 0) != 0) {
+            Logger::warn("Model id '{}' resolves outside the models directory; ignoring", model_id);
+            return "";
+        }
+    }
+    return joined;
+}
+
+// Validate a HuggingFace repo id (owner/name). Rejects path traversal and
+// anything other than [A-Za-z0-9_.-] with a single '/' separating owner
+// and repo. Returns false when the repo is not a safe plain identifier.
+static bool is_valid_hf_repo(const std::string& repo) {
+    if (repo.empty()) return false;
+    if (repo.find("..") != std::string::npos) return false;
+    size_t slash = repo.find('/');
+    if (slash == std::string::npos) return false;                     // require owner/repo
+    if (repo.find('/', slash + 1) != std::string::npos) return false; // exactly one '/'
+    for (size_t i = 0; i < repo.size(); i++) {
+        if (i == slash) continue;
+        char c = repo[i];
+        bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+               || (c >= '0' && c <= '9') || c == '_' || c == '.' || c == '-';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// STATE FILES — ~/.terllama models.json / benchmarks.json
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Serialize read-modify-write of the registry file across concurrent
+// pull/rm invocations.
+static std::mutex g_registry_mutex;
+
+// Write `content` to `path` atomically with mode 0600: write to a temp file
+// in the same directory, fsync, then rename() over the target. This avoids a
+// partially-written state file after a crash and keeps model metadata private
+// to the user (default umask would otherwise make it world-readable).
+// Returns false (with a logged warning) on any failure.
+static bool write_state_file(const std::string& path, const std::string& content) {
+    std::string tmp = path + ".tmp." + std::to_string((long)getpid());
+    int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) {
+        Logger::warn("Cannot open state file {} for writing: {}", tmp, std::strerror(errno));
+        return false;
+    }
+    size_t written = 0;
+    while (written < content.size()) {
+        ssize_t n = ::write(fd, content.data() + written, content.size() - written);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            Logger::warn("Failed writing {}: {}", tmp, std::strerror(errno));
+            ::close(fd);
+            ::unlink(tmp.c_str());
+            return false;
+        }
+        written += (size_t)n;
+    }
+    if (::fsync(fd) != 0) {
+        Logger::warn("fsync failed for {}: {}", tmp, std::strerror(errno));
+    }
+    ::close(fd);
+    if (::rename(tmp.c_str(), path.c_str()) != 0) {
+        Logger::warn("rename {} -> {} failed: {}", tmp, path, std::strerror(errno));
+        ::unlink(tmp.c_str());
+        return false;
+    }
+    return true;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -98,18 +200,21 @@ static std::once_flag   g_cli_gigatoken_flag;
 static void ensure_gigatoken(const std::string& model_dir) {
     std::call_once(g_cli_gigatoken_flag, [&]() {
         if (model_dir.empty()) return;
-        // Search for .so next to binary, then CWD, then third_party
+        // Resolve the .so relative to the executable ONLY — never from CWD
+        // or ./bin (dlopen hijack prevention, issue #6).
         char exe_buf[4096];
         ssize_t exe_len = readlink("/proc/self/exe", exe_buf, sizeof(exe_buf) - 1);
-        std::string exe_dir;
+        std::string so_paths;
         if (exe_len > 0) {
             exe_buf[exe_len] = '\0';
-            exe_dir = std::string(exe_buf);
+            std::string exe_dir(exe_buf);
             auto p = exe_dir.rfind('/');
-            if (p != std::string::npos) exe_dir = exe_dir.substr(0, p);
+            if (p != std::string::npos) so_paths = exe_dir.substr(0, p);
         }
-        std::string so_paths = ".:./bin";
-        if (!exe_dir.empty()) so_paths = exe_dir + ":" + so_paths;
+        if (so_paths.empty()) {
+            Logger::info("GigaToken: cannot resolve exe dir — .so search disabled");
+            return;
+        }
         g_cli_gigatoken_ok = g_cli_gigatoken.load(so_paths);
         if (g_cli_gigatoken_ok) {
             g_cli_gigatoken_ok = g_cli_gigatoken.load_tokenizer(model_dir);
@@ -247,9 +352,17 @@ int cmd_list() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 int cmd_show(const std::string& model_id) {
-    std::string model_dir = std::getenv("TERLLAMA_MODEL_DIR")
-        ? std::string(std::getenv("TERLLAMA_MODEL_DIR"))
-        : models_dir() + "/" + model_id;
+    std::string model_dir;
+    const char* env_dir = std::getenv("TERLLAMA_MODEL_DIR");
+    if (env_dir) {
+        model_dir = std::string(env_dir);
+    } else {
+        model_dir = model_path_for_id(model_id);
+        if (model_dir.empty()) {
+            Logger::error("Invalid model id: {}", model_id);
+            return 1;
+        }
+    }
 
     std::string extra_path = model_dir + "/model_extra.bin";
     std::string als_path  = model_dir + "/model_decomposed.bin";
@@ -295,7 +408,11 @@ int cmd_show(const std::string& model_id) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 int cmd_rm(const std::string& model_id) {
-    std::string model_dir = models_dir() + "/" + model_id;
+    std::string model_dir = model_path_for_id(model_id);
+    if (model_dir.empty()) {
+        Logger::error("Invalid model id: {}", model_id);
+        return 1;
+    }
     struct stat st;
 
     if (stat(model_dir.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) {
@@ -314,42 +431,44 @@ int cmd_rm(const std::string& model_id) {
     rmdir(model_dir.c_str());
 
     std::string jpath = models_json_path();
+    // Serialize concurrent pull/rm, then rewrite the registry atomically
+    // (temp + fsync + rename, mode 0600) — never leave a partial file.
+    std::lock_guard<std::mutex> lock(g_registry_mutex);
     std::ifstream inf(jpath);
     if (inf) {
         std::string content((std::istreambuf_iterator<char>(inf)),
                              std::istreambuf_iterator<char>());
         inf.close();
 
-        std::ofstream of(jpath);
-        if (of) {
-            std::string result;
-            size_t pos = 0;
-            bool first = true;
-            result = "{\n  \"models\": [\n";
-            while (true) {
-                auto start = content.find("{\"id\"", pos);
-                if (start == std::string::npos) break;
-                auto end = content.find("}", start);
-                if (end == std::string::npos) break;
-                std::string block = content.substr(start, end - start + 1);
+        std::string result;
+        size_t pos = 0;
+        bool first = true;
+        result = "{\n  \"models\": [\n";
+        while (true) {
+            auto start = content.find("{\"id\"", pos);
+            if (start == std::string::npos) break;
+            auto end = content.find("}", start);
+            if (end == std::string::npos) break;
+            std::string block = content.substr(start, end - start + 1);
 
-                auto p = block.find("\"id\":\"");
-                if (p != std::string::npos) {
-                    p += 6;
-                    auto q = block.find("\"", p);
-                    if (q != std::string::npos) {
-                        std::string existing_id = block.substr(p, q - p);
-                        if (existing_id != model_id) {
-                            if (!first) result += ",";
-                            first = false;
-                            result += block;
-                        }
+            auto p = block.find("\"id\":\"");
+            if (p != std::string::npos) {
+                p += 6;
+                auto q = block.find("\"", p);
+                if (q != std::string::npos) {
+                    std::string existing_id = block.substr(p, q - p);
+                    if (existing_id != model_id) {
+                        if (!first) result += ",";
+                        first = false;
+                        result += block;
                     }
                 }
-                pos = end + 1;
             }
-            result += "\n  ]\n}\n";
-            of << result;
+            pos = end + 1;
+        }
+        result += "\n  ]\n}\n";
+        if (!write_state_file(jpath, result)) {
+            Logger::warn("Failed to update registry after removing '{}'", model_id);
         }
     }
 
@@ -364,9 +483,17 @@ int cmd_rm(const std::string& model_id) {
 static int cmd_chat_simple(const std::string& model_id,
                             const std::string& prompt_text,
                             int max_tokens, float temperature) {
-    std::string model_dir = std::getenv("TERLLAMA_MODEL_DIR")
-        ? std::string(std::getenv("TERLLAMA_MODEL_DIR"))
-        : models_dir() + "/" + model_id;
+    std::string model_dir;
+    const char* env_dir = std::getenv("TERLLAMA_MODEL_DIR");
+    if (env_dir) {
+        model_dir = std::string(env_dir);
+    } else {
+        model_dir = model_path_for_id(model_id);
+        if (model_dir.empty()) {
+            Logger::error("Invalid model id: {}", model_id);
+            return 1;
+        }
+    }
 
     srand(42);
     CPUArch arch = detect_cpu_arch();
@@ -470,9 +597,17 @@ int cmd_chat(int argc, char** argv) {
         Logger::info("Type your messages. Ctrl+C or empty line to exit.");
         Logger::info(std::string(50, '-').c_str());
 
-        std::string model_dir = std::getenv("TERLLAMA_MODEL_DIR")
-            ? std::string(std::getenv("TERLLAMA_MODEL_DIR"))
-            : models_dir() + "/" + model_id;
+        std::string model_dir;
+        const char* env_dir = std::getenv("TERLLAMA_MODEL_DIR");
+        if (env_dir) {
+            model_dir = std::string(env_dir);
+        } else {
+            model_dir = model_path_for_id(model_id);
+            if (model_dir.empty()) {
+                Logger::error("Invalid model id: {}", model_id);
+                return 1;
+            }
+        }
 
         srand(42);
         auto loaded = load_model_from(model_dir);
@@ -539,6 +674,14 @@ int cmd_pull(int argc, char** argv) {
                      auto_fmt.c_str(), (long long)size_mb);
     }
 
+    // Reject unsafe repo ids before they reach slugify/downloader: only
+    // [A-Za-z0-9_.-] with a single '/' separating owner/repo is allowed,
+    // so the slugified out dir can never escape models_dir().
+    if (!is_valid_hf_repo(hf_repo)) {
+        Logger::error("Invalid model repo: '{}'. Expected owner/name using only [A-Za-z0-9_.-] (e.g. owner/repo).", hf_repo);
+        return 1;
+    }
+
     // Build new argv for downloader_main: terllama download <hf_repo> [--fmt fmt]
     std::vector<const char*> args;
     args.push_back(argv[0]);
@@ -583,9 +726,11 @@ int cmd_pull(int argc, char** argv) {
 
     if (ret == 0) {
         Logger::info("Download complete!");
-        // Compute model directory size for registry
+        // Compute model directory size for registry. Re-verify the slugified
+        // out dir stays under models_dir() (input was validated above; this
+        // is defense in depth). Empty => invalid; opendir below just fails.
         int64_t total_size = 0;
-        std::string mdir = models_dir() + "/" + slugify(hf_repo);
+        std::string mdir = model_path_for_id(slugify(hf_repo));
         DIR* d = opendir(mdir.c_str());
         if (d) {
             struct dirent* e;
@@ -611,6 +756,9 @@ int cmd_pull(int argc, char** argv) {
 static void add_model_entry(const std::string& model_id,
                              const std::string& format,
                              int64_t size_bytes) {
+    // Serialize concurrent pull/rm; the whole read-modify-write must hold
+    // the lock so two writers cannot lose each other's entries.
+    std::lock_guard<std::mutex> lock(g_registry_mutex);
     std::string jpath = models_json_path();
     std::string timestamp;
     {
@@ -657,18 +805,17 @@ static void add_model_entry(const std::string& model_id,
         + ",\"downloaded\":\"" + timestamp + "\"}";
     entries.push_back(new_entry);
 
-    // Write back
-    std::ofstream of(jpath);
-    if (!of) {
-        Logger::warn("Cannot write {}", jpath);
+    // Write back atomically (temp + fsync + rename) with mode 0600.
+    std::string content = "{\n  \"models\": [\n";
+    for (size_t i = 0; i < entries.size(); i++) {
+        if (i > 0) content += ",\n";
+        content += "    " + entries[i];
+    }
+    content += "\n  ]\n}\n";
+    if (!write_state_file(jpath, content)) {
+        Logger::warn("Failed to save model entry for '{}'", model_id);
         return;
     }
-    of << "{\n  \"models\": [\n";
-    for (size_t i = 0; i < entries.size(); i++) {
-        if (i > 0) of << ",\n";
-        of << "    " << entries[i];
-    }
-    of << "\n  ]\n}\n";
     Logger::info("Model entry saved to {}", jpath);
 }
 
@@ -830,26 +977,27 @@ int cmd_bench() {
     Logger::info("  Avg   |            |          |  \033[32m{:.1f} tok/s\033[0m", avg_speed);
     Logger::info("");
 
-    // Save to benchmarks.json
+    // Save to benchmarks.json (atomic temp+fsync+rename, mode 0600 like
+    // the model registry — benchmark results are user state files too).
     std::string bench_path = home_dir() + "/.terllama/benchmarks.json";
-    std::ofstream bf(bench_path);
-    if (bf) {
-        bf << "{\n";
-        bf << "  \"model\": \"" << model_dir << "\",\n";
-        bf << "  \"arch\": \"" << cpu_arch_name(arch) << "\",\n";
-        bf << "  \"prompt_tokens\": " << prompt_tokens.size() << ",\n";
-        bf << "  \"avg_speed_tok_s\": " << avg_speed << ",\n";
-        bf << "  \"runs\": [\n";
-        for (int r = 0; r < NUM_RUNS; r++) {
-            if (r > 0) bf << ",\n";
-            bf << "    { \"run\": " << (r+1)
-               << ", \"ms\": " << results[r].ms
-               << ", \"tokens\": " << results[r].tokens << " }";
-        }
-        bf << "\n  ]\n}\n";
-        bf.close();
+    std::string bench_content = "{\n";
+    bench_content += "  \"model\": \"" + model_dir + "\",\n";
+    bench_content += std::string("  \"arch\": \"") + cpu_arch_name(arch) + "\",\n";
+    bench_content += "  \"prompt_tokens\": " + std::to_string(prompt_tokens.size()) + ",\n";
+    bench_content += "  \"avg_speed_tok_s\": " + std::to_string(avg_speed) + ",\n";
+    bench_content += "  \"runs\": [\n";
+    for (int r = 0; r < NUM_RUNS; r++) {
+        if (r > 0) bench_content += ",\n";
+        bench_content += "    { \"run\": " + std::to_string(r + 1)
+                       + ", \"ms\": " + std::to_string(results[r].ms)
+                       + ", \"tokens\": " + std::to_string(results[r].tokens) + " }";
     }
-    Logger::info("Results saved to {}", bench_path);
+    bench_content += "\n  ]\n}\n";
+    if (write_state_file(bench_path, bench_content)) {
+        Logger::info("Results saved to {}", bench_path);
+    } else {
+        Logger::warn("Could not save benchmark results to {}", bench_path);
+    }
 
     return 0;
 }
@@ -1073,16 +1221,20 @@ int cmd_bench_tokenizer(int argc, char** argv) {
 void print_usage(const char* prog) {
     // ─── First-run wizard: interactive download prompt ───
     if (!has_any_model()) {
-        fprintf(stderr, "\nNo models found! Download TinyLlama-1.1B (139 MB) to test? [Y/n] ");
+        fprintf(stderr, "\nNo models found. Download TinyLlama-1.1B (139 MB) to test? [y/N] ");
         fflush(stderr);
         std::string response;
         std::getline(std::cin, response);
-        if (response.empty() || response == "Y" || response == "y" || response == "yes") {
+        // Explicit consent only: bare Enter (empty) or anything other than
+        // y/yes must NOT trigger a download.
+        if (response == "Y" || response == "y" || response == "yes") {
             fprintf(stderr, "Downloading TinyLlama...\n");
             const char* pull_argv[] = {prog, "pull", "tinyllama"};
             int pull_argc = 3;
             cmd_pull(pull_argc, const_cast<char**>(pull_argv));
             fprintf(stderr, "\nDownload complete! Run '%s chat --model tinyllama' to start chatting.\n\n", prog);
+        } else {
+            fprintf(stderr, "Skipping download. You can install it later with '%s pull tinyllama'.\n", prog);
         }
         fprintf(stderr, "\n");
     }

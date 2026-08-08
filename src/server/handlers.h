@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 #include <mutex>
+#include <atomic>
 
 #include <httplib.h>
 
@@ -30,7 +31,7 @@ struct ServerModelState {
     RoPECache rope;
     std::string model_dir;
     CPUArch arch{CPUArch::UNKNOWN};
-    bool loaded{false};
+    std::atomic<bool> loaded{false};
     Tokenizer tokenizer;  // native tokenizer from GGUF metadata
     std::shared_ptr<GigaTokenWrapper> gigatoken;  // HF tokenizer.json decode (byte-level BPE etc.)
 };
@@ -72,6 +73,10 @@ void send_error(httplib::Response& res, const std::string& message,
 
 std::vector<int> tokenize_with_helper(const std::string& prompt);
 
+// Invalidates the cached model snapshot so the next request rebuilds it.
+// Called from server.cpp on model (re)load and on watchdog unload.
+void invalidate_model_snapshot();
+
 // ── Decode with fallback chain: native (llama) → GigaToken ────────────────
 // The native Tokenizer only decodes SentencePiece-style ("llama") vocab.
 // Byte-level BPE models (e.g. SmolLM2 via tokenizer.json) decode through
@@ -92,6 +97,8 @@ long now_ts();
 // ═══════════════════════════════════════════════════════════════════════════
 // ROUTE HANDLERS
 // ═══════════════════════════════════════════════════════════════════════════
+
+bool check_api_key(const httplib::Request& req, httplib::Response& res);
 
 void handle_models(const httplib::Request& req, httplib::Response& res);
 void handle_chat_completions(const httplib::Request& req,

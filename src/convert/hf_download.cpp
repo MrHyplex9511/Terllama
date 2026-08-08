@@ -73,6 +73,20 @@ size_t write_to_file(char* ptr, size_t size, size_t nmemb, void* userdata) {
     return fwrite(ptr, size, nmemb, f);
 }
 
+// Hosts the downloader is allowed to talk to: the hub itself (huggingface.co
+// + subdomains, incl. the cdn-lfs CDN) and the newer *.hf.co CDN. Anything
+// else — internal IPs, cloud metadata endpoints, arbitrary hosts — is refused.
+bool hf_host_is_allowed(const std::string& host) {
+    if (host == "huggingface.co" || host == "hf.co") return true;
+    const std::string s1 = ".huggingface.co";
+    const std::string s2 = ".hf.co";
+    if (host.size() > s1.size() &&
+        host.compare(host.size() - s1.size(), s1.size(), s1) == 0) return true;
+    if (host.size() > s2.size() &&
+        host.compare(host.size() - s2.size(), s2.size(), s2) == 0) return true;
+    return false;
+}
+
 } // namespace
 
 int hf_download_file(const std::string& repo_id,
@@ -93,7 +107,7 @@ int hf_download_file(const std::string& repo_id,
         return 1;
     }
 
-    const std::string url =
+    std::string url =
         "https://huggingface.co/" + hf_url_encode(repo_id) + "/resolve/main/" +
         hf_url_encode(filename);
 
@@ -106,12 +120,38 @@ int hf_download_file(const std::string& repo_id,
     }
 
     const std::string final_path = dest_dir + "/" + filename;
-    const std::string tmp_path =
-        dest_dir + "/." + filename + ".tmp." + std::to_string(static_cast<long>(getpid()));
 
-    FILE* f = fopen(tmp_path.c_str(), "wb");
+    // Secure temp file: mkstemp() opens with O_CREAT|O_EXCL (no symlink or
+    // TOCTOU race) and an unpredictable random name — the previous
+    // PID-based ".name.tmp.<pid>" was guessable by other local users.
+    std::string tmp_path = dest_dir + "/." + filename + ".tmp.XXXXXX";
+    std::vector<char> tmpl(tmp_path.begin(), tmp_path.end());
+    tmpl.push_back('\0');
+    int tmp_fd = mkstemp(tmpl.data());
+    if (tmp_fd < 0) {
+        Logger::error("hf_download: cannot create temp file in '{}': {}",
+                      dest_dir, strerror(errno));
+        return 1;
+    }
+    tmp_path.assign(tmpl.begin(), tmpl.end() - 1); // drop the trailing NUL
+
+    // Defence in depth: the created file must be a regular file owned by the
+    // current user (rejects any pre-existing symlink swap after creation).
+    struct stat tst;
+    if (fstat(tmp_fd, &tst) != 0 || !S_ISREG(tst.st_mode) ||
+        tst.st_uid != geteuid()) {
+        Logger::error("hf_download: temp file '{}' is not a regular file "
+                      "owned by uid {}", tmp_path, geteuid());
+        close(tmp_fd);
+        unlink(tmp_path.c_str());
+        return 1;
+    }
+
+    FILE* f = fdopen(tmp_fd, "wb");
     if (!f) {
-        Logger::error("hf_download: cannot open temp file '{}'", tmp_path);
+        close(tmp_fd);
+        unlink(tmp_path.c_str());
+        Logger::error("hf_download: cannot fdopen temp file '{}'", tmp_path);
         return 1;
     }
 
@@ -128,8 +168,23 @@ int hf_download_file(const std::string& repo_id,
     bool ok = false;
 
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    // CURLOPT_FOLLOWLOCATION is deliberately NOT enabled: libcurl would follow
+    // redirects to any scheme (ftp://, and file:// on older libcurl) or host,
+    // defeating TLS verification and enabling SSRF to internal hosts. We walk
+    // redirects manually below with a strict scheme + host allowlist.
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 0L);
     curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 10L);
+    // Protocol allowlists: block file://, ftp://, etc. for both the initial
+    // URL and any redirected one. _STR variants exist since libcurl 7.85.0.
+#if LIBCURL_VERSION_NUM >= 0x075500
+    curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "http,https");
+    curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "http,https");
+#else
+    curl_easy_setopt(curl, CURLOPT_PROTOCOLS,
+                     CURLPROTO_HTTP | CURLPROTO_HTTPS);
+    curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS,
+                     CURLPROTO_HTTP | CURLPROTO_HTTPS);
+#endif
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 60L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 300L);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
@@ -140,28 +195,90 @@ int hf_download_file(const std::string& repo_id,
     // TLS: verify peer + host against system CAs; do NOT accept self-signed.
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+
+    struct curl_slist* headers = nullptr;
     if (!hf_token.empty()) {
         const std::string auth = "Authorization: Bearer " + hf_token;
-        struct curl_slist* headers = nullptr;
         headers = curl_slist_append(headers, auth.c_str());
         curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-        rc = curl_easy_perform(curl);
-        curl_slist_free_all(headers);
-    } else {
-        rc = curl_easy_perform(curl);
     }
 
-    if (rc == CURLE_OK) {
+    // Manual redirect walk: the initial URL is always https, so every hop
+    // must stay https (no scheme downgrade) and resolve to an allowlisted
+    // HF host. CURLINFO_REDIRECT_URL reports the resolved absolute URL of the
+    // Location header even with FOLLOWLOCATION disabled.
+    const bool initial_https = (url.compare(0, 8, "https://") == 0);
+    int redirects = 0;
+    for (;;) {
+        // Fresh body for each attempt: rewind and truncate the temp file.
+        fflush(f);
+        fseek(f, 0, SEEK_SET);
+        if (ftruncate(fileno(f), 0) != 0) {
+            Logger::error("hf_download: cannot truncate temp file '{}'",
+                          tmp_path);
+            break;
+        }
+
+        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+        rc = curl_easy_perform(curl);
+
+        if (rc != CURLE_OK) {
+            Logger::error("hf_download: curl error {} for {}",
+                          curl_easy_strerror(rc), url);
+            break;
+        }
+
         curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+
+        if (http_code >= 300 && http_code < 400) {
+            char* loc = nullptr;
+            curl_easy_getinfo(curl, CURLINFO_REDIRECT_URL, &loc);
+            if (!loc || !*loc) {
+                Logger::error("hf_download: HTTP {} redirect without a "
+                              "Location for {}", http_code, url);
+                break;
+            }
+            const std::string next(loc);
+            if (++redirects > 10) {
+                Logger::error("hf_download: too many redirects ({}) for {}",
+                              redirects, url);
+                break;
+            }
+            const bool next_https = (next.compare(0, 8, "https://") == 0);
+            const bool next_http = (next.compare(0, 7, "http://") == 0);
+            if (!next_https && !next_http) {
+                Logger::error("hf_download: redirect to unsupported scheme "
+                              "'{}'", next);
+                break;
+            }
+            if (!next_https && initial_https) {
+                Logger::error("hf_download: refusing https->http redirect "
+                              "downgrade '{}'", next);
+                break;
+            }
+            std::string host = next.substr(next_https ? 8 : 7);
+            size_t slash = host.find('/');
+            if (slash != std::string::npos) host.resize(slash);
+            size_t colon = host.find(':');
+            if (colon != std::string::npos) host.resize(colon);
+            if (!hf_host_is_allowed(host)) {
+                Logger::error("hf_download: redirect to disallowed host '{}': "
+                              "'{}'", host, next);
+                break;
+            }
+            url = next;
+            continue;
+        }
+
         if (http_code >= 200 && http_code < 300) {
             ok = true;
         } else {
             Logger::error("hf_download: HTTP {} for {}", http_code, url);
         }
-    } else {
-        Logger::error("hf_download: curl error {} for {}",
-                      curl_easy_strerror(rc), url);
+        break;
     }
+
+    if (headers) curl_slist_free_all(headers);
 
     fclose(f);
     curl_easy_cleanup(curl);

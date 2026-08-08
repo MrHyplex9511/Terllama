@@ -18,12 +18,79 @@ Output: model_decomposed.bin (magic 0xDEADBEEF)
 Usage:
   python scripts/export_ternary_model_bitnet.py --model HuggingFaceTB/SmolLM2-135M --terms 12
 """
-import argparse, torch, math, time, struct, json, os, sys
+import argparse, torch, math, time, struct, json, os, re, sys
 from pathlib import Path
 
 torch.manual_seed(42)
 DTYPE = torch.float32
 QUANTIZED_LAYERS = {'q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj', 'qkv_proj'}
+
+MODEL_NAME_RE = re.compile(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+')
+
+
+def validate_model_arg(model):
+    """Reject path escapes in --model; allow 'owner/repo' or an existing local dir."""
+    if '..' in model:
+        sys.exit(f"error: invalid --model {model!r}: '..' is not allowed")
+    if os.path.isdir(os.path.expanduser(model)):
+        return
+    if not MODEL_NAME_RE.fullmatch(model):
+        sys.exit(f"error: invalid --model {model!r}: expected 'owner/repo' "
+                 "or a local model directory")
+
+
+def _repo_has_safetensors(model):
+    """Return True/False if a .safetensors/.bin set is determinable, else None.
+
+    Local dirs are inspected on disk; remote repos via huggingface_hub.
+    None means "cannot introspect" (network/API failure or no weight files
+    found) — the loader below still refuses a pickle fallback via
+    use_safetensors=True.
+    """
+    p = os.path.expanduser(model)
+    if os.path.isdir(p):
+        sfs = list(Path(p).glob('*.safetensors'))
+        if sfs:
+            return True
+        bins = list(Path(p).glob('*.bin'))
+        if bins:
+            return False
+        return None
+    try:
+        from huggingface_hub import list_repo_files
+        files = list_repo_files(model)
+    except Exception:
+        return None
+    if any(f.endswith('.safetensors') for f in files):
+        return True
+    if any(f.endswith('.bin') for f in files):
+        return False
+    return None
+
+
+def load_model_weights(model, torch_dtype=DTYPE):
+    """Load CausalLM weights, refusing pickle-based (.bin) weights.
+
+    If the repo/dir only ships .bin files we refuse with a clear error
+    instead of letting transformers fall back to torch.load().  Safe
+    (safetensors) repos load exactly as before.
+    """
+    from transformers import AutoModelForCausalLM
+    ok = _repo_has_safetensors(model)
+    if ok is False:
+        sys.exit(f"error: refusing to load pickle-based weights from {model!r}; "
+                 "use a safetensors repo or convert offline")
+    try:
+        return AutoModelForCausalLM.from_pretrained(
+            model, torch_dtype=torch_dtype, use_safetensors=True
+        )
+    except (EnvironmentError, OSError, ValueError) as e:
+        # use_safetensors=True means transformers will NOT fall back to
+        # torch.load; surface a clear refusal when safetensors are missing.
+        if 'safetensors' in str(e).lower():
+            sys.exit(f"error: refusing to load pickle-based weights from {model!r}; "
+                     "use a safetensors repo or convert offline")
+        raise
 
 def should_quantize(layer_name):
     return any(x in layer_name for x in QUANTIZED_LAYERS)
@@ -248,7 +315,6 @@ def export_als_blocks(out_dir, model_name, num_terms=12):
     Writes model_decomposed.bin (magic 0xDEADBEEF). Layer types:
       0 = TQ1 legacy (unused, backward compat), 1 = RAW_FP32, 2 = multi-term block container.
     """
-    from transformers import AutoModelForCausalLM
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     model_bin = out_dir / 'model_decomposed.bin'
@@ -259,7 +325,7 @@ def export_als_blocks(out_dir, model_name, num_terms=12):
     print("=" * 70)
 
     print(f"\nDownloading {model_name} from HuggingFace...")
-    model_hf = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=DTYPE).eval()
+    model_hf = load_model_weights(model_name).eval()
 
     q_layers = []
     total_fp32 = 0
@@ -453,6 +519,7 @@ def main():
     parser.add_argument('--rotate', type=int, default=0,
                         help='RoPE theta (-1: max positional, 0: no change, N: specific value)')
     args = parser.parse_args()
+    validate_model_arg(args.model)
 
     # Early marker so the app can show a progress indicator immediately.
     print('[PROGRESS] 0%', flush=True)
@@ -466,13 +533,14 @@ def main():
 
     # Write model_extra.bin — reload model if needed (it's cached, fast)
     print('\n[Writing model_extra.bin...]')
-    from transformers import AutoModelForCausalLM as _M
-    m = _M.from_pretrained(args.model, dtype=torch.float32).eval()
+    m = load_model_weights(args.model, torch_dtype=torch.float32).eval()
     extra_path = write_extra(out_dir, m)
     print(f'  Wrote {extra_path} ({os.path.getsize(extra_path)/1e6:.1f} MB)')
 
     # Write tokenizer files (tokenizer.json + tokenizer_config.json + extras)
     # so the C++ loader can find model_dir/tokenizer.json at runtime.
+    # Note: tokenizers load vocab/tokenizer files, not torch weights, so the
+    # safetensors-only policy does not apply here.
     print('\n[Writing tokenizer files...]')
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(args.model)

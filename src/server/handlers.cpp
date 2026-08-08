@@ -20,9 +20,12 @@
 #include <cstring>
 #include <ctime>
 #include <atomic>
+#include <random>
 #include <chrono>
 #include <thread>
 #include <memory>
+#include <deque>
+#include <map>
 #include <unistd.h>
 #include <csignal>
 
@@ -70,13 +73,54 @@ void send_error(httplib::Response& res, const std::string& message,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// RATE LIMITING (sliding window per source IP)
+// ═══════════════════════════════════════════════════════════════════════════
+
+static constexpr size_t kRateLimitMax = 20;               // requests per window per IP
+static constexpr std::chrono::seconds kRateLimitWindow{60};
+
+static std::mutex g_rl_mutex;
+static std::map<std::string,
+                std::deque<std::chrono::steady_clock::time_point>> g_rl_history;
+
+// Returns true if the request is within the per-IP sliding-window budget.
+static bool rate_limit_allow(const httplib::Request& req) {
+    const std::string ip = req.remote_addr;
+    const auto now = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> lock(g_rl_mutex);
+    auto& deq = g_rl_history[ip];
+    while (!deq.empty() && now - deq.front() > kRateLimitWindow)
+        deq.pop_front();
+    if (deq.size() >= kRateLimitMax) return false;
+    deq.push_back(now);
+    return true;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// max_tokens VALIDATION
+// ═══════════════════════════════════════════════════════════════════════════
+
+static constexpr int kMaxTokensCeiling = 4096;
+
+// Clamps max_tokens to [1, kMaxTokensCeiling]. Sends 400 and returns false
+// when the client asks for <= 0 tokens.
+static bool sanitize_max_tokens(int& max_tokens, httplib::Response& res) {
+    if (max_tokens <= 0) {
+        send_error(res, "max_tokens must be a positive integer", 400, "invalid_request");
+        return false;
+    }
+    if (max_tokens > kMaxTokensCeiling) max_tokens = kMaxTokensCeiling;
+    return true;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // API KEY AUTH CHECK
 // ═══════════════════════════════════════════════════════════════════════════
 
 // Returns true if request is authorized (or no key set).
 // Sends 401 and returns false on mismatch.
-static bool check_api_key(const httplib::Request& req,
-                          httplib::Response& res)
+bool check_api_key(const httplib::Request& req,
+                   httplib::Response& res)
 {
     if (g_api_key.empty()) return true;
     const auto& auth = req.get_header_value("Authorization");
@@ -170,12 +214,13 @@ std::string build_chat_prompt(const std::vector<Message>& messages) {
 
 std::string make_id(const char* prefix) {
     static std::atomic<uint64_t> counter{0};
-    auto ts = std::chrono::duration_cast<std::chrono::seconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
-    uint64_t id = (static_cast<uint64_t>(ts) << 20) | (counter++ & 0xFFFFF);
+    static thread_local std::mt19937_64 rng{std::random_device{}()};
+    uint64_t rand_part = rng();
+    uint64_t seq       = counter.fetch_add(1, std::memory_order_relaxed);
     char buf[64];
-    snprintf(buf, sizeof(buf), "%s-%llx", prefix,
-             static_cast<unsigned long long>(id));
+    snprintf(buf, sizeof(buf), "%s-%llx%llx", prefix,
+             static_cast<unsigned long long>(rand_part),
+             static_cast<unsigned long long>(seq));
     return buf;
 }
 
@@ -202,9 +247,9 @@ struct ModelSnap {
 #include <sys/stat.h>
 
 struct RequestGuard {
-    RequestGuard() {
-        g_active_requests++;
-    }
+    // The request slot is reserved atomically by try_reserve_request();
+    // this guard only releases it on completion (destructor), including on
+    // exception unwind.
     ~RequestGuard() {
         g_active_requests--;
         g_last_request_time = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -268,18 +313,72 @@ size_t get_kv_cache_size_bytes() {
     return (size_t)cfg.num_hidden_layers * cfg.max_position_embeddings * cfg.num_key_value_heads * cfg.head_dim * sizeof(float) * 2;
 }
 
-static ModelSnap snapshot_model() {
-    std::lock_guard<std::mutex> lock(g_model_mutex);
-    return {
-        g_model.cfg,
-        g_model.embedding,
-        g_model.layers,
-        g_model.final_norm,
-        g_model.layer_norms,
-        g_model.rope,
-        g_model.tokenizer,
-        g_model.gigatoken
-    };
+// ── Memory-limit admission (check-and-reserve atomically) ─────────────────
+// g_active_requests is incremented here under g_admission_mutex so the
+// projected-memory check and the reservation are atomic — no TOCTOU between
+// the pre-check and RequestGuard's increment. RequestGuard only releases the
+// slot on completion. Returns false (no reservation) when the request would
+// exceed the memory limit.
+static std::mutex g_admission_mutex;
+
+static bool try_reserve_request() {
+    std::lock_guard<std::mutex> lock(g_admission_mutex);
+    if (g_memory_limit > 0) {
+        size_t model_mem = get_model_size_bytes();
+        size_t kv_mem    = get_kv_cache_size_bytes();
+        int    active    = g_active_requests.load();
+        size_t projected_mem = model_mem + (size_t)(active + 1) * kv_mem;
+        if (projected_mem > g_memory_limit) {
+            Logger::warn("Request rejected: projected memory ({} MB) exceeds limit ({} MB)",
+                projected_mem / (1024 * 1024), g_memory_limit / (1024 * 1024));
+            return false;
+        }
+    }
+    g_active_requests++;
+    return true;
+}
+
+// ── Model snapshot cache ─────────────────────────────────────────────────
+// Snapshot copies are multi-GB; instead of deep-copying per request, cache a
+// single snapshot and rebuild it only when the model is (re)loaded or
+// unloaded (see invalidate_model_snapshot(), called from server.cpp).
+// Concurrent requests share the cached snapshot via shared_ptr.
+static std::mutex g_snapshot_mutex;
+static std::shared_ptr<ModelSnap> g_snapshot_cache;
+
+std::shared_ptr<ModelSnap> get_model_snapshot() {
+    {
+        std::lock_guard<std::mutex> lock(g_snapshot_mutex);
+        if (g_snapshot_cache) return g_snapshot_cache;
+    }
+    // Build a fresh copy outside the cache lock to avoid lock-order inversion
+    // with g_model_mutex (held by init_server / watchdog unload). A redundant
+    // build can happen under a load race; the loser's copy is dropped below.
+    auto fresh = std::make_shared<ModelSnap>();
+    {
+        std::lock_guard<std::mutex> lock(g_model_mutex);
+        *fresh = {
+            g_model.cfg,
+            g_model.embedding,
+            g_model.layers,
+            g_model.final_norm,
+            g_model.layer_norms,
+            g_model.rope,
+            g_model.tokenizer,
+            g_model.gigatoken
+        };
+    }
+    std::lock_guard<std::mutex> lock(g_snapshot_mutex);
+    if (!g_snapshot_cache) g_snapshot_cache = fresh;
+    return g_snapshot_cache;
+}
+
+// Invalidates the cached snapshot so the next request rebuilds it. Called
+// from server.cpp on model (re)load and on watchdog unload so the cached
+// multi-GB copy is not retained after the model is freed.
+void invalidate_model_snapshot() {
+    std::lock_guard<std::mutex> lock(g_snapshot_mutex);
+    g_snapshot_cache.reset();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -316,6 +415,11 @@ void handle_chat_completions(const httplib::Request& req,
     touch_last_request();
     if (!check_api_key(req, res)) return;
 
+    if (!rate_limit_allow(req)) {
+        send_error(res, "Too many requests", 429, "rate_limited");
+        return;
+    }
+
     if (!g_model.loaded) {
         if (!g_model.model_dir.empty()) {
             Logger::info("Auto-reloading model from {}...", g_model.model_dir);
@@ -329,19 +433,12 @@ void handle_chat_completions(const httplib::Request& req,
         }
     }
 
-    if (g_memory_limit > 0) {
-        size_t model_mem = get_model_size_bytes();
-        size_t kv_mem = get_kv_cache_size_bytes();
-        int active = g_active_requests.load();
-        size_t projected_mem = model_mem + (active + 1) * kv_mem;
-        if (projected_mem > g_memory_limit) {
-            Logger::warn("Request rejected: projected memory ({} MB) exceeds limit ({} MB)", 
-                projected_mem / (1024 * 1024), g_memory_limit / (1024 * 1024));
-            send_error(res, "Service Unavailable: Request would exceed memory limit", 503, "service_unavailable");
-            return;
-        }
+    // Reserve the request slot atomically against the memory limit (see
+    // try_reserve_request). RequestGuard releases it on completion.
+    if (!try_reserve_request()) {
+        send_error(res, "Service Unavailable: Request would exceed memory limit", 503, "service_unavailable");
+        return;
     }
-
     auto req_guard = std::make_shared<RequestGuard>();
 
     // Parse request body via nlohmann/json
@@ -353,42 +450,69 @@ void handle_chat_completions(const httplib::Request& req,
         return;
     }
 
-    std::string model      = req_body.value("model", std::string("default"));
-    bool        stream     = req_body.value("stream", false);
-    float       temperature = req_body.value("temperature", 0.7f);
-    int         max_tokens  = req_body.value("max_tokens", 256);
-
-    // Parse messages array
+    std::string model;
+    bool        stream     = false;
+    float       temperature = 0.7f;
+    int         max_tokens  = 256;
     std::vector<Message> messages;
-    if (req_body.contains("messages") && req_body["messages"].is_array()) {
-        for (const auto& m : req_body["messages"]) {
-            Message msg;
-            msg.role    = m.value("role",    std::string());
-            msg.content = m.value("content", std::string());
-            if (!msg.role.empty()) messages.push_back(std::move(msg));
+
+    // Parameter extraction can throw (e.g. a string where a number is
+    // expected). Wrap it so malformed fields yield the generic error rather
+    // than leaking exception text to the client.
+    try {
+        model       = req_body.value("model", std::string("default"));
+        stream      = req_body.value("stream", false);
+        temperature = req_body.value("temperature", 0.7f);
+        max_tokens  = req_body.value("max_tokens", 256);
+
+        // Parse messages array
+        if (req_body.contains("messages") && req_body["messages"].is_array()) {
+            for (const auto& m : req_body["messages"]) {
+                Message msg;
+                msg.role    = m.value("role",    std::string());
+                msg.content = m.value("content", std::string());
+                if (!msg.role.empty()) messages.push_back(std::move(msg));
+            }
         }
+    } catch (const std::exception& e) {
+        Logger::error("Bad request parameter: {}", e.what());
+        send_error(res, "Internal server error", 500, "internal_error");
+        return;
     }
     if (messages.empty()) {
         send_error(res, "No messages provided", 400, "invalid_request");
         return;
     }
 
+    if (!sanitize_max_tokens(max_tokens, res)) return;
+
     std::string prompt = build_chat_prompt(messages);
 
-    // Tokenize
+    // Tokenize (also capture the model context size under the same lock)
     std::vector<int> prompt_tokens;
+    int max_position_embeddings = 0;
     {
         std::lock_guard<std::mutex> lock(g_model_mutex);
         prompt_tokens = tokenize_with_helper(prompt);
+        max_position_embeddings = g_model.cfg.max_position_embeddings;
     }
     if (prompt_tokens.empty()) {
         send_error(res, "Tokenization failed", 500, "tokenization_error");
         return;
     }
 
+    // Defense-in-depth for the KVCache overflow: reject prompts longer than
+    // the model context, and never generate more tokens than fit in it.
+    if ((size_t)max_position_embeddings < prompt_tokens.size()) {
+        send_error(res, "Prompt too long: exceeds model context", 400, "invalid_request");
+        return;
+    }
+    int context_budget = max_position_embeddings - (int)prompt_tokens.size();
+    if (max_tokens > context_budget) max_tokens = std::max(1, context_budget);
+
     if (temperature < 0.01f) temperature = 0.0f;
 
-    auto snap = std::make_shared<ModelSnap>(snapshot_model());
+    auto snap = get_model_snapshot();
 
     if (stream) {
         // ── Streaming (SSE via chunked transfer) ────────────────────────
@@ -562,6 +686,11 @@ void handle_completions(const httplib::Request& req,
     touch_last_request();
     if (!check_api_key(req, res)) return;
 
+    if (!rate_limit_allow(req)) {
+        send_error(res, "Too many requests", 429, "rate_limited");
+        return;
+    }
+
     if (!g_model.loaded) {
         if (!g_model.model_dir.empty()) {
             Logger::info("Auto-reloading model from {}...", g_model.model_dir);
@@ -575,19 +704,12 @@ void handle_completions(const httplib::Request& req,
         }
     }
 
-    if (g_memory_limit > 0) {
-        size_t model_mem = get_model_size_bytes();
-        size_t kv_mem = get_kv_cache_size_bytes();
-        int active = g_active_requests.load();
-        size_t projected_mem = model_mem + (active + 1) * kv_mem;
-        if (projected_mem > g_memory_limit) {
-            Logger::warn("Request rejected: projected memory ({} MB) exceeds limit ({} MB)", 
-                projected_mem / (1024 * 1024), g_memory_limit / (1024 * 1024));
-            send_error(res, "Service Unavailable: Request would exceed memory limit", 503, "service_unavailable");
-            return;
-        }
+    // Reserve the request slot atomically against the memory limit (see
+    // try_reserve_request). RequestGuard releases it on completion.
+    if (!try_reserve_request()) {
+        send_error(res, "Service Unavailable: Request would exceed memory limit", 503, "service_unavailable");
+        return;
     }
-
     auto req_guard = std::make_shared<RequestGuard>();
 
     json req_body;
@@ -598,29 +720,55 @@ void handle_completions(const httplib::Request& req,
         return;
     }
 
-    std::string prompt = req_body.value("prompt", std::string());
+    std::string prompt;
+    bool        stream      = false;
+    float       temperature = 0.7f;
+    int         max_tokens  = 256;
+
+    // Parameter extraction can throw (e.g. a string where a number is
+    // expected). Wrap it so malformed fields yield the generic error rather
+    // than leaking exception text to the client.
+    try {
+        prompt      = req_body.value("prompt", std::string());
+        stream      = req_body.value("stream", false);
+        temperature = req_body.value("temperature", 0.7f);
+        max_tokens  = req_body.value("max_tokens", 256);
+    } catch (const std::exception& e) {
+        Logger::error("Bad request parameter: {}", e.what());
+        send_error(res, "Internal server error", 500, "internal_error");
+        return;
+    }
     if (prompt.empty()) {
         send_error(res, "No prompt provided", 400, "invalid_request");
         return;
     }
 
-    bool   stream      = req_body.value("stream", false);
-    float  temperature = req_body.value("temperature", 0.7f);
-    int    max_tokens  = req_body.value("max_tokens", 256);
+    if (!sanitize_max_tokens(max_tokens, res)) return;
 
     std::vector<int> prompt_tokens;
+    int max_position_embeddings = 0;
     {
         std::lock_guard<std::mutex> lock(g_model_mutex);
         prompt_tokens = tokenize_with_helper(prompt);
+        max_position_embeddings = g_model.cfg.max_position_embeddings;
     }
     if (prompt_tokens.empty()) {
         send_error(res, "Tokenization failed", 500, "tokenization_error");
         return;
     }
 
+    // Defense-in-depth for the KVCache overflow: reject prompts longer than
+    // the model context, and never generate more tokens than fit in it.
+    if ((size_t)max_position_embeddings < prompt_tokens.size()) {
+        send_error(res, "Prompt too long: exceeds model context", 400, "invalid_request");
+        return;
+    }
+    int context_budget = max_position_embeddings - (int)prompt_tokens.size();
+    if (max_tokens > context_budget) max_tokens = std::max(1, context_budget);
+
     if (temperature < 0.01f) temperature = 0.0f;
 
-    auto snap = std::make_shared<ModelSnap>(snapshot_model());
+    auto snap = get_model_snapshot();
 
     if (stream) {
         // ── Streaming ───────────────────────────────────────────────────
@@ -784,9 +932,9 @@ void handle_completions(const httplib::Request& req,
 // ── GET /health ─────────────────────────────────────────────────────────
 
 void handle_health(const httplib::Request& req, httplib::Response& res) {
-    (void)req;
     add_cors_headers(res);
     touch_last_request();
+    if (!check_api_key(req, res)) return;
     send_json(res, json{
         {"status", g_model.loaded ? "ok" : "not_loaded"},
         {"model",  "default"}

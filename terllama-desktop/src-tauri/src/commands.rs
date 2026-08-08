@@ -52,6 +52,36 @@ fn parse_progress_pct(line: &str) -> Option<u64> {
     None
 }
 
+/// Validate a model identifier supplied by the webview before it is used in a
+/// subprocess argument or a filesystem path. Accepts either a HuggingFace repo
+/// id ("owner/repo") or a plain registry slug ("owner-repo"), restricted to
+/// [A-Za-z0-9_.-] with at most one '/'.
+fn validate_model_id(model: &str) -> Result<(), String> {
+    validate_model_component(model, true)
+}
+
+/// Like `validate_model_id` but rejects slashes entirely — for values that
+/// must be a bare registry id (used as a directory name).
+fn validate_registry_id(model: &str) -> Result<(), String> {
+    validate_model_component(model, false)
+}
+
+fn validate_model_component(model: &str, allow_slash: bool) -> Result<(), String> {
+    let segments: Vec<&str> = model.split('/').collect();
+    let valid = !model.is_empty()
+        && !model.contains("..")
+        && segments.len() <= 2
+        && segments.iter().all(|s| !s.is_empty())
+        && model.chars().all(|c| {
+            c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-' || (allow_slash && c == '/')
+        });
+    if valid {
+        Ok(())
+    } else {
+        Err("invalid model id".to_string())
+    }
+}
+
 #[tauri::command]
 /// Download a model in one of three formats: "fp", "q4", or "ternary".
 pub async fn download_model(
@@ -59,6 +89,9 @@ pub async fn download_model(
     model_id: String,
     format: String,
 ) -> Result<(), String> {
+    // Validate the webview-supplied id before it is used to build a path.
+    validate_registry_id(&model_id)?;
+
     // Determine HF repo from registry
     let registry = download::fetch_registry().await?;
     let model = registry
@@ -266,7 +299,29 @@ async fn download_files_direct(
         .build()
         .map_err(|e| format!("Failed to create client: {}", e))?;
 
+    // Registry-controlled filenames must never escape the model dir. Reject
+    // any path separators, traversal components, or non-allow-listed names
+    // before they reach out_dir.join() (path-traversal / arbitrary file
+    // write prevention, issue #2).
+    fn validate_registry_filename(filename: &str) -> Result<(), String> {
+        if filename.is_empty()
+            || filename.contains('/')
+            || filename.contains('\\')
+            || filename.contains("..")
+            || !filename
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        {
+            return Err(format!(
+                "Refusing to download file with unsafe name: '{}'",
+                filename
+            ));
+        }
+        Ok(())
+    }
+
     for filename in &filenames {
+        validate_registry_filename(filename)?;
         let url = format!(
             "https://huggingface.co/{}/resolve/main/{}",
             hf_repo, filename
@@ -406,6 +461,17 @@ pub async fn start_server(
     model_id: String,
     port: u16,
 ) -> Result<(), String> {
+    // Validate webview input before it reaches a subprocess arg (--port) or
+    // the engine environment (TERLLAMA_HF_MODEL / model dir path).
+    validate_registry_id(&model_id)?;
+    let configured_port = crate::config::Settings::load().port;
+    if port != configured_port {
+        return Err(format!(
+            "port mismatch: use the configured server port ({})",
+            configured_port
+        ));
+    }
+
     // Refuse to load a model while a conversion is running — the weights are
     // being rewritten under the model dir and loading would race with it.
     if crate::convert::is_converting() {
@@ -431,6 +497,13 @@ pub async fn server_status(
 
 #[tauri::command]
 pub async fn send_chat_message(messages: Vec<Message>, port: u16) -> Result<String, String> {
+    // Only talk to the engine on the configured server port (blocks SSRF to
+    // arbitrary localhost services via a webview-supplied port).
+    let configured_port = crate::config::Settings::load().port;
+    if port != configured_port {
+        return Err("port mismatch: use the configured server port".to_string());
+    }
+
     let client = Client::new();
     let body = serde_json::json!({
         "model": "default",
@@ -454,6 +527,13 @@ pub async fn stream_chat(
     messages: Vec<Message>,
     port: u16,
 ) -> Result<(), String> {
+    // Only talk to the engine on the configured server port (blocks SSRF to
+    // arbitrary localhost services via a webview-supplied port).
+    let configured_port = crate::config::Settings::load().port;
+    if port != configured_port {
+        return Err("port mismatch: use the configured server port".to_string());
+    }
+
     let client = Client::new();
     let body = serde_json::json!({
         "model": "default",
@@ -523,6 +603,15 @@ pub async fn convert_model(
     format: String,
     terms: u32,
 ) -> Result<(), String> {
+    // Validate webview input before it reaches a subprocess arg or a path.
+    validate_model_id(&model)?;
+    if format != "als" && format != "gguf" {
+        return Err(format!("Unsupported conversion format: {}", format));
+    }
+    if !(1..=64).contains(&terms) {
+        return Err(format!("terms out of range: {} (expected 1..=64)", terms));
+    }
+
     // Ensure only one conversion at a time
     let lock = CONVERT_LOCK.get_or_init(|| Mutex::new(()));
     let _lock = lock.lock().await;

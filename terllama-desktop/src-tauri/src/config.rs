@@ -54,7 +54,22 @@ impl Settings {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
         let data = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-        std::fs::write(&path, data).map_err(|e| e.to_string())
+
+        // Write atomically via a sibling temp file, then rename. On Unix the
+        // file is created with owner-only perms (0o600) so the saved settings
+        // never sit world-readable. Windows behavior is unchanged.
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, &data).map_err(|e| e.to_string())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| e.to_string())?;
+        }
+        std::fs::rename(&tmp, &path).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            e.to_string()
+        })
     }
 }
 

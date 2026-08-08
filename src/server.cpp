@@ -101,19 +101,21 @@ bool init_server(const std::string& model_dir) {
         // instead of "????".
         g_model.gigatoken = std::make_shared<GigaTokenWrapper>();
         {
-            // Search for .so next to binary, then CWD, then third_party
+            // Resolve the .so relative to the executable ONLY — never from
+            // CWD or ./bin (dlopen hijack prevention, issue #6).
             char exe_buf[4096];
             ssize_t exe_len = readlink("/proc/self/exe", exe_buf, sizeof(exe_buf) - 1);
-            std::string exe_dir;
+            std::string so_paths;
             if (exe_len > 0) {
                 exe_buf[exe_len] = '\0';
-                exe_dir = std::string(exe_buf);
+                std::string exe_dir(exe_buf);
                 auto p = exe_dir.rfind('/');
-                if (p != std::string::npos) exe_dir = exe_dir.substr(0, p);
+                if (p != std::string::npos) so_paths = exe_dir.substr(0, p);
             }
-            std::string so_paths = ".:./bin";
-            if (!exe_dir.empty()) so_paths = exe_dir + ":" + so_paths;
-            if (g_model.gigatoken->load(so_paths)) {
+            if (so_paths.empty()) {
+                Logger::info("  GigaToken: cannot resolve exe dir — .so search disabled");
+                g_model.gigatoken.reset();
+            } else if (g_model.gigatoken->load(so_paths)) {
                 if (g_model.gigatoken->load_tokenizer(model_dir)) {
                     Logger::info("  GigaToken: loaded HF tokenizer from {} (vocab={})",
                                  (model_dir + "/tokenizer.json"), g_model.gigatoken->vocab_size());
@@ -145,6 +147,9 @@ bool init_server(const std::string& model_dir) {
         }
 
         g_model.loaded = true;
+        // Model (re)loaded: drop any stale snapshot so the next request
+        // builds a fresh cached copy.
+        invalidate_model_snapshot();
         Logger::info("Server initialized.");
         return true;
 
@@ -303,6 +308,9 @@ int server_main(int argc, char** argv) {
                         g_model.rope.cos.clear();
                         g_model.rope.cos.shrink_to_fit();
                         g_model.loaded = false;
+                        // Drop the cached snapshot so the multi-GB copy is
+                        // freed along with the model.
+                        invalidate_model_snapshot();
                         Logger::info("Model unloaded.");
                     }
                 }
@@ -322,29 +330,34 @@ int server_main(int argc, char** argv) {
     svr.Post("/v1/completions",      handle_completions);
     svr.Get ("/health",              handle_health);
 
-    // Static file serving for web UI
-    {
-        std::ifstream test_web(web_dir + "/index.html");
-        if (test_web.good()) {
-            svr.set_base_dir(web_dir, "/");
-            Logger::info("Web UI at http://0.0.0.0:{}/", port);
-        } else {
-            svr.Get("/", [](const httplib::Request& req, httplib::Response& res) {
-                (void)req;
-                add_cors_headers(res);
-                send_json(res, json{
-                    {"service",   "Terllama Inference Server"},
-                    {"version",   "1.0.0"},
-                    {"endpoints", json::array({
-                        "GET  /v1/models",
-                        "POST /v1/chat/completions",
-                        "POST /v1/completions",
-                        "GET  /health"
-                    })}
-                }.dump());
-            });
+    // Static file serving for web UI. Only mount the static web dir when no
+    // API key is configured — otherwise the UI would be served anonymously,
+    // bypassing auth. With a key set, fall back to the plain API listing.
+    std::ifstream test_web(web_dir + "/index.html");
+    if (!g_api_key.empty() || !test_web.good()) {
+        svr.Get("/", [](const httplib::Request& req, httplib::Response& res) {
+            add_cors_headers(res);
+            // Non-API routes must not bypass the API key. check_api_key
+            // returns true when no key is configured (listing stays open).
+            if (!check_api_key(req, res)) return;
+            send_json(res, json{
+                {"service",   "Terllama Inference Server"},
+                {"version",   "1.0.0"},
+                {"endpoints", json::array({
+                    "GET  /v1/models",
+                    "POST /v1/chat/completions",
+                    "POST /v1/completions",
+                    "GET  /health"
+                })}
+            }.dump());
+        });
+        if (g_api_key.empty())
             Logger::info("No web/index.html — serving API listing at /");
-        }
+        else
+            Logger::info("API key set — not serving web UI; API listing at /");
+    } else {
+        svr.set_base_dir(web_dir, "/");
+        Logger::info("Web UI at http://0.0.0.0:{}/", port);
     }
 
     // Error handler
@@ -352,7 +365,7 @@ int server_main(int argc, char** argv) {
         (void)req;
         add_cors_headers(res);
         if (res.status == 404) {
-            send_error(res, "Not found: " + req.path, 404, "not_found");
+            send_error(res, "Not found", 404, "not_found");
         }
     });
 
@@ -364,10 +377,13 @@ int server_main(int argc, char** argv) {
         try {
             if (ep) std::rethrow_exception(ep);
         } catch (const std::exception& e) {
-            send_error(res, std::string("Internal error: ") + e.what(), 500);
+            // Log the real error server-side; never echo it to the client.
+            Logger::error("Unhandled exception in request handler: {}", e.what());
         } catch (...) {
-            send_error(res, "Unknown internal error", 500);
+            Logger::error("Unhandled unknown exception in request handler");
         }
+        // Static generic body — no internals leaked.
+        send_error(res, "Internal server error", 500, "internal_error");
     });
 
     svr.set_payload_max_length(10 * 1024 * 1024); // 10 MB max

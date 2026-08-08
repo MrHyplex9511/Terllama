@@ -9,10 +9,20 @@
 #include "loader.h"           // find_layer_index
 #include "core/logger.h"
 #include "core/sandwich_scheduler.h"
+#include <random>
 
 // ─── File-scope thread_local buffers for model_forward ────────────────────
 static thread_local std::vector<float> tls_x;
 static thread_local std::vector<float> tls_logits;
+
+// Thread-safe PRNG for sampling: seeded once per thread from std::random_device.
+// Replaces rand()/srand() (global state → data race under concurrent streaming,
+// and srand(time(NULL)) made sampling predictable).
+static thread_local std::mt19937_64 g_rng = [] {
+    std::random_device rd;
+    std::seed_seq seq{rd(), rd(), rd(), rd()};
+    return std::mt19937_64(seq);
+}();
 
 // ═══════════════════════════════════════════════════════════════════════════
 // KV CACHE
@@ -31,6 +41,11 @@ KVCache::KVCache(int max_seq, int n_layers, int n_kv, int hd, int hs)
 
 void KVCache::append(int layer, const float* k, const float* v, int seq_pos) {
     int n = n_kv_heads * head_dim;
+    if (seq_pos < 0 || seq_pos >= max_seq) {
+        Logger::warn("KVCache::append: seq_pos={} out of range [0,{}); refusing write",
+                     seq_pos, max_seq);
+        return;
+    }
     std::copy(k, k + n, &k_cache[layer][seq_pos * n]);
     std::copy(v, v + n, &v_cache[layer][seq_pos * n]);
     seq_lens[layer] = seq_pos + 1;
@@ -346,9 +361,24 @@ float* model_forward(int token, int seq_pos,
         tls_x.resize(cfg.hidden_size);
 
     // Embedding lookup
-    std::copy(&embedding[token * cfg.hidden_size],
-              &embedding[(token + 1) * cfg.hidden_size],
-              tls_x.data());
+    int emb_token = token;
+    if (emb_token < 0 || emb_token >= cfg.vocab_size) {
+        static thread_local bool warned = false;
+        if (!warned) {
+            warned = true;
+            Logger::warn("model_forward: token={} outside [0,{}); falling back to token 0",
+                         token, cfg.vocab_size);
+        }
+        emb_token = (cfg.vocab_size > 0) ? 0 : -1;
+    }
+    if (emb_token >= 0) {
+        std::copy(&embedding[(size_t)emb_token * cfg.hidden_size],
+                  &embedding[(size_t)(emb_token + 1) * cfg.hidden_size],
+                  tls_x.data());
+    } else {
+        // Degenerate model with no embedding table: zero input, no OOB read.
+        std::fill(tls_x.begin(), tls_x.end(), 0.0f);
+    }
 
     // Debug: check embedding for NaN (enabled via TERLLAMA_DEBUG_DIR)
     FILE* dbg = debug_fopen("nan_trace.txt", "a");
@@ -473,7 +503,7 @@ int sample_multinomial(const float* logits, int n, float temp,
         probs[i] = std::exp((val - maxv) / temp);
         sum += probs[i];
     }
-    float r = (float)rand() / RAND_MAX * sum;
+    float r = (float)((double)g_rng() / (double)std::mt19937_64::max()) * sum;
     float acc = 0.0f;
     for (int i = 0; i < n; i++) {
         acc += probs[i];
@@ -505,10 +535,26 @@ bool generate_stream(const std::vector<int>& prompt_tokens,
     // ─── Sandwich scheduler: phase-aware config ─────────────────────────
     SandwichScheduler scheduler;
 
+    // ─── Bounds hardening: never write past the KV cache ────────────────
+    const int max_seq = cfg.max_position_embeddings;
+    int n_prompt = (int)prompt_tokens.size();
+    if (n_prompt >= max_seq) {
+        n_prompt = std::max(0, max_seq - 1);  // leave room for >=1 generated token
+        Logger::warn("generate_stream: prompt length {} >= max_position_embeddings {}; "
+                     "truncating prefill to {} tokens",
+                     prompt_tokens.size(), max_seq, n_prompt);
+    }
+    if (max_tokens > max_seq - n_prompt) {
+        Logger::warn("generate_stream: max_tokens={} limited to {} by KV cache "
+                     "(max_position_embeddings={}, prompt={})",
+                     max_tokens, std::max(0, max_seq - n_prompt), max_seq, n_prompt);
+        max_tokens = std::max(0, max_seq - n_prompt);
+    }
+
     // Prefill phase (compute-bound) → more threads, compact pinning
     scheduler.apply(GenPhase::PREFILL);
 
-    for (int pos = 0; pos < (int)prompt_tokens.size(); pos++) {
+    for (int pos = 0; pos < n_prompt; pos++) {
         model_forward(prompt_tokens[pos], pos, cfg, embedding,
                       layers, final_norm, layer_norms, rope, kv_cache, mote_layers);
     }
@@ -518,10 +564,11 @@ bool generate_stream(const std::vector<int>& prompt_tokens,
 
     // Autoregressive
     std::vector<int> output_tokens;
-    int next_token = prompt_tokens.back();
+    int next_token = n_prompt > 0 ? prompt_tokens[n_prompt - 1]
+                                  : (cfg.eos_token_id >= 0 ? cfg.eos_token_id : 0);
     FILE* log_debug = debug_fopen("logits.txt", "w");
     for (int i = 0; i < max_tokens; i++) {
-        int pos = (int)prompt_tokens.size() + i;
+        int pos = n_prompt + i;
         float* logits = model_forward(next_token, pos, cfg, embedding,
                                         layers, final_norm, layer_norms, rope, kv_cache, mote_layers);
 
@@ -590,11 +637,27 @@ std::pair<std::vector<int>, double> generate(
     // ─── Sandwich scheduler: phase-aware config ─────────────────────────
     SandwichScheduler scheduler;
 
+    // ─── Bounds hardening: never write past the KV cache ────────────────
+    const int max_seq = cfg.max_position_embeddings;
+    int n_prompt = (int)prompt_tokens.size();
+    if (n_prompt >= max_seq) {
+        n_prompt = std::max(0, max_seq - 1);  // leave room for >=1 generated token
+        Logger::warn("generate: prompt length {} >= max_position_embeddings {}; "
+                     "truncating prefill to {} tokens",
+                     prompt_tokens.size(), max_seq, n_prompt);
+    }
+    if (max_tokens > max_seq - n_prompt) {
+        Logger::warn("generate: max_tokens={} limited to {} by KV cache "
+                     "(max_position_embeddings={}, prompt={})",
+                     max_tokens, std::max(0, max_seq - n_prompt), max_seq, n_prompt);
+        max_tokens = std::max(0, max_seq - n_prompt);
+    }
+
     // Prefill phase (compute-bound) → more threads, compact pinning
     scheduler.apply(GenPhase::PREFILL);
     auto t_start = std::chrono::high_resolution_clock::now();
 
-    for (int pos = 0; pos < (int)prompt_tokens.size(); pos++) {
+    for (int pos = 0; pos < n_prompt; pos++) {
         model_forward(prompt_tokens[pos], pos, cfg, embedding,
                       layers, final_norm, layer_norms, rope, kv_cache, mote_layers);
     }
@@ -602,10 +665,11 @@ std::pair<std::vector<int>, double> generate(
     // Decode phase (memory-bound) → fewer threads, spread pinning
     scheduler.apply(GenPhase::DECODE);
     std::vector<int> output_tokens;
-    int next_token = prompt_tokens.back();
+    int next_token = n_prompt > 0 ? prompt_tokens[n_prompt - 1]
+                                  : (cfg.eos_token_id >= 0 ? cfg.eos_token_id : 0);
     FILE* log_debug = debug_fopen("logits.txt", "a");
     for (int i = 0; i < max_tokens; i++) {
-        int pos = (int)prompt_tokens.size() + i;
+        int pos = n_prompt + i;
         float* logits = model_forward(next_token, pos, cfg, embedding,
                                         layers, final_norm, layer_norms, rope, kv_cache, mote_layers);
 

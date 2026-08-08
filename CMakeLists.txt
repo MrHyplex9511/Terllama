@@ -20,6 +20,23 @@ option(BUILD_TESTING   "Build tests" ON)
 option(BUILD_SERVER    "Build API server" ON)
 option(BUILD_DOWNLOADER "Build model downloader" ON)
 
+# ─── Hardening flags (GCC/Clang) ─────────────────────────────────────────
+# Compile-time: stack protector, FORTIFY_SOURCE (effective at -O1+, which all
+# targets use) and PIE so objects are position-independent. Link-time PIE +
+# RELRO/BIND_NOW are applied per-executable via TERLLAMA_EXE_LINK_FLAGS (never
+# to shared libraries). Apple ld64 has no -z relro/now and macOS executables
+# are already PIE by default, so those flags are skipped there.
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    add_compile_options(-fstack-protector-strong -D_FORTIFY_SOURCE=2 -fPIE)
+    if(NOT APPLE)
+        set(TERLLAMA_EXE_LINK_FLAGS "-pie -Wl,-z,relro,-z,now")
+    else()
+        set(TERLLAMA_EXE_LINK_FLAGS "")
+    endif()
+else()
+    set(TERLLAMA_EXE_LINK_FLAGS "")
+endif()
+
 # ─── Dependencies ─────────────────────────────────────────────────────────
 find_package(OpenMP QUIET)
 find_package(CURL QUIET)
@@ -151,6 +168,9 @@ endif()
 if(CURL_FOUND)
     target_link_libraries(terllama PRIVATE CURL::libcurl)
 endif()
+if(TERLLAMA_EXE_LINK_FLAGS)
+    target_link_options(terllama PRIVATE ${TERLLAMA_EXE_LINK_FLAGS})
+endif()
 
 # Post-build: copy GigaToken .so next to the binary so dlopen finds it
 if(EXISTS ${GIGATOKEN_LIB})
@@ -187,6 +207,9 @@ if(BUILD_BENCHMARK)
     endif()
     if(CURL_FOUND)
         target_link_libraries(terllama-bench PRIVATE CURL::libcurl)
+    endif()
+    if(TERLLAMA_EXE_LINK_FLAGS)
+        target_link_options(terllama-bench PRIVATE ${TERLLAMA_EXE_LINK_FLAGS})
     endif()
 endif()
 

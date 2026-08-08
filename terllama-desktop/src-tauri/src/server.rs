@@ -236,6 +236,13 @@ impl ServerManager {
 }
 
 pub fn find_terllama_binary(resource_dir: Option<&std::path::Path>) -> Result<String, String> {
+    // 0. Documented env override (TERLLAMA_BIN) wins over everything else.
+    if let Ok(env_bin) = std::env::var("TERLLAMA_BIN") {
+        if !env_bin.is_empty() && std::path::Path::new(&env_bin).exists() {
+            return Ok(env_bin);
+        }
+    }
+
     // 1. Bundled resource (production installs). Tauri v2 layout:
     //    <resource_dir>/resources/bin/terllama  (and terllama.exe on Windows)
     if let Some(rd) = resource_dir {
@@ -249,24 +256,22 @@ pub fn find_terllama_binary(resource_dir: Option<&std::path::Path>) -> Result<St
         }
     }
 
-    // 2. Check PATH first
+    // 2. Fixed install locations. These are preferred over a PATH scan: a
+    //    stray `terllama` dropped into an earlier, writable PATH directory
+    //    would otherwise be picked up and executed instead.
+    for c in ["/usr/local/bin/terllama", "/usr/bin/terllama"] {
+        if std::path::Path::new(c).exists() {
+            return Ok(c.to_string());
+        }
+    }
+
+    // 3. PATH scan (last resort).
     if let Ok(path) = std::env::var("PATH") {
         for dir in path.split(':') {
             let candidate = format!("{}/terllama", dir);
             if std::path::Path::new(&candidate).exists() {
                 return Ok(candidate);
             }
-        }
-    }
-
-    let candidates = vec![
-        "/usr/local/bin/terllama",
-        "/usr/bin/terllama",
-        "/media/extra/Symlinks/BitNet/terllama-repo/terllama",
-    ];
-    for c in candidates {
-        if std::path::Path::new(c).exists() {
-            return Ok(c.to_string());
         }
     }
 

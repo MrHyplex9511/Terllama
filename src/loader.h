@@ -19,6 +19,7 @@
 #include <fstream>
 #include <vector>
 #include <string>
+#include <stdexcept>
 #include <cstring>
 #include <cctype>
 #include <algorithm>
@@ -59,7 +60,7 @@ inline void decode_block_ternary(const uint8_t* packed, int8_t* ternary, int qk)
 // ═══════════════════════════════════════════════════════════════════════════
 inline ModelConfig load_config(const std::string& path) {
     std::ifstream f(path, std::ios::binary);
-    if (!f) { Logger::error("Cannot open: {}", path); exit(1); }
+    if (!f) { Logger::error("Cannot open: {}", path); throw std::runtime_error("Cannot open model config: " + path); }
     ModelConfig cfg;
     int32_t vs, hs, is, nl, nah, nkv, mpe;
     float rne, rt;
@@ -72,6 +73,27 @@ inline ModelConfig load_config(const std::string& path) {
     f.read(reinterpret_cast<char*>(&rne), 4);
     f.read(reinterpret_cast<char*>(&rt), 4);
     f.read(reinterpret_cast<char*>(&mpe), 4);
+
+    // ─── Config validation ──────────────────────────────────────────────
+    // Reject truncated/crafted config headers. In particular mpe=0 would
+    // produce a zero-size KV cache → buffer overflow on the first token.
+    // Every dimension must be positive, head_dim (= hidden_size /
+    // num_attention_heads) must be >= 1, and mpe must be within a sane
+    // range (it is capped further to 4096 below for KV memory).
+    // Failure mode: throw, never exit(1) — init_server() and the server's
+    // auto-reload path (handlers.cpp) catch std::exception and return a
+    // clean error, keeping a running server alive on a bad/truncated model
+    // dir. cmd_show also already wraps load_config in try/catch. A sentinel
+    // config was rejected: callers that don't check it would proceed with
+    // silently-zero dimensions.
+    if (vs <= 0 || hs <= 0 || is <= 0 || nl <= 0 ||
+        nah <= 0 || nkv <= 0 || hs / nah <= 0 ||
+        mpe <= 0 || mpe > 1000000) {
+        Logger::error("Invalid model config in {}: vocab={} hidden={} intermediate={} layers={} heads={} kv_heads={} mpe={}",
+                      path, vs, hs, is, nl, nah, nkv, mpe);
+        throw std::runtime_error("Invalid model config in " + path + " (truncated or corrupt model header)");
+    }
+
     // KV cache memory guard: max_position_embeddings is the rope/KV length,
     // so huge config values (e.g. Qwen3 40960) would pre-allocate ~9 GB of
     // cache on this machine. Cap the *effective* context; generation beyond
@@ -89,7 +111,7 @@ inline ModelConfig load_config(const std::string& path) {
 // ═══════════════════════════════════════════════════════════════════════════
 inline std::vector<float> load_embedding(const std::string& path, const ModelConfig& cfg) {
     std::ifstream f(path, std::ios::binary);
-    if (!f) { Logger::error("Cannot open: {}", path); exit(1); }
+    if (!f) { Logger::error("Cannot open: {}", path); throw std::runtime_error("Cannot open model file: " + path); }
     f.seekg(4*9, std::ios::beg); // skip 9 int32/float config fields
     std::vector<float> emb(cfg.vocab_size * cfg.hidden_size);
     f.read(reinterpret_cast<char*>(emb.data()), emb.size() * sizeof(float));
@@ -98,7 +120,7 @@ inline std::vector<float> load_embedding(const std::string& path, const ModelCon
 
 inline std::vector<float> load_final_norm(const std::string& path, const ModelConfig& cfg) {
     std::ifstream f(path, std::ios::binary);
-    if (!f) { Logger::error("Cannot open: {}", path); exit(1); }
+    if (!f) { Logger::error("Cannot open: {}", path); throw std::runtime_error("Cannot open model file: " + path); }
     f.seekg(36 + cfg.vocab_size * cfg.hidden_size * 4, std::ios::beg);
     std::vector<float> fn(cfg.hidden_size);
     f.read(reinterpret_cast<char*>(fn.data()), fn.size() * sizeof(float));
@@ -116,7 +138,7 @@ struct NormWeights {
 
 inline std::vector<NormWeights> load_layer_norms(const std::string& path, const ModelConfig& cfg) {
     std::ifstream f(path, std::ios::binary);
-    if (!f) { Logger::error("Cannot open: {}", path); exit(1); }
+    if (!f) { Logger::error("Cannot open: {}", path); throw std::runtime_error("Cannot open model file: " + path); }
     int64_t offset = 36 + (int64_t)cfg.vocab_size * cfg.hidden_size * 4 + cfg.hidden_size * 4;
     f.seekg(offset, std::ios::beg);
     std::vector<NormWeights> norms(cfg.num_hidden_layers);
@@ -135,9 +157,14 @@ inline std::vector<NormWeights> load_layer_norms(const std::string& path, const 
 inline int find_layer_index(const std::vector<LayerData>& layers, const std::string& name) {
     for (int i = 0; i < (int)layers.size(); i++)
         if (layers[i].name == name) return i;
-    Logger::error("Layer not found: %s", name.c_str());
-    exit(1);
-    return -1;
+    // Missing layer in a truncated/crafted model: propagate instead of
+    // exit(1) so a bad file cannot kill a running server (DoS). Throw —
+    // callers in inference.cpp/mote_builder.cpp index the result
+    // unconditionally, so returning -1 would be unchecked UB; throwing is
+    // caught per-request by httplib's exception handler (→ 500, server
+    // survives) or at load time by init_server (→ clean load failure).
+    Logger::error("Layer not found: {}", name);
+    throw std::runtime_error("Layer not found in model file: " + name);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -145,10 +172,13 @@ inline int find_layer_index(const std::vector<LayerData>& layers, const std::str
 // ═══════════════════════════════════════════════════════════════════════════
 inline std::vector<LayerData> load_decomposed_layers(const std::string& path) {
     std::ifstream f(path, std::ios::binary);
-    if (!f) { Logger::error("Cannot open: {}", path); exit(1); }
+    if (!f) { Logger::error("Cannot open: {}", path); throw std::runtime_error("Cannot open model file: " + path); }
     uint32_t magic;
     f.read(reinterpret_cast<char*>(&magic), 4);
-    if (magic != 0xDEADBEEF) { Logger::error("Bad magic"); exit(1); }
+    if (magic != 0xDEADBEEF) {
+        Logger::error("Bad magic");
+        throw std::runtime_error("Bad magic in decomposed model file");
+    }
     uint32_t num_layers;
     f.read(reinterpret_cast<char*>(&num_layers), 4);
     std::vector<LayerData> layers(num_layers);
@@ -225,7 +255,7 @@ static std::vector<BlockTerm> parse_block_terms(const uint8_t* data, size_t data
             int offset = row * row_stride + b * (codes_per_block + (int)sizeof(float));
             if (offset + codes_per_block + (int)sizeof(float) > (int)data_len) {
                 Logger::error("Block data truncated at row {} block {}", row, b);
-                exit(1);
+                throw std::runtime_error("ALS block data truncated in model file");
             }
             blocks[block_idx].packed.assign(
                 data + offset, data + offset + codes_per_block);
@@ -299,20 +329,29 @@ static void parse_layer_type_data(LayerData& ld, uint8_t layer_type,
         // ─── Multi-term block container ─────────────────────────────────
         // data = [num_terms:u32][term0_len:u32][term0_data]...[termN_len:u32][termN_data]
         uint32_t num_terms;
-        if (data.size() < 4) { Logger::error("ALS multi-term: bad header"); exit(1); }
+        if (data.size() < 4) {
+            Logger::error("ALS multi-term: bad header");
+            throw std::runtime_error("ALS multi-term: bad header in model file");
+        }
         std::memcpy(&num_terms, data.data(), 4);
         if (num_terms == 0 || num_terms > 32) {
             Logger::error("ALS multi-term: invalid num_terms={}", num_terms);
-            exit(1);
+            throw std::runtime_error("ALS multi-term: invalid num_terms in model file");
         }
         ld.block_terms.resize(num_terms);
         size_t pos = 4;
         for (uint32_t t = 0; t < num_terms; t++) {
-            if (pos + 4 > data.size()) { Logger::error("ALS multi-term: truncated term len"); exit(1); }
+            if (pos + 4 > data.size()) {
+                Logger::error("ALS multi-term: truncated term len");
+                throw std::runtime_error("ALS multi-term: truncated term length in model file");
+            }
             uint32_t tlen;
             std::memcpy(&tlen, data.data() + pos, 4);
             pos += 4;
-            if (pos + tlen > data.size()) { Logger::error("ALS multi-term: truncated term data"); exit(1); }
+            if (pos + tlen > data.size()) {
+                Logger::error("ALS multi-term: truncated term data");
+                throw std::runtime_error("ALS multi-term: truncated term data in model file");
+            }
             ld.block_terms[t] = parse_block_terms(data.data() + pos, tlen,
                                                   ld.out_features, ld.in_features, qk);
             pos += tlen;
@@ -349,12 +388,12 @@ static int sniff_als_layout(const std::ifstream& f, uint32_t x) {
 
 inline std::vector<LayerData> load_decomposed_layers_als(const std::string& path) {
     std::ifstream f(path, std::ios::binary);
-    if (!f) { Logger::error("Cannot open: {}", path); exit(1); }
+    if (!f) { Logger::error("Cannot open: {}", path); throw std::runtime_error("Cannot open model file: " + path); }
     uint32_t magic;
     f.read(reinterpret_cast<char*>(&magic), 4);
     if (magic != 0xDEADBEEF) {
         Logger::error("Bad magic: 0x{:x}", magic);
-        exit(1);
+        throw std::runtime_error("Bad magic in ALS model file");
     }
     uint32_t num_layers;
     f.read(reinterpret_cast<char*>(&num_layers), 4);
@@ -417,7 +456,7 @@ inline std::vector<LayerData> load_decomposed_layers_als(const std::string& path
         uint8_t layer_type = (uint8_t)(x & 0xFF);
         if (layer_type > 2) {
             Logger::error("ALS layer {}: bad layer_type {}", ld.name, (int)layer_type);
-            exit(1);
+            throw std::runtime_error("ALS layer: bad layer_type in model file");
         }
         uint32_t data_len = (x >> 8) & 0x00FFFFFF;
         uint8_t len_hi;
@@ -444,12 +483,12 @@ inline std::vector<LayerData> load_decomposed_layers_als(const std::string& path
 // block-scaled ternary so all existing block kernels work transparently.
 inline std::vector<LayerData> load_decomposed_layers_tq1(const std::string& path) {
     std::ifstream f(path, std::ios::binary);
-    if (!f) { Logger::error("Cannot open: {}", path); exit(1); }
+    if (!f) { Logger::error("Cannot open: {}", path); throw std::runtime_error("Cannot open model file: " + path); }
     uint32_t magic;
     f.read(reinterpret_cast<char*>(&magic), 4);
     if (magic != 0x5F315154) {  // "TQ1_"
         Logger::error("Bad magic (expected TQ1_): 0x{:x}", magic);
-        exit(1);
+        throw std::runtime_error("Bad magic in TQ1 model file");
     }
     uint32_t num_layers;
     f.read(reinterpret_cast<char*>(&num_layers), 4);
@@ -626,7 +665,7 @@ inline LoadedModel load_model_from(const std::string& model_path_or_dir) {
                               m.layer_norms, m.final_norm, m.layers,
                               &m.tokenizer)) {
             Logger::error("GGUF load failed");
-            exit(1);
+            throw std::runtime_error("GGUF load failed: " + gguf_path);
         }
     } else {
         // ── Legacy .bin path ─────────────────────────────────────────────
@@ -636,7 +675,7 @@ inline LoadedModel load_model_from(const std::string& model_path_or_dir) {
         struct stat st_extra;
         if (stat(extra_path.c_str(), &st_extra) != 0) {
             Logger::error("No model files found in {}", model_path_or_dir);
-            exit(1);
+            throw std::runtime_error("No model files found in " + model_path_or_dir);
         }
 
         m.cfg = load_config(extra_path);
@@ -646,7 +685,7 @@ inline LoadedModel load_model_from(const std::string& model_path_or_dir) {
 
         if (stat(als_path.c_str(), &st_extra) != 0) {
             Logger::error("No ALS weights (model_decomposed.bin) in {}", model_path_or_dir);
-            exit(1);
+            throw std::runtime_error("No ALS weights (model_decomposed.bin) in " + model_path_or_dir);
         }
         m.layers = load_decomposed_layers_als(als_path);  // ALS (old/new layout)
 
@@ -867,7 +906,7 @@ inline void save_mote_model(const std::string& path,
                              const MoTEConfig& config,
                              const std::vector<MoTELayerData>& mote_layers) {
     std::ofstream f(path, std::ios::binary);
-    if (!f) { Logger::error("Cannot write: {}", path); exit(1); }
+    if (!f) { Logger::error("Cannot write: {}", path); throw std::runtime_error("Cannot write " + path); }
 
     uint32_t magic = MOTE_MAGIC;
     f.write((const char*)&magic, 4);
@@ -922,13 +961,13 @@ inline void save_mote_model(const std::string& path,
 // ─── Peek MoTE config from file ────────────────────────────────────────────
 inline MoTEConfig peek_mote_config(const std::string& path) {
     std::ifstream f(path, std::ios::binary);
-    if (!f) { Logger::error("Cannot open: {}", path); exit(1); }
+    if (!f) { Logger::error("Cannot open: {}", path); throw std::runtime_error("Cannot open " + path); }
 
     uint32_t magic;
     f.read((char*)&magic, 4);
     if (magic != MOTE_MAGIC) {
         Logger::error("Bad MoTE magic: 0x{:x}", magic);
-        exit(1);
+        throw std::runtime_error("Bad MoTE magic in model file");
     }
 
     uint32_t cfg_len;
@@ -966,7 +1005,7 @@ inline MoTEConfig peek_mote_config(const std::string& path) {
 // ─── Load MoTE layers from file ────────────────────────────────────────────
 inline std::vector<MoTELayerData> load_mote_layers(const std::string& path) {
     std::ifstream f(path, std::ios::binary);
-    if (!f) { Logger::error("Cannot open: {}", path); exit(1); }
+    if (!f) { Logger::error("Cannot open: {}", path); throw std::runtime_error("Cannot open " + path); }
 
     f.seekg(0, std::ios::end);
     size_t file_size = (size_t)f.tellg();
@@ -982,7 +1021,7 @@ inline std::vector<MoTELayerData> load_mote_layers(const std::string& path) {
     uint32_t magic = rd32();
     if (magic != MOTE_MAGIC) {
         Logger::error("Bad MoTE magic: 0x{:x}", magic);
-        exit(1);
+        throw std::runtime_error("Bad MoTE magic in model file");
     }
 
     uint32_t cfg_len = rd32();
