@@ -75,35 +75,63 @@ jobs:
           sudo apt-get install -y -qq build-essential cmake g++ libomp-dev
 
       - name: Install deps (macOS)
-        if: runner.os == 'macOS'
+        if: runner.os == 'MacOS'
         run: |
           brew install cmake libomp
 
-      - name: Install deps (Windows)
-        if: runner.os == 'Windows'
+      - name: Install Rust (tokenizer .so)
         run: |
-          choco install cmake --installargs 'ADD_CMAKE_TO_PATH=System' -y
+          if ! command -v cargo &>/dev/null; then
+            curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal
+            source "$HOME/.cargo/env"
+          fi
+          rustc --version && cargo --version
+
+      - name: Build GigaToken tokenizer (.so)
+        run: |
+          source "$HOME/.cargo/env"
+          (cd third_party/gigatoken-capi && cargo build --release -p gigatoken-capi)
 
       - name: Configure
         run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
 
       - name: Build
-        run: cmake --build build -j$(nproc) --target terllama
+        run: cmake --build build -j$(nproc)
 
-      - name: Rename binary
+      - name: Assemble release bundle
         shell: bash
         run: |
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            cp build/terllama.exe terllama-${{ matrix.target }}.exe
-          else
-            cp build/terllama terllama-${{ matrix.target }}
-          fi
+          set -euo pipefail
+          VER="${{ github.ref_name }}"
+          BUNDLE="terllama-${VER}-${{ matrix.target }}"
+          mkdir -p "$BUNDLE/bin" "$BUNDLE/share/terllama/web"
+          for t in terllama terllama-bench terllama-worker terllama-cluster terllama-node; do
+            if [ -f "build/$t" ]; then
+              cp "build/$t" "$BUNDLE/bin/"
+            fi
+          done
+          cp build/libgigatoken_rs.so "$BUNDLE/bin/"
+          cp web/index.html web/network.js web/anime.min.js "$BUNDLE/share/terllama/web/"
+          cp install.sh uninstall.sh "$BUNDLE/"
+          tar -czf "terllama-${VER}-${{ matrix.target }}.tar.gz" "$BUNDLE"
+          ls -la *.tar.gz
 
       - name: Upload
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: terllama-${{ matrix.target }}
-          path: terllama-${{ matrix.target }}*
+          path: '*.tar.gz'
+
+      - name: Upload web assets & installers
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: terllama-web-${{ matrix.target }}
+          path: |
+            install.sh
+            uninstall.sh
+            web/index.html
+            web/network.js
+            web/anime.min.js
 
   publish:
     name: Publish Release

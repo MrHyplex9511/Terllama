@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Terllama — Uninstaller
-# Removes CLI binary, data directory, and optionally the Desktop app
+# Terllama — Uninstaller for the full runtime bundle
+# Removes the CLI binaries, tokenizer .so, web UI and (optionally) data.
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -11,42 +11,31 @@ NC='\033[0m'
 
 echo -e "${YELLOW}━━━ Terllama Uninstall ━━━${NC}"
 
-# ─── CLI binary ──────────────────────────────────────────────
-CLI_BIN="/usr/local/bin/terllama"
-if [ -f "$CLI_BIN" ]; then
-    if [ -w "$(dirname "$CLI_BIN")" ]; then
-        rm "$CLI_BIN"
-    else
-        sudo rm "$CLI_BIN"
+# ─── Installed bin dir (matches install.sh defaults) ───────────────────
+HOME_BIN="${INSTALL_DIR:-$HOME/.local/bin}"
+PREFIX="${PREFIX:-$(dirname "$HOME_BIN")}"
+
+for f in terllama terllama-bench terllama-worker terllama-cluster terllama-node \
+         libgigatoken_rs.so; do
+    if [ -e "$HOME_BIN/$f" ]; then
+        rm -f "$HOME_BIN/$f"
+        echo -e "  ${GREEN}✓${NC} Removed $HOME_BIN/$f"
     fi
-    echo -e "  ${GREEN}✓${NC} Removed CLI binary: $CLI_BIN"
-else
-    echo -e "  ${YELLOW}−${NC} CLI binary not found at $CLI_BIN"
+done
+
+if [ -d "$PREFIX/share/terllama" ]; then
+    rm -rf "$PREFIX/share/terllama"
+    echo -e "  ${GREEN}✓${NC} Removed web UI ($PREFIX/share/terllama)"
 fi
 
-# ─── Desktop app (APT) ───────────────────────────────────────
-if dpkg -s terllama-desktop &>/dev/null 2>&1; then
-    echo ""
-    echo -e "  Desktop app (deb) detected. Remove? [y/N] "
-    read -r resp
-    if [[ "$resp" =~ ^[Yy]$ ]]; then
-        sudo apt remove -y terllama-desktop
-        echo -e "  ${GREEN}✓${NC} Removed desktop app"
-    fi
+# ─── Legacy: old single-binary install ───────────────────────────────
+if [ -f /usr/local/bin/terllama ]; then
+    if [ -w /usr/local/bin ]; then rm -f /usr/local/bin/terllama
+    else sudo rm -f /usr/local/bin/terllama; fi
+    echo -e "  ${GREEN}✓${NC} Removed legacy /usr/local/bin/terllama"
 fi
 
-# ─── Desktop app (RPM) ───────────────────────────────────────
-if rpm -q terllama-desktop &>/dev/null 2>&1; then
-    echo ""
-    echo -e "  Desktop app (rpm) detected. Remove? [y/N] "
-    read -r resp
-    if [[ "$resp" =~ ^[Yy]$ ]]; then
-        sudo rpm -e terllama-desktop
-        echo -e "  ${GREEN}✓${NC} Removed desktop app"
-    fi
-fi
-
-# ─── Data directory ──────────────────────────────────────────
+# ─── Data directory ──────────────────────────────────────────────────
 DATA_DIR="${HOME}/.terllama"
 if [ -d "$DATA_DIR" ]; then
     echo ""

@@ -348,7 +348,36 @@ int server_main(int argc, char** argv) {
         if (std::string(argv[i]) == "--node") { run_node = true; break; }
     }
 
+    // Resolve the web UI directory. Dev layout: <model_dir>/web (repo root,
+    // run from the source tree). Installed layout: share dir relative to the
+    // executable — prefer the install path over a model dir that happens to
+    // sit under a path we can't serve.
     std::string web_dir = model_dir + "/web";
+    {
+        std::ifstream in_repo(web_dir + "/index.html");
+        if (!in_repo.good()) {
+            // Binary lives in <prefix>/bin → <prefix>/share/terllama/web
+            // or the flat layout <exe_dir>/share/web.
+            char exe_buf[4096];
+            ssize_t exe_len = readlink("/proc/self/exe", exe_buf, sizeof(exe_buf) - 1);
+            std::string exe_dir;
+            if (exe_len > 0) {
+                exe_buf[exe_len] = '\0';
+                std::string self(exe_buf);
+                auto p = self.rfind('/');
+                if (p != std::string::npos) exe_dir = self.substr(0, p);
+            }
+            std::vector<std::string> candidates;
+            if (!exe_dir.empty()) {
+                candidates.push_back(exe_dir + "/../share/terllama/web");
+                candidates.push_back(exe_dir + "/share/web");
+            }
+            for (const auto& c : candidates) {
+                std::ifstream in(c + "/index.html");
+                if (in.good()) { web_dir = c; break; }
+            }
+        }
+    }
 
     // ─── Init model ─────────────────────────────────────────────────────
     Logger::info("Initializing Terllama server...");
