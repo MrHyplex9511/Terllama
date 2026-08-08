@@ -213,6 +213,82 @@ if(BUILD_BENCHMARK)
     endif()
 endif()
 
+# ─── Distributed inference (terllama-worker + terllama-cluster) ──────────
+# Native layer-sharding across multiple devices. Two standalone binaries that
+# do NOT touch the single-device terllama binary; builds are fully additive.
+option(BUILD_DISTRIBUTED "Build distributed inference binaries" ON)
+
+if(BUILD_DISTRIBUTED)
+    # Lean core for the distributed binaries: the full terllama_core object
+    # library embeds main.cpp / the API server, which would collide here.
+    add_library(terllama_dist_core OBJECT
+        src/core/inference.cpp
+        src/core/logger.cpp
+        src/core/tokenizer.cpp
+        src/core/gigatoken_wrapper.cpp
+        src/gguf_loader.cpp
+    )
+    target_include_directories(terllama_dist_core PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${THIRD_PARTY_DIR}
+    )
+    target_compile_options(terllama_dist_core PRIVATE -O3)
+    target_link_libraries(terllama_dist_core PRIVATE pthread dl)
+
+    # Shared kernel objects (same set as the main binary, minus NEON on x86).
+    set(TERLLAMA_DIST_KERNELS
+        $<TARGET_OBJECTS:terllama_kernel_scalar>
+        $<TARGET_OBJECTS:terllama_kernel_avx2>
+        $<TARGET_OBJECTS:terllama_kernel_mote>
+        $<TARGET_OBJECTS:terllama_dispatcher>
+    )
+    if(ARCH_ARM64)
+        list(APPEND TERLLAMA_DIST_KERNELS $<TARGET_OBJECTS:terllama_kernel_neon>)
+    endif()
+
+    function(terllama_link_dist tgt)
+        target_include_directories(${tgt} PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${THIRD_PARTY_DIR}
+        )
+        target_link_libraries(${tgt} PRIVATE pthread dl)
+        if(OpenMP_CXX_FOUND)
+            target_link_libraries(${tgt} PRIVATE OpenMP::OpenMP_CXX)
+        endif()
+        if(TERLLAMA_EXE_LINK_FLAGS)
+            target_link_options(${tgt} PRIVATE ${TERLLAMA_EXE_LINK_FLAGS})
+        endif()
+    endfunction()
+
+    add_executable(terllama-worker
+        distributed/worker_main.cpp
+        distributed/worker.cpp
+        $<TARGET_OBJECTS:terllama_dist_core>
+        ${TERLLAMA_DIST_KERNELS}
+    )
+    terllama_link_dist(terllama-worker)
+
+    add_executable(terllama-cluster
+        distributed/coordinator_main.cpp
+        distributed/coordinator.cpp
+        distributed/partitioner.cpp
+        $<TARGET_OBJECTS:terllama_dist_core>
+        ${TERLLAMA_DIST_KERNELS}
+    )
+    terllama_link_dist(terllama-cluster)
+
+    # Copy GigaToken .so next to terllama-cluster (coordinator dlopens it)
+    if(EXISTS ${GIGATOKEN_LIB})
+        add_custom_command(TARGET terllama-cluster POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${GIGATOKEN_LIB} ${CMAKE_BINARY_DIR}/libgigatoken_rs.so
+            COMMENT "Copying libgigatoken_rs.so → ${CMAKE_BINARY_DIR}/"
+        )
+    endif()
+
+    install(TARGETS terllama-worker terllama-cluster RUNTIME DESTINATION bin)
+endif()
+
 # ─── Tests ────────────────────────────────────────────────────────────────
 if(BUILD_TESTING)
     enable_testing()

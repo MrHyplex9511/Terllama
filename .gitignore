@@ -38,6 +38,9 @@ venv/
 # OpenCode agent config
 .opencode/
 
+# Reference repos (exo study copy)
+exo-reference/
+
 # Generated docs (specific excludes, not whole dir)
 docs/*.json
 docs/*.html
@@ -50,6 +53,7 @@ build-clang/
 build-noomp/
 libgigatoken_rs.so
 third_party/gigatoken/
+third_party/gigatoken-capi/target/
 .test-tmp/
 .trackB/
 
