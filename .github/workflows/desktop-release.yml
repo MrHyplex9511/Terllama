@@ -101,7 +101,9 @@ jobs:
           PYO3_PYTHON="$(brew --prefix python@3.12)/bin/python3.12" \
           cargo +nightly build --release -p gigatoken \
             --manifest-path third_party/gigatoken/Cargo.toml
-          cp third_party/gigatoken/target/release/libgigatoken_rs.so \
+          # macOS cdylibs are .dylib; dlopen loads Mach-O by magic, not
+          # extension, so keep the bundled name the engine expects (.so).
+          cp third_party/gigatoken/target/release/libgigatoken_rs.dylib \
              terllama-desktop/src-tauri/resources/bin/libgigatoken_rs.so
 
       - name: Build
