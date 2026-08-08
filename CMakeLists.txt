@@ -277,11 +277,18 @@ if(BUILD_DISTRIBUTED)
     )
     terllama_link_dist(terllama-cluster)
 
-    # Copy GigaToken .so next to terllama-cluster (coordinator dlopens it)
-    if(EXISTS ${GIGATOKEN_LIB})
+    # Copy GigaToken .so next to terllama-cluster (coordinator dlopens it).
+    # Prefer the Python-free C ABI crate (gigatoken-capi); fall back to the
+    # legacy pyo3 build. Same filename either way (gt_* C ABI).
+    if(EXISTS ${THIRD_PARTY_DIR}/gigatoken-capi/target/release/libgigatoken_rs.so)
+        set(GIGATOKEN_DIST_SO ${THIRD_PARTY_DIR}/gigatoken-capi/target/release/libgigatoken_rs.so)
+    elseif(EXISTS ${GIGATOKEN_LIB})
+        set(GIGATOKEN_DIST_SO ${GIGATOKEN_LIB})
+    endif()
+    if(GIGATOKEN_DIST_SO)
         add_custom_command(TARGET terllama-cluster POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                ${GIGATOKEN_LIB} ${CMAKE_BINARY_DIR}/libgigatoken_rs.so
+                ${GIGATOKEN_DIST_SO} ${CMAKE_BINARY_DIR}/libgigatoken_rs.so
             COMMENT "Copying libgigatoken_rs.so → ${CMAKE_BINARY_DIR}/"
         )
     endif()
