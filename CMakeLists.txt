@@ -298,6 +298,16 @@ if(BUILD_DISTRIBUTED)
     endif()
 
     install(TARGETS terllama-worker terllama-cluster RUNTIME DESTINATION bin)
+
+    # terllama-node: LAN node daemon (UDP discovery + HTTP management + spawns
+    # workers/cluster). Lean — needs only the logger, not the inference core.
+    add_executable(terllama-node
+        distributed/node_main.cpp
+        distributed/node.cpp
+        src/core/logger.cpp
+    )
+    terllama_link_dist(terllama-node)
+    install(TARGETS terllama-node RUNTIME DESTINATION bin)
 endif()
 
 # ─── Tests ────────────────────────────────────────────────────────────────
