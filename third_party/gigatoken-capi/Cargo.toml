@@ -1,0 +1,60 @@
+# Python-free C API build of GigaToken.
+#
+# The vendored gigatoken crate (third_party/gigatoken, a gitignored nested
+# repo) is a pyo3 extension module: its cdylib hard-links libpython3.12 and
+# exports only PyInit_gigatoken_rs. The engine needs a C ABI (gt_*) with NO
+# Python runtime dependency.
+#
+# This crate reuses the pure-Rust tokenizer sources via #[path] includes in
+# src/lib.rs, builds a cdylib named gigatoken_rs that exports only the gt_*
+# symbols, and links nothing Python-related.
+[package]
+name = "gigatoken-capi"
+version = "0.10.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[lib]
+name = "gigatoken_rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+# Mirror the vendored crate's pure-Rust deps (no pyo3, no numpy).
+dashmap = "6.1"
+itertools = "0.15"
+priority-queue = "2.0"
+rayon = "1.11"
+rustc-hash = "2.1"
+memmap2 = { version = "0.9", features = ["stable_deref_trait"] }
+base64 = "0.22"
+icu = { version = "2.2", features = ["compiled_data", "datagen"] }
+eyre = "0.6.12"
+sonic-rs = "0.5.8"
+memchr = "2.8.0"
+aho-corasick = "1.1"
+serde = { version = "1.0.228", features = ["derive"] }
+flate2 = "1.1"
+zstd = "0.13"
+spm_precompiled = "0.1.4"
+simdutf = "0.7.0"
+winnow = { version = "1", features = ["simd"] }
+parquet = { version = "59.1.0", default-features = false, features = [
+    "arrow",
+    "snap",
+    "zstd",
+    "flate2",
+    "lz4",
+    "brotli",
+    "flate2-rust_backend",
+] }
+arrow-array = "59"
+arrow-schema = "59"
+ureq = { version = "3.3.0", default-features = false, features = ["rustls"] }
+indicatif = "0.18"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[profile.release]
+lto = "fat"

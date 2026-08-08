@@ -1,0 +1,56 @@
+diff --git a/src/load_tokenizer/hf.rs b/src/load_tokenizer/hf.rs
+index a15be80..9aab157 100644
+--- a/src/load_tokenizer/hf.rs
++++ b/src/load_tokenizer/hf.rs
+@@ -73,6 +73,8 @@ struct PreTokenizerJson {
+     #[serde(default)]
+     add_prefix_space: Option<bool>,
+     #[serde(default)]
++    use_regex: Option<bool>,
++    #[serde(default)]
+     split: Option<bool>,
+     /// `Split` field (e.g. "MergedWithPrevious" for the gemma-3/4 no-op
+     /// space Split).
+@@ -597,9 +599,13 @@ fn detect_nfc_normalizer(normalizer: &Option<NormalizerJson>) -> Result<bool> {
+ 
+ /// Determine the pretokenization scheme from a tokenizer.json `pre_tokenizer`.
+ ///
+-/// Handles a bare `ByteLevel` (GPT-2 style, `use_regex: true`) and
+-/// `Sequence`s whose `Split` regexes (in order) form a known scheme —
+-/// either a single known regex or DeepSeek's digits/CJK/main triple.
++/// Handles a bare `ByteLevel` (GPT-2 style, `use_regex: true`), `Sequence`s
++/// whose `Split` regexes (in order) form a known scheme — either a single
++/// known regex or DeepSeek's digits/CJK/main triple — and `Sequence`s that
++/// contain a `ByteLevel` with `use_regex` unset or true (SmolLM2's
++/// `[Digits, ByteLevel]`): the ByteLevel applies the GPT-2 regex, and a
++/// `Digits` pre-split is a no-op for byte-level vocabs without multi-digit
++/// merges.
+ fn detect_pretokenizer_type(
+     pre_tokenizer: &Option<PreTokenizerJson>,
+ ) -> Result<crate::pretokenize::PretokenizerType> {
+@@ -616,6 +622,16 @@ fn detect_pretokenizer_type(
+         }
+     }
+ 
++    // A ByteLevel pretokenizer with use_regex unset or true splits with the
++    // GPT-2 regex; it may sit alone or inside a Sequence (e.g. SmolLM2's
++    // `[Digits, ByteLevel]`).
++    fn contains_regex_bytelevel(pt: &PreTokenizerJson) -> bool {
++        if pt.kind == "ByteLevel" && pt.use_regex != Some(false) {
++            return true;
++        }
++        pt.pretokenizers.iter().any(contains_regex_bytelevel)
++    }
++
+     let Some(pt) = pre_tokenizer else {
+         // No pre_tokenizer at all; keep the historical default.
+         return Ok(PretokenizerType::GPT2);
+@@ -624,7 +640,7 @@ fn detect_pretokenizer_type(
+     collect_split_regexes(pt, &mut regexes);
+     if regexes.is_empty() {
+         // ByteLevel with use_regex (the default) splits with the GPT-2 regex.
+-        if pt.kind == "ByteLevel" {
++        if contains_regex_bytelevel(pt) {
+             return Ok(PretokenizerType::GPT2);
+         }
+         return Err(eyre::eyre!(
