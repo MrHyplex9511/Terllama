@@ -340,14 +340,19 @@ bool Coordinator::start() {
     try {
         const size_t n = workers_.size();
 
-        // 1. Health-check every worker and collect RAM.
+        // 1. Health-check every worker; collect RAM + any pre-loaded shard.
         std::vector<int64_t> rams(n, 0);
+        std::vector<tldist::ShardSpec> pre(n);
+        bool all_preloaded = true;
         for (size_t i = 0; i < n; i++) {
             tldist::HealthInfo h = get_health(i);
             if (!h.ok)
                 throw std::runtime_error("worker " + std::to_string(i) +
                                          " unhealthy: " + h.error);
             rams[i] = h.ram_available_bytes;
+            pre[i] = h.shard;
+            if (!h.model_loaded || h.shard.end_layer <= h.shard.start_layer)
+                all_preloaded = false;
         }
         // Fallback: local model-size estimate when a worker reports no RAM.
         const int64_t local_model_size = estimate_model_size_bytes(model_path_);
@@ -365,16 +370,41 @@ bool Coordinator::start() {
             cfg_ = load_model_from(model_path_).cfg;
         }
 
-        // 3. Partition layers across workers.
-        std::vector<tldist::ShardSpec> shards = tldist::compute_shards(
-            cfg_.num_hidden_layers, (int)n, rams, local_model_size);
+        // 3. Partition layers across workers. When every worker already loaded
+        // a shard (e.g. spawned pre-sharded by the terllama-node daemon, which
+        // partitioned by ADVERTISED RAM), adopt that plan verbatim — do NOT
+        // recompute from live RAM, which double-loads weights and can abort
+        // once the machine's real free memory is low. Standalone usage (bare
+        // workers, no --shard) falls back to computing + assigning shards.
+        std::vector<tldist::ShardSpec> shards;
+        bool valid_plan = all_preloaded;
+        if (valid_plan) {
+            int expect = 0;
+            for (size_t i = 0; i < n; i++) {
+                if (pre[i].start_layer != expect) { valid_plan = false; break; }
+                expect = pre[i].end_layer;
+            }
+            if (expect != cfg_.num_hidden_layers) valid_plan = false;
+        }
+        if (valid_plan) {
+            shards = pre;
+            Logger::info("terllama-cluster: adopting {} pre-loaded shards (node-daemon plan)",
+                         n);
+        } else {
+            shards = tldist::compute_shards(
+                cfg_.num_hidden_layers, (int)n, rams, local_model_size);
+        }
 
-        // 4. Tell each worker which shard to load.
+        // 4. Assign shards to workers. Pre-loaded ones keep their slice (skip
+        //    the redundant POST /load — re-loading 500MB+ is wasteful); only
+        //    the standalone path pushes a load request.
         for (size_t i = 0; i < n; i++) {
-            tldist::LoadRequest lr;
-            lr.model_path = model_path_;
-            lr.shard = shards[i];
-            post_load(i, lr);
+            if (!valid_plan) {
+                tldist::LoadRequest lr;
+                lr.model_path = model_path_;
+                lr.shard = shards[i];
+                post_load(i, lr);
+            }
             workers_[i].shard = shards[i];
         }
 

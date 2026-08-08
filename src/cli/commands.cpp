@@ -354,8 +354,10 @@ int cmd_list() {
 int cmd_show(const std::string& model_id) {
     std::string model_dir;
     const char* env_dir = std::getenv("TERLLAMA_MODEL_DIR");
-    if (env_dir) {
-        model_dir = std::string(env_dir);
+    if (env_dir && *env_dir) {
+        // TERLLAMA_MODEL_DIR is the models root (same convention as the
+        // distributed node): resolve <root>/<model_id>.
+        model_dir = std::string(env_dir) + "/" + model_id;
     } else {
         model_dir = model_path_for_id(model_id);
         if (model_dir.empty()) {
