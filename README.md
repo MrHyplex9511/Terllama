@@ -62,6 +62,40 @@ curl -X POST http://localhost:8375/v1/chat/completions \
 | 🐳 **Docker support** | Single-command containerized deployment |
 | 📊 **Built-in benchmark** | Per-kernel correctness validation + speed measurement |
 | ⚡ **GigaToken tokenizer** | In-process Rust tokenizer via dlopen — ~1000× faster than Python subprocess |
+| 🌍 **Distributed inference** | Native layer-sharding across devices — `terllama-worker` + `terllama-cluster` (see below) |
+
+## 🚀 Distributed Inference (Experimental)
+
+Run a ternary model across multiple devices via native **layer-sharding**: each
+`terllama-worker` owns a contiguous half-open layer range `[start, end)`, and a
+`terllama-cluster` coordinator pipelines hidden states between them and serves
+an OpenAI-compatible API. Workers run the exact same `transformer_block` chain
+as single-device inference, so a correct cluster is **bit-identical** to
+`terllama serve` with the same sampling.
+
+**Quick start (2 local nodes, one model dir):**
+
+```bash
+# Node 0: first 15 of 30 layers
+build-release/terllama-worker --listen 127.0.0.1:9100 \
+    --model ~/.terllama/models/terllama-convert-test --shard 0,15 &
+
+# Node 1: last 15 layers (owns final_norm + lm_head)
+build-release/terllama-worker --listen 127.0.0.1:9101 \
+    --model ~/.terllama/models/terllama-convert-test --shard 15,30 &
+
+# Coordinator (OpenAI API on :8375)
+build-release/terllama-cluster --workers 127.0.0.1:9100,127.0.0.1:9101 \
+    --model ~/.terllama/models/terllama-convert-test --port 8375
+```
+
+Shards are allocated **proportionally to each worker's available RAM**
+(largest-remainder). Both binaries are built by default (`BUILD_DISTRIBUTED=ON`)
+and do not touch the single-device `terllama` binary.
+
+See [`distributed/README.md`](distributed/README.md) for full documentation:
+CLI flags, wire format, API surface, and known v1 limitations (explicit worker
+list, no weight streaming, workers need local model files, plaintext HTTP).
 
 ## Quality-vs-Size (Mistral-7B)
 
