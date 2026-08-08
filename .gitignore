@@ -53,10 +53,11 @@ build-clang/
 build-noomp/
 dist/
 libgigatoken_rs.so
-third_party/gigatoken/
+third_party/gigatoken/target/
 third_party/gigatoken-capi/target/
 .test-tmp/
 .trackB/
 
 # Logs
 *.log
+third_party/gigatoken/uv.lock
