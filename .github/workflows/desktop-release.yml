@@ -28,10 +28,26 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
 
+      # GigaToken is a gitignored nested repo (not a submodule), so the CI
+      # checkout does not contain it — clone the pinned revision explicitly.
+      - name: Fetch GigaToken (pinned)
+        run: |
+          git clone --quiet https://github.com/marcelroed/gigatoken.git third_party/gigatoken
+          git -C third_party/gigatoken checkout --quiet 34a1599
+          # Its Cargo.toml uses per-profile rustflags, which current nightly
+          # cargo requires an explicit cargo-features opt-in for. Portable
+          # first-line insert (BSD sed on macOS cannot do GNU `sed -i 1i`).
+          { printf 'cargo-features = ["profile-rustflags"]\n'; cat third_party/gigatoken/Cargo.toml; } \
+            > third_party/gigatoken/Cargo.toml.patched
+          mv third_party/gigatoken/Cargo.toml.patched third_party/gigatoken/Cargo.toml
+          head -3 third_party/gigatoken/Cargo.toml
+
       - name: Install deps (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
+          # GigaToken embeds CPython (pyo3 abi3-py310) — the link needs the
+          # unversioned libpython3.12.so, provided by the -dev package.
           sudo apt-get install -y \
             libwebkit2gtk-4.1-dev \
             libayatana-appindicator3-dev \
@@ -41,15 +57,18 @@ jobs:
             libssl-dev \
             rpm \
             cmake \
-            libcurl4-openssl-dev
+            libcurl4-openssl-dev \
+            libpython3.12-dev
 
       - name: Install deps (macOS)
         if: runner.os == 'macOS'
         run: |
-          brew install cmake libomp
+          brew install cmake libomp python@3.12
 
       # The C++ engine is Unix-only (Linux + macOS). Build it and place it
-      # where the Tauri bundle will pick it up as a resource.
+      # where the Tauri bundle will pick it up as a resource. The GigaToken
+      # tokenizer is a Rust cdylib — build it too, since tauri.conf.json
+      # bundles resources/bin/libgigatoken_rs.so.
       - name: Build engine (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -58,6 +77,13 @@ jobs:
           cmake --build build-release -j2 --target terllama
           mkdir -p terllama-desktop/src-tauri/resources/bin
           cp build-release/terllama terllama-desktop/src-tauri/resources/bin/terllama
+          # GigaToken uses #![feature(portable_simd)] — needs nightly cargo.
+          rustup toolchain install nightly --profile minimal
+          PYO3_PYTHON=$(command -v python3.12) \
+          cargo +nightly build --release -p gigatoken \
+            --manifest-path third_party/gigatoken/Cargo.toml
+          cp third_party/gigatoken/target/release/libgigatoken_rs.so \
+             terllama-desktop/src-tauri/resources/bin/libgigatoken_rs.so
 
       - name: Build engine (macOS)
         if: runner.os == 'macOS'
@@ -70,6 +96,13 @@ jobs:
           cmake --build build-release -j2 --target terllama
           mkdir -p terllama-desktop/src-tauri/resources/bin
           cp build-release/terllama terllama-desktop/src-tauri/resources/bin/terllama
+          # GigaToken uses #![feature(portable_simd)] — needs nightly cargo.
+          rustup toolchain install nightly --profile minimal
+          PYO3_PYTHON="$(brew --prefix python@3.12)/bin/python3.12" \
+          cargo +nightly build --release -p gigatoken \
+            --manifest-path third_party/gigatoken/Cargo.toml
+          cp third_party/gigatoken/target/release/libgigatoken_rs.so \
+             terllama-desktop/src-tauri/resources/bin/libgigatoken_rs.so
 
       - name: Build
         run: |
