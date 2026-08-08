@@ -1,7 +1,7 @@
 // test_kernels.cpp — Catch2 tests for ternary kernel correctness
 //
 // Compares AVX2/NEON outputs against scalar reference on small matrices.
-// Tests both bitplane (combined[]) and I2_S kernel paths.
+// Tests both bitplane (combined[]) and ALS block-scaled kernel paths.
 #include "model.h"
 #include "kernel_decl.h"
 #include "catch_amalgamated.hpp"
@@ -164,38 +164,40 @@ TEST_CASE("NEON kernel matches scalar reference (small matrix)", "[kernel][neon]
 }
 #endif
 
-TEST_CASE("I2_S kernel produces NaN-free output", "[kernel][i2s]") {
-    // Build a minimal I2_S-style layer
+TEST_CASE("ALS block kernel produces NaN-free output", "[kernel][als]") {
+    // Build a minimal ALS block-scaled layer (128-element blocks, codes:
+    // {0=-1, 1=0, 2=+1} packed 4-per-byte, MSB first).
+    constexpr int in_f = 128;   // one 128-element block per row
+    constexpr int out_f = 2;
     LayerData ld;
-    ld.name = "test_i2s";
-    ld.out_features = 2;
-    ld.in_features = 128;
-    ld.has_i2s = true;
-    ld.i2s_qk = 128;
-    int n_blocks = 1;
-
-    ld.i2s_blocks.resize((size_t)ld.out_features * n_blocks);
-    for (auto& block : ld.i2s_blocks) {
-        block.packed.assign(32, 0x55);  // alternating patterns
-        block.scale = 0.5f;
-    }
-
-    // Also populate combined[] for backward-compat path
+    ld.name = "test_als";
+    ld.out_features = out_f;
+    ld.in_features = in_f;
     ld.num_terms = 1;
-    BitplaneTerm term;
-    term.alpha_exp = 0;
-    term.n_elements = (size_t)ld.out_features * ld.in_features;
-    int words_per_row = (ld.in_features + 15) / 16;
-    term.combined.assign((size_t)ld.out_features * words_per_row, 0);
-    ld.terms.push_back(std::move(term));
+    ld.has_blocks = true;
+    ld.block_qk = 128;
+    ld.terms.clear();
 
-    auto input = make_input(128);
-    std::vector<float> output(2, -999.0f);
+    // term 0: one block per output row
+    std::vector<BlockTerm> blocks(out_f);
+    for (auto& blk : blocks) {
+        blk.packed.assign(in_f / 4, 0);
+        blk.scale = 0.5f;
+        // pack alternating +1/-1 patterns: v=+1 → 2, v=-1 → 0
+        for (int j = 0; j < in_f; j++) {
+            int code = (j % 2 == 0) ? 2 : 0;
+            blk.packed[j / 4] |= (uint8_t)code << (6 - 2 * (j % 4));
+        }
+    }
+    ld.block_terms.push_back(std::move(blocks));
 
-    // Dispatch through I2_S path
-    ternary_linear_i2s(ld, input.data(), output.data(), CPUArch::X86_64_SCALAR);
+    auto input = make_input(in_f);
+    std::vector<float> output(out_f, -999.0f);
 
-    for (int i = 0; i < 2; i++) {
+    // Dispatch through the ALS block path
+    ternary_linear_blocks(ld, input.data(), output.data(), CPUArch::X86_64_SCALAR);
+
+    for (int i = 0; i < out_f; i++) {
         REQUIRE_FALSE(std::isnan(output[i]));
         REQUIRE_FALSE(std::isinf(output[i]));
     }
