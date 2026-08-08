@@ -16,6 +16,30 @@
 #include <cstring>
 #include <cstdint>
 
+// Horizontal sum of 8 int32 lanes (AVX2).
+static inline int32_t hsum_epi32(__m256i v) {
+    __m128i lo = _mm256_castsi256_si128(v);
+    __m128i hi = _mm256_extracti128_si256(v, 1);
+    lo = _mm_add_epi32(lo, hi);
+    lo = _mm_add_epi32(lo, _mm_shuffle_epi32(lo, _MM_SHUFFLE(2, 3, 0, 1)));
+    lo = _mm_add_epi32(lo, _mm_shuffle_epi32(lo, _MM_SHUFFLE(1, 0, 3, 2)));
+    return _mm_cvtsi128_si32(lo);
+}
+
+// 256-entry LUT: 8-bit mask byte -> __m256i sign mask with lane i = -1 iff
+// bit i of the byte is set. One vpshufb/load replaces the per-word scalar
+// bit-test + _mm256_set_epi32 construction.
+struct TernaryMaskTable {
+    alignas(32) __m256i m[256];
+    TernaryMaskTable() {
+        for (int v = 0; v < 256; v++) {
+            int a[8];
+            for (int b = 0; b < 8; b++) a[b] = (v & (1 << b)) ? -1 : 0;
+            m[v] = _mm256_set_epi32(a[7], a[6], a[5], a[4], a[3], a[2], a[1], a[0]);
+        }
+    }
+};
+
 // ═══════════════════════════════════════════════════════════════════════════
 // BITPLANE KERNEL - bitplane combined[] format (backward compat)
 // ═══════════════════════════════════════════════════════════════════════════
@@ -29,11 +53,18 @@ void ternary_mul_avx2(const uint32_t* const* term_data, const int* alpha_exps,
     uint32_t tail_mask = rem > 0 ? (uint32_t)((1 << rem) - 1) : 0;
     size_t stride = (size_t)words_per_row;
 
-    #pragma omp parallel for
+    // alpha_exps is constant per call: precompute 2^alpha once, multiply
+    // instead of a std::ldexp libm call per (row, term).
+    float alpha_scale[32];
+    for (int t = 0; t < n_active; t++) alpha_scale[t] = std::ldexp(1.0f, alpha_exps[t]);
+
+    // Skip OMP team creation for tiny GEMMs (fork/join cost dominates).
+    #pragma omp parallel for if((int64_t)out_f * in_f > 65536)
     for (int i = 0; i < out_f; i++) {
         __m256 vacc[32];
         for (int t = 0; t < n_active; t++) vacc[t] = _mm256_setzero_ps();
         __m256 zero = _mm256_setzero_ps();
+        static thread_local const TernaryMaskTable mask_tab;
 
         for (int w = 0; w < full_words; w++) {
             __m256 v0 = _mm256_loadu_ps(&input[w * 16 + 0]);
@@ -46,25 +77,15 @@ void ternary_mul_avx2(const uint32_t* const* term_data, const int* alpha_exps,
 
                 { uint32_t abits = (nzw & ~negw) & 0xFF;
                   uint32_t sbits = (nzw & negw) & 0xFF;
-                  int a[8], sb[8];
-                  for (int b = 0; b < 8; b++) {
-                      a[b] = (abits & (1 << b)) ? -1 : 0;
-                      sb[b] = (sbits & (1 << b)) ? -1 : 0;
-                  }
-                  __m256i addm = _mm256_set_epi32(a[7],a[6],a[5],a[4],a[3],a[2],a[1],a[0]);
-                  __m256i subm = _mm256_set_epi32(sb[7],sb[6],sb[5],sb[4],sb[3],sb[2],sb[1],sb[0]);
+                  __m256i addm = _mm256_load_si256(&mask_tab.m[abits]);
+                  __m256i subm = _mm256_load_si256(&mask_tab.m[sbits]);
                   vacc[t] = _mm256_add_ps(vacc[t], _mm256_blendv_ps(zero, v0, _mm256_castsi256_ps(addm)));
                   vacc[t] = _mm256_sub_ps(vacc[t], _mm256_blendv_ps(zero, v0, _mm256_castsi256_ps(subm)));
                 }
                 { uint32_t abits = ((nzw & ~negw) >> 8) & 0xFF;
                   uint32_t sbits = ((nzw & negw) >> 8) & 0xFF;
-                  int a[8], sb[8];
-                  for (int b = 0; b < 8; b++) {
-                      a[b] = (abits & (1 << b)) ? -1 : 0;
-                      sb[b] = (sbits & (1 << b)) ? -1 : 0;
-                  }
-                  __m256i addm = _mm256_set_epi32(a[7],a[6],a[5],a[4],a[3],a[2],a[1],a[0]);
-                  __m256i subm = _mm256_set_epi32(sb[7],sb[6],sb[5],sb[4],sb[3],sb[2],sb[1],sb[0]);
+                  __m256i addm = _mm256_load_si256(&mask_tab.m[abits]);
+                  __m256i subm = _mm256_load_si256(&mask_tab.m[sbits]);
                   vacc[t] = _mm256_add_ps(vacc[t], _mm256_blendv_ps(zero, v1, _mm256_castsi256_ps(addm)));
                   vacc[t] = _mm256_sub_ps(vacc[t], _mm256_blendv_ps(zero, v1, _mm256_castsi256_ps(subm)));
                 }
@@ -84,13 +105,8 @@ void ternary_mul_avx2(const uint32_t* const* term_data, const int* alpha_exps,
                   uint32_t cm = (1 << chbits) - 1;
                   uint32_t abits = ((nzw & ~negw) >> 0) & cm;
                   uint32_t sbits = ((nzw & negw) >> 0) & cm;
-                  int a[8]={0}, sb[8]={0};
-                  for (int b = 0; b < chbits; b++) {
-                      a[b] = (abits & (1 << b)) ? -1 : 0;
-                      sb[b] = (sbits & (1 << b)) ? -1 : 0;
-                  }
-                  __m256i addm = _mm256_set_epi32(a[7],a[6],a[5],a[4],a[3],a[2],a[1],a[0]);
-                  __m256i subm = _mm256_set_epi32(sb[7],sb[6],sb[5],sb[4],sb[3],sb[2],sb[1],sb[0]);
+                  __m256i addm = _mm256_load_si256(&mask_tab.m[abits]);
+                  __m256i subm = _mm256_load_si256(&mask_tab.m[sbits]);
                   vacc[t] = _mm256_add_ps(vacc[t], _mm256_blendv_ps(zero, v0, _mm256_castsi256_ps(addm)));
                   vacc[t] = _mm256_sub_ps(vacc[t], _mm256_blendv_ps(zero, v0, _mm256_castsi256_ps(subm)));
                 }
@@ -99,13 +115,8 @@ void ternary_mul_avx2(const uint32_t* const* term_data, const int* alpha_exps,
                     uint32_t cm = (1 << chbits) - 1;
                     uint32_t abits = ((nzw & ~negw) >> 8) & cm;
                     uint32_t sbits = ((nzw & negw) >> 8) & cm;
-                    int a[8]={0}, sb[8]={0};
-                    for (int b = 0; b < chbits; b++) {
-                        a[b] = (abits & (1 << b)) ? -1 : 0;
-                        sb[b] = (sbits & (1 << b)) ? -1 : 0;
-                    }
-                    __m256i addm = _mm256_set_epi32(a[7],a[6],a[5],a[4],a[3],a[2],a[1],a[0]);
-                    __m256i subm = _mm256_set_epi32(sb[7],sb[6],sb[5],sb[4],sb[3],sb[2],sb[1],sb[0]);
+                    __m256i addm = _mm256_load_si256(&mask_tab.m[abits]);
+                    __m256i subm = _mm256_load_si256(&mask_tab.m[sbits]);
                     vacc[t] = _mm256_add_ps(vacc[t], _mm256_blendv_ps(zero, v1, _mm256_castsi256_ps(addm)));
                     vacc[t] = _mm256_sub_ps(vacc[t], _mm256_blendv_ps(zero, v1, _mm256_castsi256_ps(subm)));
                 }
@@ -118,7 +129,7 @@ void ternary_mul_avx2(const uint32_t* const* term_data, const int* alpha_exps,
             _mm256_storeu_ps(buf, vacc[t]);
             float s = 0;
             for (int k = 0; k < 8; k++) s += buf[k];
-            result += std::ldexp(s, alpha_exps[t]);
+            result += s * alpha_scale[t];
         }
         output[i] = result;
     }
@@ -130,14 +141,48 @@ void ternary_mul_avx2(const uint32_t* const* term_data, const int* alpha_exps,
 // ═══════════════════════════════════════════════════════════════════════════
 // FP32 -> INT8 quantize, return scale.
 inline float quantize_activations_to_i8(const float* x, int n, int8_t* x_q) {
+    // Vectorized abs-max scan (8 lanes at a time).
+    __m256 vmax = _mm256_setzero_ps();
+    const __m256 sign_mask = _mm256_set1_ps(-0.0f);
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        __m256 v = _mm256_loadu_ps(&x[i]);
+        vmax = _mm256_max_ps(vmax, _mm256_andnot_ps(sign_mask, v));
+    }
     float max_val = 0.0f;
-    for (int i = 0; i < n; i++) max_val = std::max(max_val, std::abs(x[i]));
+    for (; i < n; i++) max_val = std::max(max_val, std::abs(x[i]));
+    __m128 lo = _mm256_castps256_ps128(vmax), hi = _mm256_extractf128_ps(vmax, 1);
+    lo = _mm_max_ps(lo, hi);
+    lo = _mm_max_ps(lo, _mm_shuffle_ps(lo, lo, _MM_SHUFFLE(2, 3, 0, 1)));
+    lo = _mm_max_ps(lo, _mm_shuffle_ps(lo, lo, _MM_SHUFFLE(1, 0, 3, 2)));
+    float simd_max = _mm_cvtss_f32(lo);
+    if (simd_max > max_val) max_val = simd_max;
+
     if (max_val < 1e-10f) {
         std::memset(x_q, 0, n);
         return 1.0f;
     }
     float scale = max_val / 127.0f;
-    for (int i = 0; i < n; i++) {
+
+    // Vectorized quantize. _mm256_cvttps_epi32 truncates toward zero,
+    // matching the (int) cast; clamp to [-128, 127] then pack to int8.
+    const __m256 svec = _mm256_set1_ps(scale);
+    const __m256i lo_c = _mm256_set1_epi32(-128);
+    const __m256i hi_c = _mm256_set1_epi32(127);
+    i = 0;
+    for (; i + 8 <= n; i += 8) {
+        __m256 f = _mm256_div_ps(_mm256_loadu_ps(&x[i]), svec);
+        __m256i v = _mm256_cvttps_epi32(f);
+        v = _mm256_max_epi32(v, lo_c);
+        v = _mm256_min_epi32(v, hi_c);
+        // Pack low+high 128-bit halves (both already clamped int8 values).
+        __m128i lo = _mm256_castsi256_si128(v);
+        __m128i hi = _mm256_extracti128_si256(v, 1);
+        __m128i i16 = _mm_packs_epi32(lo, hi);
+        __m128i i8v = _mm_packs_epi16(i16, i16);
+        _mm_storel_epi64((__m128i*)&x_q[i], i8v);
+    }
+    for (; i < n; i++) {
         int v = (int)(x[i] / scale);
         x_q[i] = (int8_t)std::clamp(v, -128, 127);
     }
@@ -176,8 +221,11 @@ void ternary_mul_avx2_blocks(const uint8_t* const* const* term_block_data,
 
     // FP32 activations -> INT8
     float act_scale = quantize_activations_to_i8(input, in_f, input_i8);
+    // Precompute reciprocal once; per-row divide becomes a multiply.
+    float inv_act_scale = 1.0f / act_scale;
 
-    #pragma omp parallel for
+    // Skip OMP team creation for tiny GEMMs (fork/join cost dominates).
+    #pragma omp parallel for if((int64_t)out_f * in_f > 65536)
     for (int row = 0; row < out_f; row++) {
         float sum = 0.0f;
 
@@ -195,15 +243,33 @@ void ternary_mul_avx2_blocks(const uint8_t* const* const* term_block_data,
                 // Decode codes -> int8
                 decode_block_ternary_avx2(packed, decoded_w);
 
-                // INT8 dot product
-                int32_t dot = 0;
-                for (int j = 0; j < block_size; j++) {
-                    dot += (int32_t)input_i8[block_start + j] * (int32_t)decoded_w[j];
+                // INT8 dot product via _mm256_maddubs_epi16 (4x lanes).
+                // maddubs treats operand a as UNSIGNED bytes; activations can
+                // be negative so bias them by +128 and subtract 128*sum(w).
+                // All arithmetic is exact int32, so results stay bit-identical
+                // to the scalar dot (block_size < 32 falls through to scalar).
+                const __m256i ones8  = _mm256_set1_epi8(1);
+                const __m256i ones16 = _mm256_set1_epi16(1);
+                const __m256i bias   = _mm256_set1_epi8(-128); // +128 unsigned
+                __m256i dot32 = _mm256_setzero_si256();
+                __m256i sw32  = _mm256_setzero_si256();
+                int j = 0;
+                for (; j + 32 <= block_size; j += 32) {
+                    __m256i u = _mm256_loadu_si256((const __m256i*)&input_i8[block_start + j]);
+                    u = _mm256_add_epi8(u, bias);
+                    __m256i w = _mm256_loadu_si256((const __m256i*)&decoded_w[j]);
+                    __m256i p  = _mm256_maddubs_epi16(u, w);       // (a+128)*w pairs
+                    __m256i pw = _mm256_maddubs_epi16(ones8, w);   // sum of w per pair
+                    dot32 = _mm256_add_epi32(dot32, _mm256_madd_epi16(p, ones16));
+                    sw32  = _mm256_add_epi32(sw32, _mm256_madd_epi16(pw, ones16));
                 }
+                int32_t dot = hsum_epi32(dot32) - 128 * hsum_epi32(sw32);
+                for (; j < block_size; j++)
+                    dot += (int32_t)input_i8[block_start + j] * (int32_t)decoded_w[j];
                 sum += (float)dot * w_scale;
             }
         }
-        output[row] = sum / act_scale;
+        output[row] = sum * inv_act_scale;
     }
 }
 
@@ -238,7 +304,8 @@ void ternary_mul_avx512_fairyfuse(
     int n_terms, int out_f, int in_f, int n_blocks,
     const float* input, float* output) {
 
-    #pragma omp parallel for
+    // Skip OMP team creation for tiny GEMMs (fork/join cost dominates).
+    #pragma omp parallel for if((int64_t)out_f * in_f > 65536)
     for (int row = 0; row < out_f; row++) {
         __m512 vacc = _mm512_setzero_ps();
 

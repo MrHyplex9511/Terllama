@@ -105,8 +105,9 @@ struct alignas(64) LayerData {
     // Built once on first matmul (ternary_linear_blocks) instead of rebuilding
     // the packed layout on every call. Saves ~40MB of memcpy + 200+
     // allocations per generated token. Mutable: built lazily, reused across
-    // tokens. Safe because a single generate loop runs serially and each
-    // server request operates on its own snapshot copy.
+    // tokens. Snapshots are shared across concurrent worker threads, so the
+    // build is guarded by a file-static mutex in dispatcher.cpp (double-checked
+    // inside the lock); only the first matmul per layer pays it.
     // Per-term: [term][row] pointer arrays; term 0 = single-term path.
     mutable bool term_cache_built{false};
     mutable std::vector<std::vector<uint8_t>> term_contig_data;      // [term] flat packed

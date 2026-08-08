@@ -79,17 +79,45 @@ public:
         // on 4-core machines. Decode is memory-bound, so cores/2 is the intended
         // spread; removing the second halving.
 
-        Logger::info("Sandwich: phase=%s threads=%d batch=%d pin=%s",
-                     phase_name(phase), cfg.num_threads, cfg.batch_size,
-                     cfg.pin_threads ? "yes" : "no");
+        // Gate the log so disabled levels skip all formatting/IO (the logger
+        // itself re-checks, but this avoids the call entirely when off).
+        if (Logger::level <= INFO) {
+            Logger::info("Sandwich: phase=%s threads=%d batch=%d pin=%s",
+                         phase_name(phase), cfg.num_threads, cfg.batch_size,
+                         cfg.pin_threads ? "yes" : "no");
+        }
 
         // Set OMP_NUM_THREADS for OpenMP
         omp_num_threads_ = cfg.num_threads;
-        setenv("OMP_NUM_THREADS", std::to_string(cfg.num_threads).c_str(), 1);
 
-        // Pin threads if requested
-        if (cfg.pin_threads) {
+        // setenv() is not thread-safe and churns the process env on every call.
+        // This runs on every phase switch (×2 per request), so only call it
+        // when the value actually changes for this thread.
+        thread_local int tls_omp_threads = 0;
+        if (tls_omp_threads != cfg.num_threads) {
+            setenv("OMP_NUM_THREADS", std::to_string(cfg.num_threads).c_str(), 1);
+            tls_omp_threads = cfg.num_threads;
+        }
+
+        // Pin threads if requested. pin_worker_threads spawns an OpenMP region
+        // plus one sched_setaffinity syscall per worker; skip it while the pin
+        // layout for this thread is unchanged.
+        thread_local int tls_pin_threads = -1;
+        thread_local int tls_pin_start   = -1;
+        thread_local int tls_pin_stride  = -1;
+        if (cfg.pin_threads &&
+            (tls_pin_threads != cfg.num_threads ||
+             tls_pin_start   != cfg.start_core   ||
+             tls_pin_stride  != cfg.core_stride)) {
             pin_worker_threads(cfg.num_threads, cfg.start_core, cfg.core_stride);
+            tls_pin_threads = cfg.num_threads;
+            tls_pin_start   = cfg.start_core;
+            tls_pin_stride  = cfg.core_stride;
+        } else if (tls_pin_threads >= 0) {
+            // Pin no longer requested — force a re-pin on the next enable.
+            tls_pin_threads = -1;
+            tls_pin_start   = -1;
+            tls_pin_stride  = -1;
         }
     }
 

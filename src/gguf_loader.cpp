@@ -238,6 +238,26 @@ static const GGUFTensorInfo* find_tensor(const std::vector<GGUFTensorInfo>& tens
 // EXTRACT UNQUANTIZED TENSOR (F32/F16) TO FLOAT VECTOR
 // ═══════════════════════════════════════════════════════════════════════════
 
+// Vectorized FP16 -> FP32: decode 4 halves per outer iteration (one 64-bit
+// load instead of 4 two-byte memcpys) so the compiler can vectorize the
+// bit-twiddle; per-element math is byte-identical to fp16_to_fp32.
+static void decode_f16_batch(const uint8_t* src, float* out, size_t n) {
+    size_t i = 0;
+    for (; i + 4 <= n; i += 4) {
+        uint64_t w;
+        std::memcpy(&w, src + i * 2, 8);
+        for (int k = 0; k < 4; k++) {
+            uint16_t h = (uint16_t)((w >> (16u * (unsigned)k)) & 0xFFFFu);
+            out[i + (size_t)k] = fp16_to_fp32(h);
+        }
+    }
+    for (; i < n; i++) {
+        uint16_t h;
+        std::memcpy(&h, src + i * 2, 2);
+        out[i] = fp16_to_fp32(h);
+    }
+}
+
 static bool extract_f32_tensor(const GGUFFile& gguf,
                                 const GGUFTensorInfo& ti,
                                 std::vector<float>& out) {
@@ -252,11 +272,7 @@ static bool extract_f32_tensor(const GGUFFile& gguf,
         std::memcpy(out.data(), src, n_elems * 4);
     } else if (ti.type == GGML_TYPE_F16) {
         out.resize(n_elems);
-        for (size_t i = 0; i < n_elems; i++) {
-            uint16_t fp16;
-            std::memcpy(&fp16, src + i * 2, 2);
-            out[i] = fp16_to_fp32(fp16);
-        }
+        decode_f16_batch(src, out.data(), n_elems);
     } else if (ti.type == GGML_TYPE_Q2_0 || ti.type == 42) {
         // Q2_0 (or TQ2_0_GS8) with g128: 34 bytes/block
         out.resize(n_elems);
@@ -344,6 +360,10 @@ static bool convert_q2_0_to_layer(const GGUFFile& gguf,
             }
         }
     }
+
+    // Prebuild the flattened contiguous cache at load time so the runtime
+    // skips its lazy first-matmul build (see dispatcher.cpp).
+    build_block_contig_cache(layer);
 
     return true;
 }

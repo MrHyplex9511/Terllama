@@ -74,6 +74,43 @@ float bf16_to_f32(uint16_t h) {
     return out;
 }
 
+// Batch binary16 -> fp32, 4 values per 64-bit load; per-element math is
+// byte-identical to f16_to_f32 (no subnormal/zero/inf branch changes).
+static void f16s_to_f32(const uint8_t* src, float* dst, size_t n) {
+    size_t i = 0;
+    for (; i + 4 <= n; i += 4) {
+        uint64_t w;
+        std::memcpy(&w, src + i * 2, 8);
+        for (int k = 0; k < 4; ++k) {
+            uint16_t h = (uint16_t)((w >> (16u * (unsigned)k)) & 0xFFFFu);
+            dst[i + (size_t)k] = f16_to_f32(h);
+        }
+    }
+    for (; i < n; ++i) {
+        uint16_t h;
+        std::memcpy(&h, src + i * 2, 2);
+        dst[i] = f16_to_f32(h);
+    }
+}
+
+// Batch bfloat16 -> fp32, same structure as f16s_to_f32.
+static void bf16s_to_f32(const uint8_t* src, float* dst, size_t n) {
+    size_t i = 0;
+    for (; i + 4 <= n; i += 4) {
+        uint64_t w;
+        std::memcpy(&w, src + i * 2, 8);
+        for (int k = 0; k < 4; ++k) {
+            uint16_t h = (uint16_t)((w >> (16u * (unsigned)k)) & 0xFFFFu);
+            dst[i + (size_t)k] = bf16_to_f32(h);
+        }
+    }
+    for (; i < n; ++i) {
+        uint16_t h;
+        std::memcpy(&h, src + i * 2, 2);
+        dst[i] = bf16_to_f32(h);
+    }
+}
+
 } // namespace
 
 bool parse_safetensors(const std::vector<uint8_t>& buf,
@@ -97,8 +134,6 @@ bool parse_safetensors(const std::vector<uint8_t>& buf,
     }
 
     const uint8_t* json_start = buf.data() + 8;
-    const std::string json_str(reinterpret_cast<const char*>(json_start),
-                               static_cast<size_t>(json_len));
 
     // Data region must be 8-byte aligned (safetensors pads the JSON).
     const size_t data_off = 8 + static_cast<size_t>(json_len);
@@ -110,7 +145,9 @@ bool parse_safetensors(const std::vector<uint8_t>& buf,
 
     json header;
     try {
-        header = json::parse(json_str);
+        // Parse straight from the buffer range — no intermediate std::string.
+        header = json::parse(json_start,
+                             json_start + static_cast<std::ptrdiff_t>(json_len));
     } catch (const std::exception& e) {
         Logger::error("safetensors: header JSON parse failed: {}", e.what());
         return false;
@@ -220,17 +257,9 @@ bool parse_safetensors(const std::vector<uint8_t>& buf,
         if (dtype == "F32") {
             std::memcpy(tt.data.data(), src, tt.data.size() * sizeof(float));
         } else if (dtype == "F16") {
-            for (size_t i = 0; i < tt.data.size(); ++i) {
-                uint16_t h;
-                std::memcpy(&h, src + i * 2, 2);
-                tt.data[i] = f16_to_f32(h);
-            }
+            f16s_to_f32(src, tt.data.data(), tt.data.size());
         } else { // BF16
-            for (size_t i = 0; i < tt.data.size(); ++i) {
-                uint16_t h;
-                std::memcpy(&h, src + i * 2, 2);
-                tt.data[i] = bf16_to_f32(h);
-            }
+            bf16s_to_f32(src, tt.data.data(), tt.data.size());
         }
 
         out.push_back(std::move(tt));

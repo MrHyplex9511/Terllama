@@ -267,6 +267,52 @@ static std::vector<BlockTerm> parse_block_terms(const uint8_t* data, size_t data
     return blocks;
 }
 
+// Build the contiguous block-kernel cache (term_contig_data/scales + per-row
+// pointer tables) once at LOAD time. The layout is byte-identical to the lazy
+// build inside dispatcher.cpp::ternary_linear_blocks; marking
+// term_cache_built=true lets the runtime skip its first-token build for any
+// layer produced through a loader path. Layers constructed at runtime (MoTE
+// experts, packrat reconfigure) leave term_cache_built=false and still get
+// the lazy build.
+static void build_block_contig_cache(LayerData& ld) {
+    ld.term_cache_built = false;
+    if (!ld.has_blocks || ld.block_terms.empty() || ld.in_features <= 0) return;
+    const int qk = (int)ld.block_qk;
+    const int n_blocks = (ld.in_features + qk - 1) / qk;
+    const int codes_per_block = qk / 4;
+    const int n_terms = (int)ld.block_terms.size();
+    const size_t row_data_bytes = (size_t)ld.out_features * n_blocks * (size_t)codes_per_block;
+    const size_t row_scales     = (size_t)ld.out_features * n_blocks;
+
+    ld.term_contig_data.resize(n_terms);
+    ld.term_contig_scales.resize(n_terms);
+    ld.term_block_data.resize(n_terms);
+    ld.term_block_scales.resize(n_terms);
+
+    for (int t = 0; t < n_terms; t++) {
+        const std::vector<BlockTerm>& blocks = ld.block_terms[t];
+        if (blocks.size() != row_scales) continue;  // malformed term; skip
+        auto& tcd = ld.term_contig_data[t];
+        auto& tcs = ld.term_contig_scales[t];
+        tcd.assign(row_data_bytes, 0);
+        tcs.assign(row_scales, 0.0f);
+        ld.term_block_data[t].resize(ld.out_features);
+        ld.term_block_scales[t].resize(ld.out_features);
+        for (int row = 0; row < ld.out_features; row++) {
+            for (int b = 0; b < n_blocks; b++) {
+                const size_t idx = (size_t)row * n_blocks + b;
+                std::memcpy(&tcd[(size_t)row * n_blocks * (size_t)codes_per_block +
+                                 (size_t)b * codes_per_block],
+                            blocks[idx].packed.data(), (size_t)codes_per_block);
+                tcs[(size_t)row * n_blocks + b] = blocks[idx].scale;
+            }
+            ld.term_block_data[t][row] = &tcd[(size_t)row * n_blocks * (size_t)codes_per_block];
+            ld.term_block_scales[t][row] = &tcs[(size_t)row * n_blocks];
+        }
+    }
+    ld.term_cache_built = true;
+}
+
 // Decode a set of block terms into a single combined[] bitplane term.
 // Legacy fallback; the real multi-term path is ternary_linear_blocks.
 // Only term 0 is used for multi-term layers.
@@ -356,6 +402,7 @@ static void parse_layer_type_data(LayerData& ld, uint8_t layer_type,
                                                   ld.out_features, ld.in_features, qk);
             pos += tlen;
         }
+        build_block_contig_cache(ld);
         // Backward-compat combined[] from term 0 (degraded fallback only)
         if (build_combined) {
             ld.num_terms = 1;
@@ -369,6 +416,7 @@ static void parse_layer_type_data(LayerData& ld, uint8_t layer_type,
     ld.block_terms.resize(1);
     ld.block_terms[0] = parse_block_terms(data.data(), data.size(),
                                           ld.out_features, ld.in_features, qk);
+    build_block_contig_cache(ld);
 
     if (build_combined) {
         // Decode to combined[] for backward-compatible kernels
@@ -574,6 +622,7 @@ inline std::vector<LayerData> load_decomposed_layers_tq1(const std::string& path
                 ld.block_terms[0][block_idx].scale = max_abs > 0.0f ? max_abs : 1.0f;
             }
         }
+        build_block_contig_cache(ld);
 
         // Also decode to bitplane combined[] for backward compatibility
         int words_per_row = (ld.in_features + 15) / 16;
@@ -884,6 +933,7 @@ inline size_t deserialize_layer_data(const uint8_t* buf, size_t offset, LayerDat
             std::memcpy(ld.block_terms[0][b].packed.data(), buf + pos, ps); pos += ps;
             std::memcpy(&ld.block_terms[0][b].scale, buf + pos, 4); pos += 4;
         }
+        build_block_contig_cache(ld);
         return pos - offset;
     }
 

@@ -139,7 +139,11 @@ std::string Tokenizer::decode(const std::vector<int>& token_ids) const {
     if (!valid || vocab.empty()) return "?";
     if (model_type == "gpt2") return "?";  // byte-level BPE — use GigaToken
 
-    std::ostringstream oss;
+    // Single-pass output: reserve an estimate up front (≥1 byte per token for
+    // byte-fallbacks/ASCII; UTF-8 tokens grow it lazily) instead of building
+    // an ostringstream + a temp std::string per token.
+    std::string result;
+    result.reserve(token_ids.size());
 
     for (int id : token_ids) {
         // Out of range
@@ -149,7 +153,7 @@ std::string Tokenizer::decode(const std::vector<int>& token_ids) const {
         if (id < (int)types.size() && types[id] == 3) continue;
         if (id == bos_id || id == eos_id) continue;
 
-        std::string token = vocab[id];
+        const std::string& token = vocab[id];
 
         if (model_type == "llama") {
             // SentencePiece decoding
@@ -157,35 +161,30 @@ std::string Tokenizer::decode(const std::vector<int>& token_ids) const {
             // Handle byte-fallback: "<0xNN>" → single byte
             uint8_t byte_val;
             if (is_byte_fallback(token, byte_val)) {
-                oss.put((char)byte_val);
+                result += (char)byte_val;
                 continue;
             }
 
             // Replace ▁ (UTF-8: 0xE2 0x96 0x81) with space (0x20)
-            std::string processed;
-            processed.reserve(token.size());
             size_t i = 0;
             while (i < token.size()) {
                 if (i + 2 < token.size() &&
                     (uint8_t)token[i]     == 0xE2 &&
                     (uint8_t)token[i + 1] == 0x96 &&
                     (uint8_t)token[i + 2] == 0x81) {
-                    processed += ' ';
+                    result += ' ';
                     i += 3;
                 } else {
-                    processed += token[i];
+                    result += token[i];
                     i++;
                 }
             }
-            oss << processed;
 
         } else {
             // GPT-2 BPE (non-byte-level): concatenate raw strings
-            oss << token;
+            result += token;
         }
     }
-
-    std::string result = oss.str();
 
     // Strip leading space (SentencePiece adds one)
     if (model_type == "llama" && !result.empty() && result[0] == ' ') {

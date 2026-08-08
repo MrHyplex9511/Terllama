@@ -14,6 +14,17 @@
 // ─── File-scope thread_local buffers for model_forward ────────────────────
 static thread_local std::vector<float> tls_x;
 static thread_local std::vector<float> tls_logits;
+// ─── Scalar scratch reused across tokens (per thread) ─────────────────────
+// Grows to max size seen, never re-allocates. Attention/MLP/transformer
+// scratch substituted for per-token local vectors.
+static thread_local std::vector<float> tls_attn_q, tls_attn_k, tls_attn_v;
+static thread_local std::vector<float> tls_attn_scores, tls_attn_out;
+static thread_local std::vector<float> tls_gate, tls_up, tls_residual;
+static thread_local std::vector<float> tls_probs;   // sampling temp buffer
+
+static inline void scratch_resize(std::vector<float>& v, size_t n) {
+    if (v.size() < n) v.resize(n);
+}
 
 // Thread-safe PRNG for sampling: seeded once per thread from std::random_device.
 // Replaces rand()/srand() (global state → data race under concurrent streaming,
@@ -170,16 +181,21 @@ void attention(float* x, int seq_pos, const ModelConfig& cfg,
 
     // q_proj output width = H * head_dim, which for Qwen3 (2048) is WIDER
     // than hidden_size (1024) — never size q from HS.
-    std::vector<float> q(H * HD), k(KV * HD), v(KV * HD);
-    ternary_linear_dispatch(q_proj, x, q.data());
-    ternary_linear_dispatch(k_proj, x, k.data());
-    ternary_linear_dispatch(v_proj, x, v.data());
+    scratch_resize(tls_attn_q, (size_t)H * HD);
+    scratch_resize(tls_attn_k, (size_t)KV * HD);
+    scratch_resize(tls_attn_v, (size_t)KV * HD);
+    float* q = tls_attn_q.data();
+    float* k = tls_attn_k.data();
+    float* v = tls_attn_v.data();
+    ternary_linear_dispatch(q_proj, x, q);
+    ternary_linear_dispatch(k_proj, x, k);
+    ternary_linear_dispatch(v_proj, x, v);
 
     // Qwen3-style per-head Q/K RMSNorm (weight shape [head_dim], shared
     // across heads) applied BEFORE RoPE. Skip when absent (SmolLM2 etc.).
     if (!q_norm.empty() && (int)q_norm.size() == HD) {
         for (int h = 0; h < H; h++) {
-            float* qh = q.data() + h * HD;
+            float* qh = q + h * HD;
             float m2 = 0.0f;
             for (int j = 0; j < HD; j++) m2 += qh[j] * qh[j];
             float r = 1.0f / std::sqrt(m2 / (float)HD + cfg.rms_norm_eps);
@@ -188,7 +204,7 @@ void attention(float* x, int seq_pos, const ModelConfig& cfg,
     }
     if (!k_norm.empty() && (int)k_norm.size() == HD) {
         for (int h = 0; h < KV; h++) {
-            float* kh = k.data() + h * HD;
+            float* kh = k + h * HD;
             float m2 = 0.0f;
             for (int j = 0; j < HD; j++) m2 += kh[j] * kh[j];
             float r = 1.0f / std::sqrt(m2 / (float)HD + cfg.rms_norm_eps);
@@ -196,23 +212,24 @@ void attention(float* x, int seq_pos, const ModelConfig& cfg,
         }
     }
 
-    apply_rope(q.data(), k.data(), seq_pos, H, KV, HD, rope);
-
-    kv_cache.append(layer_idx, k.data(), v.data(), seq_pos);
+    apply_rope(q, k, seq_pos, H, KV, HD, rope);
+    kv_cache.append(layer_idx, k, v, seq_pos);
     int kv_len = kv_cache.length(layer_idx);
 
-    std::vector<float> k_full(kv_len * KV * HD);
-    std::vector<float> v_full(kv_len * KV * HD);
-    kv_cache.get_k(layer_idx, k_full.data());
-    kv_cache.get_v(layer_idx, v_full.data());
+    // Dereference the flat KV buffer directly (layout: [t][kv_head][hd]) —
+    // avoids materializing k_full/v_full (≈0.9GB of memcpy/seq per token).
+    const float* k_cache_row = kv_cache.k_cache[layer_idx].data();
+    const float* v_cache_row = kv_cache.v_cache[layer_idx].data();
 
-    std::vector<float> attn_scores(H * kv_len);
+    scratch_resize(tls_attn_scores, (size_t)H * kv_len);
+    float* attn_scores = tls_attn_scores.data();
     for (int h = 0; h < H; h++) {
         int kh = h / G;
-        float* qh = q.data() + h * HD;
-        float* scores = attn_scores.data() + h * kv_len;
+        float* qh = q + h * HD;
+        float* scores = attn_scores + h * kv_len;
+        const float* k_base = k_cache_row + kh * HD;
         for (int t = 0; t < kv_len; t++) {
-            float* kt = k_full.data() + t * KV * HD + kh * HD;
+            const float* kt = k_base + t * KV * HD;
             float s = 0.0f;
             for (int j = 0; j < HD; j++) s += qh[j] * kt[j];
             scores[t] = s / std::sqrt((float)HD);
@@ -220,7 +237,7 @@ void attention(float* x, int seq_pos, const ModelConfig& cfg,
     }
 
     for (int h = 0; h < H; h++) {
-        float* scores = attn_scores.data() + h * kv_len;
+        float* scores = attn_scores + h * kv_len;
         float maxv = *std::max_element(scores, scores + kv_len);
         float sum = 0.0f;
         for (int t = 0; t < kv_len; t++) {
@@ -230,18 +247,21 @@ void attention(float* x, int seq_pos, const ModelConfig& cfg,
         for (int t = 0; t < kv_len; t++) scores[t] /= sum;
     }
 
-    std::vector<float> attn_out(H * HD, 0.0f);
+    scratch_resize(tls_attn_out, (size_t)H * HD);
+    float* attn_out = tls_attn_out.data();
+    std::fill(attn_out, attn_out + (size_t)H * HD, 0.0f);
     for (int h = 0; h < H; h++) {
         int kh = h / G;
-        float* outh = attn_out.data() + h * HD;
-        float* scores = attn_scores.data() + h * kv_len;
+        float* outh = attn_out + h * HD;
+        float* scores = attn_scores + h * kv_len;
+        const float* v_base = v_cache_row + kh * HD;
         for (int t = 0; t < kv_len; t++) {
-            float* vt = v_full.data() + t * KV * HD + kh * HD;
+            const float* vt = v_base + t * KV * HD;
             for (int j = 0; j < HD; j++) outh[j] += scores[t] * vt[j];
         }
     }
 
-    ternary_linear_dispatch(o_proj, attn_out.data(), x);
+    ternary_linear_dispatch(o_proj, attn_out, x);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -255,12 +275,15 @@ void mlp_forward(float* x, const LayerData& gate_proj,
                  const LayerData& up_proj, const LayerData& down_proj,
                  int intermediate_size) {
     Logger::debug("mlp_forward intermediate=%d", intermediate_size);
-    std::vector<float> gate(intermediate_size), up(intermediate_size);
-    ternary_linear_dispatch(gate_proj, x, gate.data());
-    ternary_linear_dispatch(up_proj, x, up.data());
+    scratch_resize(tls_gate, (size_t)intermediate_size);
+    scratch_resize(tls_up, (size_t)intermediate_size);
+    float* gate = tls_gate.data();
+    float* up = tls_up.data();
+    ternary_linear_dispatch(gate_proj, x, gate);
+    ternary_linear_dispatch(up_proj, x, up);
     for (int i = 0; i < intermediate_size; i++)
         gate[i] = silu(gate[i]) * up[i];
-    ternary_linear_dispatch(down_proj, gate.data(), x);
+    ternary_linear_dispatch(down_proj, gate, x);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -275,6 +298,64 @@ void mote_mlp_forward(float* x, const MoTELayerData& mote,
 // ═══════════════════════════════════════════════════════════════════════════
 // TRANSFORMER BLOCK
 // ═══════════════════════════════════════════════════════════════════════════
+
+// Cached ternary-layer indices for transformer_block. Resolves the
+// self_attn.{q,k,v,o}_proj / mlp.{gate,up,down}_proj names ONCE per layer per
+// model instead of building 7 std::strings + 6 linear scans on every token.
+// Keyed by the owning layers-vector pointer; invalidated when a new model
+// snapshot arrives. thread_local: one cache per streaming thread.
+struct TblkIndexCache {
+    struct Attn { int q, k, v, o; };
+    struct Mlp  { int g, u, d; };
+    const std::vector<LayerData>* owner = nullptr;
+    std::vector<Attn> attn;
+    std::vector<Mlp>  mlp;
+};
+static thread_local TblkIndexCache t_blk_idx;
+
+static const TblkIndexCache::Attn& cached_attn_idx(const std::vector<LayerData>& layers,
+                                                   int layer_idx) {
+    if (t_blk_idx.owner != &layers) {
+        t_blk_idx.owner = &layers;   // new model snapshot → rebuild caches
+        t_blk_idx.attn.clear();
+        t_blk_idx.mlp.clear();
+    }
+    if ((int)t_blk_idx.attn.size() <= layer_idx) {
+        t_blk_idx.attn.resize(layer_idx + 1, TblkIndexCache::Attn{-1, -1, -1, -1});
+        t_blk_idx.mlp.resize(layer_idx + 1, TblkIndexCache::Mlp{-1, -1, -1});
+    }
+    TblkIndexCache::Attn& a = t_blk_idx.attn[layer_idx];
+    if (a.q < 0) {   // not yet resolved for this layer
+        std::string base = "model.layers." + std::to_string(layer_idx) + ".";
+        a = TblkIndexCache::Attn{
+            find_layer_index(layers, base + "self_attn.q_proj"),
+            find_layer_index(layers, base + "self_attn.k_proj"),
+            find_layer_index(layers, base + "self_attn.v_proj"),
+            find_layer_index(layers, base + "self_attn.o_proj")};
+    }
+    return a;
+}
+
+static const TblkIndexCache::Mlp& cached_mlp_idx(const std::vector<LayerData>& layers,
+                                                 int layer_idx) {
+    if (t_blk_idx.owner != &layers) {   // paranoia: keep owner in sync with attn path
+        cached_attn_idx(layers, layer_idx);
+    }
+    if ((int)t_blk_idx.mlp.size() <= layer_idx) {
+        t_blk_idx.attn.resize(layer_idx + 1, TblkIndexCache::Attn{-1, -1, -1, -1});
+        t_blk_idx.mlp.resize(layer_idx + 1, TblkIndexCache::Mlp{-1, -1, -1});
+    }
+    TblkIndexCache::Mlp& m = t_blk_idx.mlp[layer_idx];
+    if (m.g < 0) {   // lazy: only resolved for standard (non-MoTE) layers
+        std::string base = "model.layers." + std::to_string(layer_idx) + ".";
+        m = TblkIndexCache::Mlp{
+            find_layer_index(layers, base + "mlp.gate_proj"),
+            find_layer_index(layers, base + "mlp.up_proj"),
+            find_layer_index(layers, base + "mlp.down_proj")};
+    }
+    return m;
+}
+
 void transformer_block(float* x, int seq_pos, int layer_idx,
                        const ModelConfig& cfg,
                        const std::vector<LayerData>& layers,
@@ -286,17 +367,13 @@ void transformer_block(float* x, int seq_pos, int layer_idx,
 
     Logger::debug("transformer_block layer=%d seq_pos=%d", layer_idx, seq_pos);
 
-    auto layer_name = [&](const std::string& suffix) {
-        return "model.layers." + std::to_string(layer_idx) + "." + suffix;
-    };
-
-    int idx_q = find_layer_index(layers, layer_name("self_attn.q_proj"));
-    int idx_k = find_layer_index(layers, layer_name("self_attn.k_proj"));
-    int idx_v = find_layer_index(layers, layer_name("self_attn.v_proj"));
-    int idx_o = find_layer_index(layers, layer_name("self_attn.o_proj"));
+    const TblkIndexCache::Attn& ia = cached_attn_idx(layers, layer_idx);
+    int idx_q = ia.q, idx_k = ia.k, idx_v = ia.v, idx_o = ia.o;
 
     // Attention with residual (BitNet: apply attn_sub_norm before residual)
-    std::vector<float> residual(x, x + HS);
+    scratch_resize(tls_residual, (size_t)HS);
+    float* residual = tls_residual.data();
+    std::copy(x, x + HS, residual);
     rms_norm(x, norms.input_layernorm.data(), HS, cfg.rms_norm_eps);
     attention(x, seq_pos, cfg,
               layers[idx_q], layers[idx_k], layers[idx_v], layers[idx_o],
@@ -310,18 +387,16 @@ void transformer_block(float* x, int seq_pos, int layer_idx,
     }
 
     // MLP with residual — check for MoTE first
-    std::copy(x, x + HS, residual.begin());
+    std::copy(x, x + HS, residual);
     rms_norm(x, norms.post_attention_layernorm.data(), HS, cfg.rms_norm_eps);
 
     if (mote_layers && layer_idx < (int)mote_layers->size() && (*mote_layers)[layer_idx].is_mote) {
         // MoTE FFN
         mote_mlp_forward(x, (*mote_layers)[layer_idx], HS, IS);
     } else {
-        // Standard ternary FFN
-        int idx_g = find_layer_index(layers, layer_name("mlp.gate_proj"));
-        int idx_u = find_layer_index(layers, layer_name("mlp.up_proj"));
-        int idx_d = find_layer_index(layers, layer_name("mlp.down_proj"));
-        mlp_forward(x, layers[idx_g], layers[idx_u], layers[idx_d], IS);
+        // Standard ternary FFN (indices cached; resolved on first use)
+        const TblkIndexCache::Mlp& im = cached_mlp_idx(layers, layer_idx);
+        mlp_forward(x, layers[im.g], layers[im.u], layers[im.d], IS);
     }
 
     // BitNet: apply ffn_sub_norm before residual
@@ -435,16 +510,26 @@ float* model_forward(int token, int seq_pos,
         ternary_linear_dispatch(layers[idx_lmhead], tls_x.data(), tls_logits.data());
     } else {
         // Tied embeddings: lm_head = embedding matrix (F16 from token_embd.weight)
-        // Compute logits = embedding @ hidden_state for each vocab item (linear scan)
+        // Compute logits = embedding @ hidden_state for each vocab item (linear scan).
+        // Parallel across vocab rows in blocks (each row's accumulator is a private
+        // local); dense writes to logits are spread by the block stride to reduce
+        // false sharing on the cache lines of tls_logits.
+        const float* x_data = tls_x.data();
         if (tls_logits.size() != (size_t)cfg.vocab_size)
             tls_logits.resize(cfg.vocab_size);
-        const float* x_data = tls_x.data();
-        for (int v = 0; v < cfg.vocab_size; v++) {
-            const float* emb_row = &embedding[(size_t)v * cfg.hidden_size];
-            float dot = 0.0f;
-            for (int j = 0; j < cfg.hidden_size; j++)
-                dot += emb_row[j] * x_data[j];
-            tls_logits[v] = dot;
+        const int VB = 64;  // vocab rows per block
+        int nvblk = (cfg.vocab_size + VB - 1) / VB;
+        #pragma omp parallel for schedule(static)
+        for (int b = 0; b < nvblk; b++) {
+            int v0 = b * VB;
+            int v1 = std::min(v0 + VB, cfg.vocab_size);
+            for (int v = v0; v < v1; v++) {
+                const float* emb_row = &embedding[(size_t)v * cfg.hidden_size];
+                float dot = 0.0f;
+                for (int j = 0; j < cfg.hidden_size; j++)
+                    dot += emb_row[j] * x_data[j];
+                tls_logits[v] = dot;
+            }
         }
     }
 
@@ -486,7 +571,8 @@ int sample_multinomial(const float* logits, int n, float temp,
                        const std::vector<int>& prev_tokens,
                        float repeat_penalty) {
     Logger::debug("sample_multinomial temp=%.2f vocab=%d", temp, n);
-    std::vector<float> probs(n);
+    scratch_resize(tls_probs, (size_t)n);
+    float* probs = tls_probs.data();
     float maxv = *std::max_element(logits, logits + n);
     float sum = 0.0f;
     for (int i = 0; i < n; i++) {
@@ -567,6 +653,7 @@ bool generate_stream(const std::vector<int>& prompt_tokens,
     int next_token = n_prompt > 0 ? prompt_tokens[n_prompt - 1]
                                   : (cfg.eos_token_id >= 0 ? cfg.eos_token_id : 0);
     FILE* log_debug = debug_fopen("logits.txt", "w");
+    std::vector<int> recent;   // reused across tokens (avoid per-token alloc)
     for (int i = 0; i < max_tokens; i++) {
         int pos = n_prompt + i;
         float* logits = model_forward(next_token, pos, cfg, embedding,
@@ -588,7 +675,7 @@ bool generate_stream(const std::vector<int>& prompt_tokens,
             fflush(log_debug);
         }
 
-        std::vector<int> recent;
+        recent.clear();
         for (int j = std::max(0, (int)output_tokens.size() - 8);
              j < (int)output_tokens.size(); j++)
             recent.push_back(output_tokens[j]);
@@ -668,6 +755,7 @@ std::pair<std::vector<int>, double> generate(
     int next_token = n_prompt > 0 ? prompt_tokens[n_prompt - 1]
                                   : (cfg.eos_token_id >= 0 ? cfg.eos_token_id : 0);
     FILE* log_debug = debug_fopen("logits.txt", "a");
+    std::vector<int> recent;   // reused across tokens (avoid per-token alloc)
     for (int i = 0; i < max_tokens; i++) {
         int pos = n_prompt + i;
         float* logits = model_forward(next_token, pos, cfg, embedding,
@@ -687,7 +775,7 @@ std::pair<std::vector<int>, double> generate(
             fflush(log_debug);
         }
 
-        std::vector<int> recent;
+        recent.clear();
         for (int j = std::max(0, (int)output_tokens.size() - 8);
              j < (int)output_tokens.size(); j++)
             recent.push_back(output_tokens[j]);

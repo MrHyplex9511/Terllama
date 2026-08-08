@@ -26,11 +26,18 @@
 #include <memory>
 #include <deque>
 #include <map>
+#include <functional>
 #include <unistd.h>
 #include <csignal>
 
 // Thread-local batch decode buffer (16-token batches for streaming)
 static thread_local std::vector<int> tls_decode_buffer;
+
+// Thread-local SSE frame + JSON-escape scratch buffers. The frame is cleared
+// and re-appended to per chunk, so steady-state streaming reuses the backing
+// allocation instead of building a fresh string per 16-token batch.
+static thread_local std::string tls_sse_frame;
+static thread_local std::string tls_sse_scratch;
 
 // Signal flag (defined in commands.cpp)
 extern std::atomic<bool> g_interrupted;
@@ -78,22 +85,77 @@ void send_error(httplib::Response& res, const std::string& message,
 
 static constexpr size_t kRateLimitMax = 20;               // requests per window per IP
 static constexpr std::chrono::seconds kRateLimitWindow{60};
+static constexpr size_t kRateLimitShards     = 16;        // mutex shards
+static constexpr size_t kRateLimitShardCap   = 4096;       // IPs kept per shard
 
-static std::mutex g_rl_mutex;
-static std::map<std::string,
-                std::deque<std::chrono::steady_clock::time_point>> g_rl_history;
+// Per-IP sliding-window history, sharded by IP hash so concurrent requests on
+// different IPs don't contend on one global mutex. Each shard also drops idle
+// IPs once it outgrows kRateLimitShardCap, so the map can't grow unboundedly.
+struct RateShard {
+    std::mutex mutex;
+    std::map<std::string,
+             std::deque<std::chrono::steady_clock::time_point>> history;
+};
+static RateShard g_rl_shards[kRateLimitShards];
 
 // Returns true if the request is within the per-IP sliding-window budget.
 static bool rate_limit_allow(const httplib::Request& req) {
     const std::string ip = req.remote_addr;
     const auto now = std::chrono::steady_clock::now();
-    std::lock_guard<std::mutex> lock(g_rl_mutex);
-    auto& deq = g_rl_history[ip];
+    RateShard& shard = g_rl_shards[std::hash<std::string>{}(ip) % kRateLimitShards];
+    std::lock_guard<std::mutex> lock(shard.mutex);
+    auto& deq = shard.history[ip];
     while (!deq.empty() && now - deq.front() > kRateLimitWindow)
         deq.pop_front();
     if (deq.size() >= kRateLimitMax) return false;
     deq.push_back(now);
+    // Bound memory: when this shard overflows its cap, evict IPs with no
+    // in-window requests left (they'd otherwise persist forever).
+    if (shard.history.size() > kRateLimitShardCap) {
+        for (auto it = shard.history.begin(); it != shard.history.end();) {
+            if (it->second.empty()) it = shard.history.erase(it);
+            else ++it;
+        }
+    }
     return true;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SSE STREAMING FRAME BUILDERS
+// ═══════════════════════════════════════════════════════════════════════════
+// The chunk JSON has only one variable field per 16-token batch (`content` /
+// `text`); id, created, model, object and the boolean/role/index fields are
+// constant for the whole stream. Frame bodies are prewritten as string
+// literals keyed in nlohmann::json's canonical (std::map → sorted) order, and
+// the variable field is escaped via json() so the bytes match the previous
+// json{...}.dump() output exactly. The frame buffer is reused across chunks.
+
+static void append_chat_chunk_sse(std::string& frame, std::string& scratch,
+                                  const std::string& id,
+                                  const std::string& created,
+                                  const std::string& text) {
+    scratch = nlohmann::json(text).dump();  // escaped quoted JSON string
+    frame += "data: {\"choices\":[{\"delta\":{\"content\":";
+    frame += scratch;
+    frame += ",\"role\":\"assistant\"},\"index\":0}],\"created\":\"";
+    frame += created;
+    frame += "\",\"id\":\"";
+    frame += id;
+    frame += "\",\"model\":\"default\",\"object\":\"chat.completion.chunk\"}\n\n";
+}
+
+static void append_comp_chunk_sse(std::string& frame, std::string& scratch,
+                                  const std::string& id,
+                                  const std::string& created,
+                                  const std::string& text) {
+    scratch = nlohmann::json(text).dump();
+    frame += "data: {\"choices\":[{\"finish_reason\":null,\"index\":0,\"logprobs\":null,\"text\":";
+    frame += scratch;
+    frame += "}],\"created\":\"";
+    frame += created;
+    frame += "\",\"id\":\"";
+    frame += id;
+    frame += "\",\"model\":\"default\",\"object\":\"text_completion\"}\n\n";
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -523,11 +585,13 @@ void handle_chat_completions(const httplib::Request& req,
             httplib::DataSink* sink{nullptr};
             std::string id;
             long created{0};
+            std::string created_str;   // pre-formatted; constant for the stream
             ModelSnap* snap{nullptr};
         };
         auto ctx = std::make_shared<CbCtx>();
         ctx->id      = id;
         ctx->created = created;
+        ctx->created_str = std::to_string(created);
         ctx->snap    = snap.get();
 
         res.status = 200;
@@ -555,23 +619,13 @@ void handle_chat_completions(const httplib::Request& req,
                             c->snap->tokenizer, c->snap->gigatoken,
                             tls_decode_buffer);
                         if (!text.empty()) {
-                            json delta = {
-                                {"role",    "assistant"},
-                                {"content", text}
-                            };
-                            json choice = {
-                                {"index", 0},
-                                {"delta", delta}
-                            };
-                            json chunk = {
-                                {"id",      c->id},
-                                {"object",  "chat.completion.chunk"},
-                                {"created", std::to_string(c->created)},
-                                {"model",   "default"},
-                                {"choices", {choice}}
-                            };
-                            std::string sse = "data: " + chunk.dump() + "\n\n";
-                            if (!c->sink->write(sse.data(), sse.size()))
+                            // Single serialization into a reused frame buffer;
+                            // the only variable field is the decoded text.
+                            tls_sse_frame.clear();
+                            append_chat_chunk_sse(tls_sse_frame, tls_sse_scratch,
+                                                  c->id, c->created_str, text);
+                            if (!c->sink->write(tls_sse_frame.data(),
+                                                tls_sse_frame.size()))
                                 return false;
                         }
                         tls_decode_buffer.clear();
@@ -590,14 +644,10 @@ void handle_chat_completions(const httplib::Request& req,
                         ctx->snap->tokenizer, ctx->snap->gigatoken,
                         tls_decode_buffer);
                     if (!text.empty()) {
-                        json delta = {{"role","assistant"}, {"content",text}};
-                        json chunk = {
-                            {"id",ctx->id}, {"object","chat.completion.chunk"},
-                            {"created",std::to_string(ctx->created)}, {"model","default"},
-                            {"choices",{{{"index",0},{"delta",delta}}}}
-                        };
-                        std::string sse = "data: " + chunk.dump() + "\n\n";
-                        sink.write(sse.data(), sse.size());
+                        tls_sse_frame.clear();
+                        append_chat_chunk_sse(tls_sse_frame, tls_sse_scratch,
+                                              ctx->id, ctx->created_str, text);
+                        sink.write(tls_sse_frame.data(), tls_sse_frame.size());
                     }
                     tls_decode_buffer.clear();
                 }
@@ -779,11 +829,13 @@ void handle_completions(const httplib::Request& req,
             httplib::DataSink* sink{nullptr};
             std::string id;
             long created{0};
+            std::string created_str;   // pre-formatted; constant for the stream
             ModelSnap* snap{nullptr};
         };
         auto ctx = std::make_shared<CbCtx>();
         ctx->id      = id;
         ctx->created = created;
+        ctx->created_str = std::to_string(created);
         ctx->snap    = snap.get();
 
         res.status = 200;
@@ -811,21 +863,13 @@ void handle_completions(const httplib::Request& req,
                             c->snap->tokenizer, c->snap->gigatoken,
                             tls_decode_buffer);
                         if (!text.empty()) {
-                            json choice = {
-                                {"index",         0},
-                                {"text",          text},
-                                {"logprobs",      nullptr},
-                                {"finish_reason", nullptr}
-                            };
-                            json chunk = {
-                                {"id",      c->id},
-                                {"object",  "text_completion"},
-                                {"created", std::to_string(c->created)},
-                                {"model",   "default"},
-                                {"choices", {choice}}
-                            };
-                            std::string sse = "data: " + chunk.dump() + "\n\n";
-                            if (!c->sink->write(sse.data(), sse.size()))
+                            // Single serialization into a reused frame buffer;
+                            // the only variable field is the decoded text.
+                            tls_sse_frame.clear();
+                            append_comp_chunk_sse(tls_sse_frame, tls_sse_scratch,
+                                                  c->id, c->created_str, text);
+                            if (!c->sink->write(tls_sse_frame.data(),
+                                                tls_sse_frame.size()))
                                 return false;
                         }
                         tls_decode_buffer.clear();
@@ -844,17 +888,10 @@ void handle_completions(const httplib::Request& req,
                         ctx->snap->tokenizer, ctx->snap->gigatoken,
                         tls_decode_buffer);
                     if (!text.empty()) {
-                        json choice = {
-                            {"index",0}, {"text",text},
-                            {"logprobs",nullptr}, {"finish_reason",nullptr}
-                        };
-                        json chunk = {
-                            {"id",ctx->id}, {"object","text_completion"},
-                            {"created",std::to_string(ctx->created)}, {"model","default"},
-                            {"choices",{choice}}
-                        };
-                        std::string sse = "data: " + chunk.dump() + "\n\n";
-                        sink.write(sse.data(), sse.size());
+                        tls_sse_frame.clear();
+                        append_comp_chunk_sse(tls_sse_frame, tls_sse_scratch,
+                                              ctx->id, ctx->created_str, text);
+                        sink.write(tls_sse_frame.data(), tls_sse_frame.size());
                     }
                     tls_decode_buffer.clear();
                 }

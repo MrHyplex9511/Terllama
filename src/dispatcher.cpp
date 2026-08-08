@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <iostream>
 #include <cstdio>
+#include <mutex>
 
 // Weak declarations: nullptr if kernel .o not linked
 #if defined(__x86_64__) || defined(_M_X64)
@@ -101,6 +102,14 @@ __attribute__((weak)) void ternary_mul_avx512_fairyfuse(
 __attribute__((weak)) void ternary_mul_scalar_blocks(
     const uint8_t* const* const*, const float* const* const*, int, int, int, int, const float*, float*);
 
+// Guards the lazy packed-term cache build (Issue #43). ModelSnap is shared by
+// all httplib worker threads; concurrent first matmuls on one snapshot could
+// double-build and tear the term_block_data/term_block_scales pointers. Only
+// the first matmul per cache pays the lock. A per-layer mutex is not possible
+// directly because LayerData is copied by value on snapshot rebuild; a single
+// global mutex is robust either way.
+static std::mutex g_term_cache_mutex;
+
 void ternary_linear_blocks(const LayerData& layer, const float* input, float* output,
                            CPUArch override_arch) {
     if (!layer.has_blocks || layer.block_terms.empty() || layer.in_features == 0) {
@@ -120,29 +129,35 @@ void ternary_linear_blocks(const LayerData& layer, const float* input, float* ou
     // matmul call (211 calls/token, ~40MB of copies) — a major decode cost.
     // Multi-term: builds one contiguous set per term.
     if (!layer.term_cache_built) {
-        layer.term_contig_data.resize(n_terms);
-        layer.term_contig_scales.resize(n_terms);
-        layer.term_block_data.resize(n_terms);
-        layer.term_block_scales.resize(n_terms);
+        // Double-checked locking: the flag is only set inside the mutex and
+        // last, so readers that observe it true are guaranteed the vectors are
+        // fully built (mutex acquire/release provides the happens-before).
+        std::lock_guard<std::mutex> lock(g_term_cache_mutex);
+        if (!layer.term_cache_built) {
+            layer.term_contig_data.resize(n_terms);
+            layer.term_contig_scales.resize(n_terms);
+            layer.term_block_data.resize(n_terms);
+            layer.term_block_scales.resize(n_terms);
 
-        for (int t = 0; t < n_terms; t++) {
-            const std::vector<BlockTerm>& blocks = layer.block_terms[t];
-            layer.term_contig_data[t].assign((size_t)layer.out_features * n_blocks * codes_per_block, 0);
-            layer.term_contig_scales[t].assign((size_t)layer.out_features * n_blocks, 0.0f);
-            layer.term_block_data[t].resize(layer.out_features);
-            layer.term_block_scales[t].resize(layer.out_features);
-            for (int row = 0; row < layer.out_features; row++) {
-                for (int b = 0; b < n_blocks; b++) {
-                    size_t idx = (size_t)row * n_blocks + b;
-                    std::memcpy(&layer.term_contig_data[t][(size_t)row * n_blocks * codes_per_block + b * codes_per_block],
-                                blocks[idx].packed.data(), (size_t)codes_per_block);
-                    layer.term_contig_scales[t][(size_t)row * n_blocks + b] = blocks[idx].scale;
+            for (int t = 0; t < n_terms; t++) {
+                const std::vector<BlockTerm>& blocks = layer.block_terms[t];
+                layer.term_contig_data[t].assign((size_t)layer.out_features * n_blocks * codes_per_block, 0);
+                layer.term_contig_scales[t].assign((size_t)layer.out_features * n_blocks, 0.0f);
+                layer.term_block_data[t].resize(layer.out_features);
+                layer.term_block_scales[t].resize(layer.out_features);
+                for (int row = 0; row < layer.out_features; row++) {
+                    for (int b = 0; b < n_blocks; b++) {
+                        size_t idx = (size_t)row * n_blocks + b;
+                        std::memcpy(&layer.term_contig_data[t][(size_t)row * n_blocks * codes_per_block + b * codes_per_block],
+                                    blocks[idx].packed.data(), (size_t)codes_per_block);
+                        layer.term_contig_scales[t][(size_t)row * n_blocks + b] = blocks[idx].scale;
+                    }
+                    layer.term_block_data[t][row] = &layer.term_contig_data[t][(size_t)row * n_blocks * codes_per_block];
+                    layer.term_block_scales[t][row] = &layer.term_contig_scales[t][(size_t)row * n_blocks];
                 }
-                layer.term_block_data[t][row] = &layer.term_contig_data[t][(size_t)row * n_blocks * codes_per_block];
-                layer.term_block_scales[t][row] = &layer.term_contig_scales[t][(size_t)row * n_blocks];
             }
+            layer.term_cache_built = true;
         }
-        layer.term_cache_built = true;
     }
 
     CPUArch arch = (override_arch != CPUArch::UNKNOWN) ? override_arch : detect_cpu_arch();

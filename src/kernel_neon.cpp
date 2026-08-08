@@ -22,6 +22,11 @@ void ternary_mul_neon(const uint32_t* const* term_data, const int* alpha_exps,
     uint32_t tail_mask = rem > 0 ? (uint32_t)((1 << rem) - 1) : 0;
     size_t stride = (size_t)words_per_row;
 
+    // alpha_exps is constant per call: precompute 2^alpha once, multiply
+    // instead of a std::ldexp libm call per (row, term).
+    float alpha_scale[32];
+    for (int t = 0; t < n_active; t++) alpha_scale[t] = std::ldexp(1.0f, alpha_exps[t]);
+
     #pragma omp parallel for
     for (int i = 0; i < out_f; i++) {
         float32x4_t vacc[32];
@@ -118,7 +123,7 @@ void ternary_mul_neon(const uint32_t* const* term_data, const int* alpha_exps,
 
         float result = 0.0f;
         for (int t = 0; t < n_active; t++) {
-            result += std::ldexp(vaddvq_f32(vacc[t]), alpha_exps[t]);
+            result += vaddvq_f32(vacc[t]) * alpha_scale[t];
         }
         output[i] = result;
     }

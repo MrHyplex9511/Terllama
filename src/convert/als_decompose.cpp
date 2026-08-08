@@ -349,12 +349,16 @@ std::vector<std::vector<float>> als_decompose_scales(const float* W, int out_f,
     return fit_block_scales(W, out_f, in_f, num_terms, /*qk=*/128, terms);
 }
 
-std::vector<uint8_t> pack_als_block(const ALSTerm& term, int out_f, int in_f,
-                                    int qk) {
+// Pack one ALS term into dst, returning bytes written. Same layout as the
+// old pack_als_block blob: per row, n_blocks * [codes_per_block code bytes +
+// float32 scale]. Writing directly into the destination avoids a temporary
+// vector + memcpy per term.
+static size_t pack_als_block_into(const ALSTerm& term, uint8_t* dst,
+                                  int out_f, int in_f, int qk) {
     const int n_blocks = (int)term.scales.size();
     const int codes_per_block = qk / 4;
     const int row_stride = n_blocks * (codes_per_block + (int)sizeof(float));
-    std::vector<uint8_t> buf((size_t)out_f * row_stride);
+    const size_t total = (size_t)out_f * (size_t)row_stride;
 
     std::vector<uint8_t> codes(qk);
     for (int row = 0; row < out_f; row++) {
@@ -376,27 +380,43 @@ std::vector<uint8_t> pack_als_block(const ALSTerm& term, int out_f, int in_f,
             for (int g = 0; g < codes_per_block; g++) {
                 uint8_t byte = (uint8_t)((codes[4 * g] << 6) | (codes[4 * g + 1] << 4) |
                                          (codes[4 * g + 2] << 2) | codes[4 * g + 3]);
-                buf[off + g] = byte;
+                dst[off + g] = byte;
             }
             const float scale = term.scales[b];
-            std::memcpy(buf.data() + off + codes_per_block, &scale, sizeof(float));
+            std::memcpy(dst + off + codes_per_block, &scale, sizeof(float));
         }
     }
+    return total;
+}
+
+std::vector<uint8_t> pack_als_block(const ALSTerm& term, int out_f, int in_f,
+                                    int qk) {
+    const int n_blocks = (int)term.scales.size();
+    const int codes_per_block = qk / 4;
+    const int row_stride = n_blocks * (codes_per_block + (int)sizeof(float));
+    std::vector<uint8_t> buf((size_t)out_f * row_stride);
+    pack_als_block_into(term, buf.data(), out_f, in_f, qk);
     return buf;
 }
 
 std::vector<uint8_t> pack_als_block_terms(const std::vector<ALSTerm>& terms,
                                           int out_f, int in_f, int qk) {
-    const size_t per_row = (size_t)((in_f + qk - 1) / qk) * (qk / 4 + 4);
+    const int n_blocks = (in_f + qk - 1) / qk;
+    const int codes_per_block = qk / 4;
+    const size_t per_row = (size_t)n_blocks * (codes_per_block + (int)sizeof(float));
     std::vector<uint8_t> buf;
     buf.reserve(4 + terms.size() * (4 + (size_t)out_f * per_row));
     const uint32_t num_terms = (uint32_t)terms.size();
     buf.insert(buf.end(), (const uint8_t*)&num_terms, (const uint8_t*)&num_terms + 4);
     for (const ALSTerm& term : terms) {
-        std::vector<uint8_t> blob = pack_als_block(term, out_f, in_f, qk);
-        const uint32_t blob_len = (uint32_t)blob.size();
+        // Per-term length must match pack_als_block_into, which derives
+        // n_blocks from term.scales.size() (same as the pre-refactor blob).
+        const size_t row_stride = (size_t)term.scales.size() * (codes_per_block + (int)sizeof(float));
+        const uint32_t blob_len = (uint32_t)((size_t)out_f * row_stride);
         buf.insert(buf.end(), (const uint8_t*)&blob_len, (const uint8_t*)&blob_len + 4);
-        buf.insert(buf.end(), blob.begin(), blob.end());
+        const size_t base = buf.size();
+        buf.resize(base + blob_len);
+        pack_als_block_into(term, buf.data() + base, out_f, in_f, qk);
     }
     return buf;
 }

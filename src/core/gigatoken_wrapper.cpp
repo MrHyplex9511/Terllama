@@ -5,6 +5,7 @@
 
 #include <dlfcn.h>
 #include <cstring>
+#include <limits>
 #include <sstream>
 
 GigaTokenWrapper::GigaTokenWrapper() = default;
@@ -120,10 +121,15 @@ bool GigaTokenWrapper::load_tokenizer(const std::string& path) {
 std::vector<uint32_t> GigaTokenWrapper::encode(const std::string& text) {
     if (!tok_ || !fn_encode_) return {};
 
-    // Start with a generous buffer.  The C API writes up to `cap` tokens and
-    // reports the actual count via `out_len`.  If out_len == cap the result
+    // Start with a buffer scaled to the input instead of a fixed 262144-token
+    // (~1MiB) allocation on every call. The C API writes up to `cap` tokens
+    // and reports the actual count via `out_len`. If out_len == cap the result
     // may have been truncated, so we double and retry.
-    int32_t cap = 262144;
+    int64_t initial = (int64_t)text.size() / 4 + 64;   // ≈4 chars per token
+    int32_t cap = 64;
+    if (initial > cap)
+        cap = static_cast<int32_t>(
+            std::min<int64_t>(initial, std::numeric_limits<int32_t>::max()));
     std::vector<uint32_t> ids;
     int32_t out_len = 0;
     for (;;) {
@@ -147,7 +153,13 @@ std::string GigaTokenWrapper::decode(const std::vector<uint32_t>& ids) {
     if (!tok_ || !fn_decode_ || ids.empty()) return {};
 
     const int32_t cap = 65536;
-    std::string buf(cap, '\0');
+
+    // Reuse a per-thread buffer instead of allocating a fresh 64KiB string on
+    // every call. resize() only reallocates when capacity shrank below cap;
+    // in steady-state (16-token streaming batches) the 64KiB block is
+    // allocated once per thread and reused for all subsequent calls.
+    thread_local std::string buf;
+    buf.resize(cap);
     int32_t out_len = 0;
     int32_t ret = fn_decode_(tok_, ids.data(), static_cast<int32_t>(ids.size()),
                              buf.data(), &out_len, cap);

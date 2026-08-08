@@ -77,6 +77,13 @@ void mote_ternary_linear(const MoTELayerData& mote, const float* x,
         combined[i] = silu_mote(gate_buf[i]) * up_buf[i];
 
     // ─── 4. Routed top-K experts ──────────────────────────────────────
+    // Two passes so the elementwise combine uses ONE parallel region for all
+    // experts instead of spawning a team per expert matmul. The expert
+    // GEMM dispatches stay outside any region (each keeps its own internal
+    // parallelism — wrapping them in the outer region would force nested
+    // single-threaded execution). Per-element accumulation order is
+    // unchanged, so results are bit-identical to the old per-expert loop.
+    std::vector<float> expert_contrib((size_t)topk * IS);
     for (int e = 0; e < topk; e++) {
         int ek = scored[e].idx;
         float weight = scored[e].prob;
@@ -84,9 +91,16 @@ void mote_ternary_linear(const MoTELayerData& mote, const float* x,
         ternary_linear_dispatch(mote.expert_gate[ek], x, gate_buf.data());
         ternary_linear_dispatch(mote.expert_up[ek], x, up_buf.data());
 
-        #pragma omp parallel for
+        float* dest = &expert_contrib[(size_t)e * IS];
         for (int i = 0; i < IS; i++)
-            combined[i] += weight * silu_mote(gate_buf[i]) * up_buf[i];
+            dest[i] = weight * silu_mote(gate_buf[i]) * up_buf[i];
+    }
+
+    #pragma omp parallel for
+    for (int i = 0; i < IS; i++) {
+        float acc = combined[i];
+        for (int e = 0; e < topk; e++) acc += expert_contrib[(size_t)e * IS + i];
+        combined[i] = acc;
     }
 
     // ─── 5. Down projection ───────────────────────────────────────────
