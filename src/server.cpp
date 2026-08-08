@@ -7,6 +7,9 @@
  *   POST /v1/completions         Text completions (streaming + non-streaming)
  *   GET  /health                 Health check
  *   GET  /                       Serve web UI or API listing
+ *   GET/POST /network/*          Node daemon bridge (with --node: spawns
+ *                                terllama-node and proxies /network/X →
+ *                                http://127.0.0.1:47801/node/X)
  *
  * Build:
  *   g++ -std=c++17 -O3 -fopenmp -I. -Ithird_party \
@@ -35,6 +38,9 @@
 #include <ctime>
 #include <climits>
 #include <unistd.h>
+#include <sys/wait.h>
+#include <csignal>
+#include <sys/prctl.h>
 #include <mutex>
 #include <thread>
 #include <atomic>
@@ -42,6 +48,71 @@
 #include "core/logger.h"
 
 using json = nlohmann::json;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// NODE DAEMON BRIDGE (--node flag)
+// ═══════════════════════════════════════════════════════════════════════════
+
+static pid_t g_node_pid = -1;
+static const int kNodeHttpPort = 47801;  // terllama-node default HTTP port
+
+// Spawns terllama-node (same install dir as this binary, else PATH) as a
+// child. prctl(PR_SET_PDEATHSIG) makes the kernel SIGTERM it if we die.
+static pid_t spawn_node_daemon() {
+    std::string exe = "terllama-node";
+    char buf[4096];
+    ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    if (n > 0) {
+        buf[n] = '\0';
+        std::string self(buf);
+        size_t slash = self.rfind('/');
+        if (slash != std::string::npos) {
+            std::string cand = self.substr(0, slash + 1) + "terllama-node";
+            std::ifstream t(cand);
+            if (t.good()) exe = cand;
+        }
+    }
+    pid_t pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        prctl(PR_SET_PDEATHSIG, SIGTERM);  // die with the server
+        execl(exe.c_str(), exe.c_str(), (char*)nullptr);
+        _exit(127);
+    }
+    return pid;
+}
+
+// Forwards /network/<X> → http://127.0.0.1:47801/node/<X>. The web UI talks
+// to the node daemon same-origin through this bridge; cluster chat goes
+// directly to the cluster (it has CORS + SSE of its own).
+static void proxy_network(const std::string& method, const httplib::Request& req,
+                          httplib::Response& res) {
+    std::string target = "/node" + req.path.substr(std::string("/network").size());
+    httplib::Client cli("127.0.0.1", kNodeHttpPort);
+    cli.set_connection_timeout(2, 0);
+    cli.set_read_timeout(300, 0);  // start-model can share files / spawn
+    httplib::Headers headers;
+    if (req.has_header("Content-Type"))
+        headers.emplace("Content-Type", req.get_header_value("Content-Type"));
+    httplib::Result r;
+    if (method == "GET") {
+        r = cli.Get(target, headers);
+    } else {
+        r = cli.Post(target, headers, req.body,
+                     req.has_header("Content-Type") ? req.get_header_value("Content-Type")
+                                                    : "application/json");
+    }
+    if (!r) {
+        res.status = 502;
+        res.set_content("{\"error\":\"terllama-node daemon unreachable\"}", "application/json");
+        return;
+    }
+    res.status = r->status;
+    std::string ct = r->get_header_value("Content-Type");
+    if (ct.empty()) ct = "application/json";
+    res.set_header("Content-Type", ct);
+    res.set_content(r->body, ct);
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // GLOBAL MODEL STATE (defined here, accessed extern from handlers)
@@ -271,6 +342,12 @@ int server_main(int argc, char** argv) {
         }
     }
 
+    // Node daemon — --node spawns terllama-node and bridges /network/* to it.
+    bool run_node = false;
+    for (int i = 1; i < argc; i++) {
+        if (std::string(argv[i]) == "--node") { run_node = true; break; }
+    }
+
     std::string web_dir = model_dir + "/web";
 
     // ─── Init model ─────────────────────────────────────────────────────
@@ -329,6 +406,28 @@ int server_main(int argc, char** argv) {
     svr.Post("/v1/chat/completions", handle_chat_completions);
     svr.Post("/v1/completions",      handle_completions);
     svr.Get ("/health",              handle_health);
+
+    // Node daemon bridge (--node): spawn the daemon, then proxy /network/*.
+    // Registered before set_base_dir so the UI paths win over static files.
+    if (run_node) {
+        g_node_pid = spawn_node_daemon();
+        if (g_node_pid > 0) {
+            Logger::info("Node daemon spawned (pid {}), /network/* → 127.0.0.1:{}",
+                         g_node_pid, kNodeHttpPort);
+        } else {
+            Logger::error("--node set but failed to spawn terllama-node");
+        }
+    }
+    if (g_node_pid > 0) {
+        svr.Get(R"(/network/.*)", [](const httplib::Request& req, httplib::Response& res) {
+            add_cors_headers(res);
+            proxy_network("GET", req, res);
+        });
+        svr.Post(R"(/network/.*)", [](const httplib::Request& req, httplib::Response& res) {
+            add_cors_headers(res);
+            proxy_network("POST", req, res);
+        });
+    }
 
     // Static file serving for web UI. Only mount the static web dir when no
     // API key is configured — otherwise the UI would be served anonymously,

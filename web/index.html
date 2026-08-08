@@ -770,7 +770,15 @@ body {
   <div class="footer">Terllama v1.0.0</div>
 </div>
 
+<!-- Terllama Network -->
+<button class="net-toggle" id="netToggle" title="Terllama Network" aria-label="Terllama Network">
+  <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="7" width="6" height="6" rx="1"/><rect x="16" y="7" width="6" height="6" rx="1"/><rect x="9" y="16" width="6" height="6" rx="1"/><path d="M5 13v2a2 2 0 0 0 2 2h3"/><path d="M19 13v-2a2 2 0 0 0-2-2h-3"/></svg>
+</button>
+<div class="net-panel hidden" id="netPanel" role="dialog" aria-label="Terllama Network"></div>
+
 <script>
+var apiBase = '';
+
 (function() {
   'use strict';
 
@@ -860,7 +868,7 @@ body {
     el.modelSelect.innerHTML = '<option value="">Loading...</option>';
     el.modelSelect.disabled = true;
     try {
-      const res = await fetch('/v1/models');
+      const res = await fetch(apiBase + '/v1/models');
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       let models = [];
@@ -878,10 +886,12 @@ body {
         const id = m.id || m.name || m.model || String(m);
         const opt = document.createElement('option');
         opt.value = id;
+        opt.dataset.cluster = apiBase ? '1' : '0';
         opt.textContent = id;
         el.modelSelect.appendChild(opt);
       });
       el.modelSelect.disabled = false;
+      if (window.TerllamaNetSync) window.TerllamaNetSync();
       if (models.length > 0) {
         el.modelSelect.value = models[0].id || models[0].name || models[0].model || String(models[0]);
         state.currentModel = el.modelSelect.value;
@@ -897,6 +907,8 @@ body {
       addError('⚠️ ' + uiMsg);
     }
   }
+
+  window.TerllamaFetchModels = fetchModels;
 
   /* ── Messages ── */
   function addMessage(role, content, isStreaming) {
@@ -1055,7 +1067,7 @@ body {
     let msgEl = null;
 
     try {
-      const response = await fetch('/v1/chat/completions', {
+      const response = await fetch(apiBase + '/v1/chat/completions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1194,7 +1206,20 @@ body {
 
   // Model select
   el.modelSelect.addEventListener('change', () => {
-    state.currentModel = el.modelSelect.value;
+    const sel = el.modelSelect.selectedOptions[0];
+    const v = sel ? sel.value : el.modelSelect.value;
+    if (v.indexOf('cluster:') === 0) {
+      const port = v.slice(8);
+      apiBase = (window.TerllamaClusterUrl && window.TerllamaClusterUrl(port)) || ('http://127.0.0.1:' + port);
+      fetchModels();
+    } else if (sel && sel.dataset.cluster === '1') {
+      state.currentModel = v;
+    } else {
+      const wasCluster = apiBase !== '';
+      apiBase = '';
+      state.currentModel = v;
+      if (wasCluster) fetchModels();
+    }
   });
 
   // Temperature
@@ -1251,5 +1276,7 @@ body {
   el.inputBox.focus();
 })();
 </script>
+<script src="anime.min.js"></script>
+<script src="network.js"></script>
 </body>
 </html>
